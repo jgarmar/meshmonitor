@@ -17,7 +17,7 @@ services:
       - "8087:3001"
     restart: unless-stopped
     volumes:
-      - meshmonitor-data:/data
+      - ./meshmonitor-data:/data
     env_file: .env
     
     
@@ -42,6 +42,6 @@ services:
       # See docs/operations/disaster-recovery.md for details
       # - RESTORE_FROM_BACKUP=2025-11-08_151637
 
-volumes:
-  meshmonitor-data:
-    driver: local
+# volumes:
+#   meshmonitor-data:
+#     driver: local
