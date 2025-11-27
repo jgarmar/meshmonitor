@@ -996,6 +996,139 @@ class ApiService {
 
     return response.json();
   }
+
+  async toggleFavorite(nodeNum: number, isFavorite: boolean) {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/nodes/${nodeNum}/favorite`, {
+      method: 'POST',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+      body: JSON.stringify({ isFavorite }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to toggle favorite');
+    }
+
+    return response.json();
+  }
+
+  async getChannelMessages(channelId: number, limit: number = 100): Promise<MeshMessage[]> {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/messages/channel/${channelId}?limit=${limit}`, {
+      credentials: 'include'
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch channel messages');
+    }
+
+    const data = await response.json();
+    return data.messages || [];
+  }
+
+  async getDirectMessages(nodeId: string, limit: number = 100): Promise<MeshMessage[]> {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/messages/direct/${nodeId}?limit=${limit}`, {
+      credentials: 'include'
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch direct messages');
+    }
+
+    const data = await response.json();
+    return data.messages || [];
+  }
+
+  async sendChannelMessage(channelId: number, text: string, replyId?: number) {
+    const sanitizedText = sanitizeTextInput(text);
+    if (!sanitizedText) {
+      throw new Error('Message text cannot be empty');
+    }
+
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/messages/send`, {
+      method: 'POST',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+      body: JSON.stringify({ 
+        channel: channelId, 
+        text: sanitizedText,
+        replyId 
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to send message');
+    }
+
+    return response.json();
+  }
+
+  async sendDirectMessage(nodeId: string, text: string, replyId?: number) {
+    const sanitizedText = sanitizeTextInput(text);
+    const validatedNodeId = validateNodeId(nodeId);
+    
+    if (!sanitizedText) {
+      throw new Error('Message text cannot be empty');
+    }
+
+    if (!validatedNodeId) {
+      throw new Error('Invalid node ID');
+    }
+
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/messages/send`, {
+      method: 'POST',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+      body: JSON.stringify({ 
+        destination: validatedNodeId, 
+        text: sanitizedText,
+        replyId 
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to send direct message');
+    }
+
+    return response.json();
+  }
+
+  async getUnreadCounts() {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/messages/unread-counts`, {
+      credentials: 'include'
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch unread counts');
+    }
+
+    return response.json();
+  }
+
+  async markMessagesAsRead(messageId?: number, channelId?: number, nodeId?: string) {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/messages/mark-read`, {
+      method: 'POST',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+      body: JSON.stringify({ messageId, channelId, nodeId }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to mark messages as read');
+    }
+
+    return response.json();
+  }
 }
 
 export default new ApiService();
