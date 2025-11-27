@@ -585,12 +585,22 @@ class ApiService {
     return this.baseUrl;
   }
 
-  async getNodesWithTelemetry(): Promise<string[]> {
+  async getNodesWithTelemetry(): Promise<{
+    nodes: string[];
+    weather: string[];
+    estimatedPosition: string[];
+    pkc: string[];
+  }> {
     await this.ensureBaseUrl();
     const response = await fetch(`${this.baseUrl}/api/telemetry/available/nodes`);
     if (!response.ok) throw new Error('Failed to fetch telemetry nodes');
     const data = await response.json();
-    return data.nodes || [];
+    return {
+      nodes: data.nodes || [],
+      weather: data.weather || [],
+      estimatedPosition: data.estimatedPosition || [],
+      pkc: data.pkc || [],
+    };
   }
 
   async updateTracerouteInterval(minutes: number) {
