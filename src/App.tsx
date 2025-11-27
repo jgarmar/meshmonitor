@@ -276,7 +276,6 @@ function App() {
     typeof setInterval
   > | null>(null); // Track upgrade polling interval for cleanup
   const initialVersionRef = useRef<string | null>(null); // Track initial backend version to detect upgrades
-  const pollingInProgressRef = useRef<boolean>(false); // Track if a poll request is currently in progress to prevent concurrent polls
 
   // Constants for emoji tapbacks
   const EMOJI_FLAG = 1; // Protobuf flag indicating this is a tapback/reaction
@@ -1507,7 +1506,7 @@ function App() {
 
   // Usar usePoll con TanStack Query para el polling automático
   // El polling se activa automáticamente cuando está conectado y no hay reboot en progreso
-  usePoll({
+  const { invalidate: invalidatePoll, refetch: refetchPoll } = usePoll({
     enabled: connectionStatus === "connected" && !showRebootModal,
     baseUrl,
     authFetch,
@@ -1580,8 +1579,8 @@ function App() {
 
       if (response.ok) {
         logger.debug("✅ Node database refresh initiated");
-        // Immediately update local data after refresh
-        setTimeout(() => updateDataFromBackend(), 2000);
+        // Invalidate poll cache to trigger refresh with new data
+        setTimeout(() => invalidatePoll(), 2000);
       } else {
         logger.warn("⚠️ Node database refresh request failed");
       }
@@ -1713,7 +1712,7 @@ function App() {
           // This ensures we show cached data even after refresh
           try {
             await fetchChannels(urlBase);
-            await updateDataFromBackend();
+            await refetchPoll();
           } catch (error) {
             logger.error(
               "Failed to fetch cached data while disconnected:",
@@ -1759,7 +1758,7 @@ function App() {
                 // Improved initialization sequence
                 try {
                   await fetchChannels(urlBase);
-                  await updateDataFromBackend();
+                  await refetchPoll();
                   setConnectionStatus("connected");
                   logger.debug(
                     "✅ Initialization complete, status set to connected"
@@ -1923,7 +1922,7 @@ function App() {
 
   /**
    * Procesa los datos recibidos del endpoint /api/poll
-   * Esta función es usada tanto por usePoll (TanStack Query) como por updateDataFromBackend (legacy)
+   * Esta función es llamada por usePoll (TanStack Query) cuando el polling tiene éxito
    */
   const processPollData = useCallback((pollData: any) => {
     logger.debug("📦 Processing poll data...");
@@ -2134,327 +2133,6 @@ function App() {
   useEffect(() => {
     processPollDataRef.current = processPollData;
   }, [processPollData]);
-
-  const updateDataFromBackend = async () => {
-    // Prevent concurrent polls - if already polling, skip this iteration
-    if (pollingInProgressRef.current) {
-      logger.warn("⏭️ Skipping poll - previous poll still in progress");
-      return;
-    }
-
-    try {
-      pollingInProgressRef.current = true;
-      logger.debug("🔄 Starting poll request...");
-
-      // Use consolidated polling endpoint to reduce API calls from 8 to 1
-      const pollResponse = await authFetch(`${baseUrl}/api/poll`);
-      if (!pollResponse.ok) {
-        logger.error(
-          "Failed to fetch consolidated poll data:",
-          pollResponse.status
-        );
-        return;
-      }
-
-      const pollData = await pollResponse.json();
-      logger.debug("✅ Poll request completed successfully");
-
-      // Check for backend version change (e.g., after auto-upgrade) and reload if changed
-      // Use health endpoint since it always returns version and doesn't require auth
-      try {
-        const healthResponse = await fetch(`${baseUrl}/api/health`);
-        if (healthResponse.ok) {
-          const healthData = await healthResponse.json();
-          if (healthData.version) {
-            if (initialVersionRef.current === null) {
-              // First check - store the initial version
-              initialVersionRef.current = healthData.version;
-              logger.info(`Initial backend version: ${healthData.version}`);
-            } else if (initialVersionRef.current !== healthData.version) {
-              // Version changed - backend was upgraded
-              logger.info(
-                `Backend version changed from ${initialVersionRef.current} to ${healthData.version} - reloading page`
-              );
-              window.location.reload();
-              return; // Don't process rest of the response since we're reloading
-            }
-          }
-        }
-      } catch (error) {
-        // Ignore health check errors - don't want to break polling if health endpoint fails
-        logger.debug("Health check for version monitoring failed:", error);
-      }
-
-      // Extract localNodeId early to use in message processing (don't wait for state update)
-      const localNodeId =
-        pollData.deviceConfig?.basic?.nodeId ||
-        pollData.config?.localNodeInfo?.nodeId ||
-        currentNodeId;
-
-      // Store in ref for immediate access across functions (bypasses React state delay)
-      if (localNodeId) {
-        localNodeIdRef.current = localNodeId;
-      }
-
-      // Process nodes data
-      if (pollData.nodes) {
-        // Merge server data with local optimistic updates for nodes with pending favorite changes
-        // This prevents polling from overwriting optimistic UI updates
-        const pendingRequests = pendingFavoriteRequests;
-
-        console.log(
-          "[POLL] Received nodes:",
-          pollData.nodes.length,
-          "Pending requests:",
-          pendingRequests.size
-        );
-
-        if (pendingRequests.size === 0) {
-          // No pending updates, safe to use server data as-is
-          setNodes(pollData.nodes);
-        } else {
-          console.log(
-            "[POLL] Merging with pending favorites:",
-            Array.from(pendingRequests.entries())
-          );
-          // Merge: keep optimistic isFavorite for nodes with pending requests
-          setNodes(
-            pollData.nodes.map((serverNode: DeviceInfo) => {
-              const pendingState = pendingRequests.get(serverNode.nodeNum);
-              if (pendingState !== undefined) {
-                // Check if server data now matches our pending update
-                if (serverNode.isFavorite === pendingState) {
-                  // Server has caught up, remove from pending
-                  console.log(
-                    "[POLL] Server caught up for node:",
-                    serverNode.nodeNum
-                  );
-                  pendingRequests.delete(serverNode.nodeNum);
-                  return serverNode;
-                }
-                // Server hasn't caught up yet, preserve the local optimistic value
-                console.log(
-                  "[POLL] Preserving optimistic value for node:",
-                  serverNode.nodeNum,
-                  "pending:",
-                  pendingState,
-                  "server:",
-                  serverNode.isFavorite
-                );
-                return { ...serverNode, isFavorite: pendingState };
-              }
-              // Use server data for nodes without pending updates
-              return serverNode;
-            })
-          );
-        }
-      }
-
-      // Process messages data
-      if (pollData.messages) {
-        const messagesData = pollData.messages;
-        // Convert timestamp strings back to Date objects
-        const processedMessages = messagesData.map((msg: any) => ({
-          ...msg,
-          timestamp: new Date(msg.timestamp)
-        }));
-
-        // Play notification sound if new messages arrived from OTHER users (not your own messages)
-        // Track by newest message ID instead of count (count stays at 100 due to API limit)
-        if (processedMessages.length > 0) {
-          const currentNewestMessage = processedMessages[0]; // Messages are sorted newest first
-          const currentNewestId = currentNewestMessage.id;
-
-          // Check if this is a new message (different ID than before)
-          if (
-            newestMessageId.current &&
-            currentNewestId !== newestMessageId.current
-          ) {
-            // New message detected! Check if it's from someone else and is a text message
-            const isFromOther = currentNewestMessage.fromNodeId !== localNodeId;
-            const isTextMessage = currentNewestMessage.portnum === 1; // Only TEXT_MESSAGE_APP
-
-            if (isFromOther && isTextMessage) {
-              logger.debug(
-                "New message arrived from other user:",
-                currentNewestMessage.fromNodeId
-              );
-              playNotificationSound();
-            }
-          }
-
-          // Update the tracked newest message ID
-          newestMessageId.current = currentNewestId;
-        }
-
-        // Check for matching messages to remove from pending
-        const currentPending = pendingMessagesRef.current;
-        let updatedPending = new Map(currentPending);
-        let pendingChanged = false;
-
-        if (currentPending.size > 0) {
-          // For each pending message, check if a matching message appears in backend response
-          currentPending.forEach((pendingMsg, tempId) => {
-            const isDM = pendingMsg.channel === -1;
-
-            const matchingMessage = processedMessages.find(
-              (msg: MeshMessage) => {
-                if (msg.text !== pendingMsg.text) return false;
-
-                // Match by sender
-                const senderMatches =
-                  (localNodeId && msg.from === localNodeId) ||
-                  msg.from === pendingMsg.from ||
-                  msg.fromNodeId === pendingMsg.fromNodeId;
-
-                if (!senderMatches) return false;
-                if (
-                  Math.abs(
-                    msg.timestamp.getTime() - pendingMsg.timestamp.getTime()
-                  ) >= 30000
-                )
-                  return false;
-
-                if (isDM) {
-                  const matches =
-                    msg.toNodeId === pendingMsg.toNodeId ||
-                    (msg.to === pendingMsg.to &&
-                      (msg.channel === 0 || msg.channel === -1));
-                  return matches;
-                } else {
-                  return msg.channel === pendingMsg.channel;
-                }
-              }
-            );
-
-            if (matchingMessage) {
-              // Remove from pending - backend now has this message
-              updatedPending.delete(tempId);
-              pendingChanged = true;
-            }
-          });
-
-          // Only update state once after all deletions
-          if (pendingChanged) {
-            pendingMessagesRef.current = updatedPending;
-            setPendingMessages(updatedPending);
-          }
-        }
-
-        // Compute merged messages BEFORE updating state (so we can use the same array for channelGroups)
-        const pendingIds = new Set(
-          Array.from(pendingMessagesRef.current.keys())
-        );
-
-        // Build merged messages from current messages state
-        const currentMessages = messages || [];
-        const pendingToKeep = currentMessages.filter((m) =>
-          pendingIds.has(m.id)
-        );
-
-        // Trust the backend's acknowledged field - no frontend override
-        const mergedMessages = [...processedMessages, ...pendingToKeep];
-
-        // Update messages state
-        setMessages(mergedMessages);
-
-        // Group messages by channel using the SAME mergedMessages array (not processedMessages)
-        const channelGroups: { [key: number]: MeshMessage[] } = {};
-
-        // Process merged messages (which already have acknowledged status preserved)
-        mergedMessages.forEach((msg: MeshMessage) => {
-          if (msg.channel === -1) return; // Skip DMs for channel grouping
-
-          if (!channelGroups[msg.channel]) {
-            channelGroups[msg.channel] = [];
-          }
-
-          channelGroups[msg.channel].push(msg);
-        });
-
-        // Use database-backed unread counts instead of time-based client-side calculation
-        // The backend now tracks read status persistently in the database
-        const currentSelected = selectedChannelRef.current;
-
-        // Fetch the latest unread counts from the backend
-        // This is done periodically via useEffect, but we also use the current state
-        let newUnreadCounts: { [key: number]: number };
-
-        if (unreadCountsData?.channels) {
-          // Use database-backed counts
-          newUnreadCounts = { ...unreadCountsData.channels };
-        } else {
-          // Fallback to empty counts if data not yet loaded
-          newUnreadCounts = { ...unreadCounts };
-        }
-
-        // Currently selected channel should always show 0 unread
-        newUnreadCounts[currentSelected] = 0;
-
-        logger.debug("📊 Updating unread counts:", {
-          currentSelected,
-          newUnreadCounts
-        });
-
-        setUnreadCounts(newUnreadCounts);
-
-        setChannelMessages(channelGroups);
-      }
-
-      // Process config data
-      if (pollData.config) {
-        setDeviceInfo(pollData.config);
-      }
-
-      // Process device configuration data
-      if (pollData.deviceConfig) {
-        setDeviceConfig(pollData.deviceConfig);
-
-        // Extract current node ID from device config
-        if (pollData.deviceConfig.basic?.nodeId) {
-          setCurrentNodeId(pollData.deviceConfig.basic.nodeId);
-        }
-      }
-
-      // Fallback: Get currentNodeId from config.localNodeInfo if deviceConfig isn't available
-      // (deviceConfig requires configuration:read permission, but localNodeInfo doesn't)
-      if (!currentNodeId && pollData.config?.localNodeInfo?.nodeId) {
-        console.log(
-          "🔧 Setting currentNodeId from config.localNodeInfo:",
-          pollData.config.localNodeInfo.nodeId
-        );
-        setCurrentNodeId(pollData.config.localNodeInfo.nodeId);
-      }
-
-      // Process telemetry availability data
-      if (pollData.telemetryNodes) {
-        setNodesWithTelemetry(new Set(pollData.telemetryNodes.nodes || []));
-        setNodesWithWeatherTelemetry(
-          new Set(pollData.telemetryNodes.weather || [])
-        );
-        setNodesWithEstimatedPosition(
-          new Set(pollData.telemetryNodes.estimatedPosition || [])
-        );
-        setNodesWithPKC(new Set(pollData.telemetryNodes.pkc || []));
-      }
-
-      // Process channels data (if available)
-      if (pollData.channels) {
-        setChannels(pollData.channels);
-      }
-    } catch (error) {
-      logger.error("Failed to update data from backend:", error);
-      // Server is offline - update status to disconnected
-      setConnectionStatus("disconnected");
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      setError(`Server connection lost: ${errorMessage}`);
-    } finally {
-      // Always reset the polling flag when done (success or error)
-      pollingInProgressRef.current = false;
-      logger.debug("🏁 Poll request finished, flag reset");
-    }
-  };
 
   const getRecentTraceroute = (nodeId: string) => {
     const nodeNumStr = nodeId.replace("!", "");
@@ -2785,8 +2463,8 @@ function App() {
       });
 
       if (response.ok) {
-        // Refresh messages to show the new tapback
-        setTimeout(() => updateDataFromBackend(), 500);
+        // Invalidate poll cache to refresh messages with new tapback
+        setTimeout(() => invalidatePoll(), 500);
       } else {
         const errorData = await response.json();
         setError(
@@ -2828,7 +2506,7 @@ function App() {
             (m) => m.id !== message.id
           )
         }));
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -2880,7 +2558,7 @@ function App() {
           ...prev,
           [channelId]: []
         }));
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -2938,7 +2616,7 @@ function App() {
           );
         }
         // Also refresh from backend to ensure consistency
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -2987,7 +2665,7 @@ function App() {
           "success"
         );
         // Refresh data from backend to ensure consistency
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -3038,7 +2716,7 @@ function App() {
           "success"
         );
         // Refresh data from backend to ensure consistency
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -3094,7 +2772,7 @@ function App() {
           setSelectedDMNode("");
         }
         // Refresh data from backend to ensure consistency
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -3150,7 +2828,7 @@ function App() {
           setSelectedDMNode("");
         }
         // Refresh data from backend to ensure consistency
-        updateDataFromBackend();
+        invalidatePoll();
       } else {
         const errorData = await response.json();
         showToast(
@@ -3257,7 +2935,7 @@ function App() {
       if (response.ok) {
         // The message was sent successfully
         // We'll wait for it to appear in the backend data to confirm acknowledgment
-        setTimeout(() => updateDataFromBackend(), 1000);
+        setTimeout(() => invalidatePoll(), 1000);
       } else {
         const errorData = await response.json();
         setError(`Failed to send message: ${errorData.error}`);
