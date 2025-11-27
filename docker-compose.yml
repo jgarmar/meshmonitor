@@ -1,46 +1,45 @@
 services:
   meshmonitor:
-    # Option 1: Use pre-built image from GitHub Container Registry (recommended)
     image: ghcr.io/yeraze/meshmonitor:latest
-
-    # Option 2: Build locally (comment out 'image' above and uncomment below for development)
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-
-    # Auto-Upgrade: To enable automatic upgrades through the UI, use:
-    #   docker compose -f docker-compose.yml -f docker-compose.upgrade.yml up -d
-    # See docs/configuration/auto-upgrade.md for details
-
     container_name: meshmonitor
     ports:
       - "8087:3001"
+      - "4404:4404"
     restart: unless-stopped
     volumes:
       - meshmonitor-data:/data
-    env_file: .env
-    
-    
-      # OPTIONAL: Uncomment and configure for production deployments
-      # See docs/configuration/production.md for full production setup guide
+      # Mount local scripts directory for Auto Responder scripts
+      - ./scripts:/data/scripts
+    env_file: .env      
 
-      # For production with HTTPS reverse proxy (nginx, Caddy, Traefik):
-      # - NODE_ENV=production
-      # - SESSION_SECRET=your-generated-secret-here  # Required in production
-      # - TRUST_PROXY=true
-      # - ALLOWED_ORIGINS=https://yourdomain.com
-
-      # For production with direct HTTP (not recommended):
-      # - NODE_ENV=production
-      # - SESSION_SECRET=your-generated-secret-here  # Required in production
-      # - COOKIE_SECURE=false
-
-      # DISASTER RECOVERY: Restore from system backup
-      # To restore from a backup on container startup, set RESTORE_FROM_BACKUP
-      # to the backup directory name (e.g., 2025-11-08_151637)
-      # Backups must be in /data/system-backups/ directory
-      # See docs/operations/disaster-recovery.md for details
-      # - RESTORE_FROM_BACKUP=2025-11-08_151637
+  # Auto-upgrade watchdog sidecar
+  meshmonitor-upgrader:
+    image: docker:latest
+    container_name: meshmonitor-upgrader
+    restart: unless-stopped
+    volumes:
+      # Docker socket for container control
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared data volume for trigger/status files (read-write)
+      - meshmonitor-data:/data
+      # Mount docker-compose directory for proper recreation
+      - .:/compose:ro
+    environment:
+      - CONTAINER_NAME=meshmonitor
+      - IMAGE_NAME=ghcr.io/yeraze/meshmonitor
+      - TRIGGER_FILE=/data/.upgrade-trigger
+      - STATUS_FILE=/data/.upgrade-status
+      - CHECK_INTERVAL=5
+      - COMPOSE_PROJECT_DIR=/compose
+      - COMPOSE_PROJECT_NAME=meshmonitor
+    command: /data/scripts/upgrade-watchdog.sh
+    depends_on:
+      - meshmonitor
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   meshmonitor-data:
