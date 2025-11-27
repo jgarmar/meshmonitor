@@ -1,8 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useCallback, useRef, useEffect } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { DeviceInfo } from '../types/device';
-import { MeshMessage } from '../types/message';
-import api from '../services/api';
 
 // Query key for consolidated poll
 export const pollQueryKey = ['poll'] as const;

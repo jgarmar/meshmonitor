@@ -1,4 +1,3 @@
-import React from 'react';
 import { useNodes, useToggleFavorite, useSendMessage, useUnreadCounts, useConnectionStatus } from '../hooks/useApi';
 
 /**
@@ -99,7 +98,7 @@ export function NodesListExample() {
               <p>NodeNum: {node.nodeNum}</p>
               <p>ID: {node.user?.id || 'N/A'}</p>
               <p>SNR: {node.snr || 'N/A'} dB</p>
-              <p>Hops: {node.hopCount ?? 'N/A'}</p>
+              <p>Hops: {node.hopsAway ?? 'N/A'}</p>
             </div>
 
             {node.user?.id && (
@@ -154,7 +153,7 @@ export function DashboardExample() {
         <div className="stat-card">
           <h3>Mensajes No Leídos</h3>
           <p className="stat-value">
-            {Object.values(unreadCounts?.channels || {}).reduce((a, b) => a + b, 0)}
+            {(Object.values(unreadCounts?.channels || {}) as number[]).reduce((a, b) => a + b, 0)}
           </p>
         </div>
         
