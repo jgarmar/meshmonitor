@@ -29,7 +29,7 @@ export function useDataSync(options: {
   // Query para nodes con polling automático
   const nodesQuery = useNodes({
     enabled: enabled && connectionStatus === 'connected',
-    refetchInterval: connectionStatus === 'connected' ? 5000 : false,
+    refetchInterval: connectionStatus === 'connected' ? 5000 : undefined,
   });
 
   // Query para channels
