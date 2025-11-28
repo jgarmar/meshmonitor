@@ -21,12 +21,14 @@ services:
       # Mount Docker socket for Docker-from-Docker (required for testing docker-compose.dev.yml)
       # Security: Provides full Docker host access to container (standard for DevContainers)
       # See .devcontainer/README.md "Security Model" section for details
-      - /var/run/docker.sock:/var/run/docker.sock
+      # macOS: Docker Desktop uses ~/.docker/run/docker.sock or /var/run/docker.sock (symlinked)
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
 
       # Named volumes for better performance
       - node_modules-cache:/workspace/node_modules
-      - vscode-extensions:/home/node/.vscode-server/extensions
-      - vscode-extensions-insiders:/home/node/.vscode-server-insiders/extensions
+      # Mount entire .vscode-server directory to persist extensions, bin, and data
+      - vscode-server:/home/node/.vscode-server
+      - vscode-server-insiders:/home/node/.vscode-server-insiders
 
     # Forward ports for development
     ports:
@@ -45,12 +47,12 @@ services:
     # Network mode for accessing host services if needed
     network_mode: bridge
 
-    # Add docker group to allow docker commands
+    # Use node user for development
     user: node
-    group_add:
-      - docker
+    # Note: On macOS, docker group doesn't exist. Docker socket permissions are handled differently.
+    # The docker-outside-of-docker feature in devcontainer.json handles this automatically.
 
 volumes:
   node_modules-cache:
-  vscode-extensions:
-  vscode-extensions-insiders:
+  vscode-server:
+  vscode-server-insiders:

@@ -675,7 +675,7 @@ function App() {
   // Compute connected node name for sidebar and page title
   const connectedNodeName = useMemo(() => {
     // Find the local node from the nodes array
-    let localNode = currentNodeId
+    const localNode = currentNodeId
       ? nodes.find((n) => n.user?.id === currentNodeId)
       : null;
 
@@ -1499,7 +1499,7 @@ function App() {
   // TanStack Query: Polling automático usando usePoll
   // Reemplaza el setInterval manual con refetchInterval de TanStack Query
   // ============================================================================
-  
+
   // Determinar si el polling debe estar activo
   // Ref para el callback de procesamiento (evita problemas de orden de definición)
   const processPollDataRef = useRef<((data: any) => void) | null>(null);
@@ -1519,17 +1519,22 @@ function App() {
     onError: useCallback((error: Error) => {
       logger.error("Poll failed:", error);
       // No desconectar inmediatamente - TanStack Query maneja reintentos
-    }, []),
+    }, [])
   });
 
   // Efecto para verificar conexión cuando no está conectado
   useEffect(() => {
-    if (connectionStatus !== "connected" && connectionStatus !== "user-disconnected" && connectionStatus !== "rebooting" && !showRebootModal) {
+    if (
+      connectionStatus !== "connected" &&
+      connectionStatus !== "user-disconnected" &&
+      connectionStatus !== "rebooting" &&
+      !showRebootModal
+    ) {
       // Verificar estado de conexión cada 5 segundos cuando no está conectado
       const checkInterval = setInterval(() => {
         checkConnectionStatus();
       }, 5000);
-      
+
       return () => clearInterval(checkInterval);
     }
   }, [connectionStatus, showRebootModal]);
@@ -1924,210 +1929,221 @@ function App() {
    * Procesa los datos recibidos del endpoint /api/poll
    * Esta función es llamada por usePoll (TanStack Query) cuando el polling tiene éxito
    */
-  const processPollData = useCallback((pollData: any) => {
-    logger.debug("📦 Processing poll data...");
+  const processPollData = useCallback(
+    (pollData: any) => {
+      logger.debug("📦 Processing poll data...");
 
-    // Check for backend version change (e.g., after auto-upgrade) and reload if changed
-    if (pollData.version) {
-      if (initialVersionRef.current === null) {
-        initialVersionRef.current = pollData.version;
-        logger.info(`Initial backend version: ${pollData.version}`);
-      } else if (initialVersionRef.current !== pollData.version) {
-        logger.info(
-          `Backend version changed from ${initialVersionRef.current} to ${pollData.version} - reloading page`
-        );
-        window.location.reload();
-        return;
+      // Check for backend version change (e.g., after auto-upgrade) and reload if changed
+      if (pollData.version) {
+        if (initialVersionRef.current === null) {
+          initialVersionRef.current = pollData.version;
+          logger.info(`Initial backend version: ${pollData.version}`);
+        } else if (initialVersionRef.current !== pollData.version) {
+          logger.info(
+            `Backend version changed from ${initialVersionRef.current} to ${pollData.version} - reloading page`
+          );
+          window.location.reload();
+          return;
+        }
       }
-    }
 
-    // Extract localNodeId early to use in message processing
-    const localNodeId =
-      pollData.deviceConfig?.basic?.nodeId ||
-      pollData.config?.localNodeInfo?.nodeId ||
-      currentNodeId;
+      // Extract localNodeId early to use in message processing
+      const localNodeId =
+        pollData.deviceConfig?.basic?.nodeId ||
+        pollData.config?.localNodeInfo?.nodeId ||
+        currentNodeId;
 
-    if (localNodeId) {
-      localNodeIdRef.current = localNodeId;
-    }
+      if (localNodeId) {
+        localNodeIdRef.current = localNodeId;
+      }
 
-    // Process nodes data
-    if (pollData.nodes) {
-      const pendingRequests = pendingFavoriteRequests;
+      // Process nodes data
+      if (pollData.nodes) {
+        const pendingRequests = pendingFavoriteRequests;
 
-      if (pendingRequests.size === 0) {
-        setNodes(pollData.nodes);
-      } else {
-        setNodes(
-          pollData.nodes.map((serverNode: DeviceInfo) => {
-            const pendingState = pendingRequests.get(serverNode.nodeNum);
-            if (pendingState !== undefined) {
-              if (serverNode.isFavorite === pendingState) {
-                pendingRequests.delete(serverNode.nodeNum);
-                return serverNode;
+        if (pendingRequests.size === 0) {
+          setNodes(pollData.nodes);
+        } else {
+          setNodes(
+            pollData.nodes.map((serverNode: DeviceInfo) => {
+              const pendingState = pendingRequests.get(serverNode.nodeNum);
+              if (pendingState !== undefined) {
+                if (serverNode.isFavorite === pendingState) {
+                  pendingRequests.delete(serverNode.nodeNum);
+                  return serverNode;
+                }
+                return { ...serverNode, isFavorite: pendingState };
               }
-              return { ...serverNode, isFavorite: pendingState };
-            }
-            return serverNode;
-          })
-        );
+              return serverNode;
+            })
+          );
+        }
       }
-    }
 
-    // Process messages data
-    if (pollData.messages) {
-      const processedMessages = pollData.messages.map((msg: any) => ({
-        ...msg,
-        timestamp: new Date(msg.timestamp)
-      }));
+      // Process messages data
+      if (pollData.messages) {
+        const processedMessages = pollData.messages.map((msg: any) => ({
+          ...msg,
+          timestamp: new Date(msg.timestamp)
+        }));
 
-      // Play notification sound for new messages
-      if (processedMessages.length > 0) {
-        const currentNewestMessage = processedMessages[0];
-        const currentNewestId = currentNewestMessage.id;
+        // Play notification sound for new messages
+        if (processedMessages.length > 0) {
+          const currentNewestMessage = processedMessages[0];
+          const currentNewestId = currentNewestMessage.id;
 
-        if (
-          newestMessageId.current &&
-          currentNewestId !== newestMessageId.current
-        ) {
-          const isFromOther = currentNewestMessage.fromNodeId !== localNodeId;
-          const isTextMessage = currentNewestMessage.portnum === 1;
+          if (
+            newestMessageId.current &&
+            currentNewestId !== newestMessageId.current
+          ) {
+            const isFromOther = currentNewestMessage.fromNodeId !== localNodeId;
+            const isTextMessage = currentNewestMessage.portnum === 1;
 
-          if (isFromOther && isTextMessage) {
-            playNotificationSound();
+            if (isFromOther && isTextMessage) {
+              playNotificationSound();
+            }
+          }
+          newestMessageId.current = currentNewestId;
+        }
+
+        // Check for matching messages to remove from pending
+        const currentPending = pendingMessagesRef.current;
+        const updatedPending = new Map(currentPending);
+        let pendingChanged = false;
+
+        if (currentPending.size > 0) {
+          currentPending.forEach((pendingMsg, tempId) => {
+            const isDM = pendingMsg.channel === -1;
+            const matchingMessage = processedMessages.find(
+              (msg: MeshMessage) => {
+                if (msg.text !== pendingMsg.text) return false;
+                const senderMatches =
+                  (localNodeId && msg.from === localNodeId) ||
+                  msg.from === pendingMsg.from ||
+                  msg.fromNodeId === pendingMsg.fromNodeId;
+                if (!senderMatches) return false;
+                if (
+                  Math.abs(
+                    msg.timestamp.getTime() - pendingMsg.timestamp.getTime()
+                  ) >= 30000
+                )
+                  return false;
+                if (isDM) {
+                  return (
+                    msg.toNodeId === pendingMsg.toNodeId ||
+                    (msg.to === pendingMsg.to &&
+                      (msg.channel === 0 || msg.channel === -1))
+                  );
+                }
+                return msg.channel === pendingMsg.channel;
+              }
+            );
+
+            if (matchingMessage) {
+              updatedPending.delete(tempId);
+              pendingChanged = true;
+            }
+          });
+
+          if (pendingChanged) {
+            pendingMessagesRef.current = updatedPending;
+            setPendingMessages(updatedPending);
           }
         }
-        newestMessageId.current = currentNewestId;
-      }
 
-      // Check for matching messages to remove from pending
-      const currentPending = pendingMessagesRef.current;
-      let updatedPending = new Map(currentPending);
-      let pendingChanged = false;
+        // Merge messages
+        const pendingIds = new Set(
+          Array.from(pendingMessagesRef.current.keys())
+        );
+        const currentMessages = messages || [];
+        const pendingToKeep = currentMessages.filter((m) =>
+          pendingIds.has(m.id)
+        );
+        const mergedMessages = [...processedMessages, ...pendingToKeep];
 
-      if (currentPending.size > 0) {
-        currentPending.forEach((pendingMsg, tempId) => {
-          const isDM = pendingMsg.channel === -1;
-          const matchingMessage = processedMessages.find(
-            (msg: MeshMessage) => {
-              if (msg.text !== pendingMsg.text) return false;
-              const senderMatches =
-                (localNodeId && msg.from === localNodeId) ||
-                msg.from === pendingMsg.from ||
-                msg.fromNodeId === pendingMsg.fromNodeId;
-              if (!senderMatches) return false;
-              if (
-                Math.abs(
-                  msg.timestamp.getTime() - pendingMsg.timestamp.getTime()
-                ) >= 30000
-              )
-                return false;
-              if (isDM) {
-                return (
-                  msg.toNodeId === pendingMsg.toNodeId ||
-                  (msg.to === pendingMsg.to &&
-                    (msg.channel === 0 || msg.channel === -1))
-                );
-              }
-              return msg.channel === pendingMsg.channel;
-            }
-          );
+        setMessages(mergedMessages);
 
-          if (matchingMessage) {
-            updatedPending.delete(tempId);
-            pendingChanged = true;
+        // Group messages by channel
+        const channelGroups: { [key: number]: MeshMessage[] } = {};
+        mergedMessages.forEach((msg: MeshMessage) => {
+          if (msg.channel === -1) return;
+          if (!channelGroups[msg.channel]) {
+            channelGroups[msg.channel] = [];
           }
+          channelGroups[msg.channel].push(msg);
         });
 
-        if (pendingChanged) {
-          pendingMessagesRef.current = updatedPending;
-          setPendingMessages(updatedPending);
+        // Update unread counts
+        const currentSelected = selectedChannelRef.current;
+        let newUnreadCounts: { [key: number]: number };
+        if (unreadCountsData?.channels) {
+          newUnreadCounts = { ...unreadCountsData.channels };
+        } else {
+          newUnreadCounts = { ...unreadCounts };
+        }
+        newUnreadCounts[currentSelected] = 0;
+        setUnreadCounts(newUnreadCounts);
+        setChannelMessages(channelGroups);
+      }
+
+      // Process config data
+      if (pollData.config) {
+        setDeviceInfo(pollData.config);
+      }
+
+      // Process device configuration data
+      if (pollData.deviceConfig) {
+        setDeviceConfig(pollData.deviceConfig);
+        if (pollData.deviceConfig.basic?.nodeId) {
+          setCurrentNodeId(pollData.deviceConfig.basic.nodeId);
         }
       }
 
-      // Merge messages
-      const pendingIds = new Set(Array.from(pendingMessagesRef.current.keys()));
-      const currentMessages = messages || [];
-      const pendingToKeep = currentMessages.filter((m) => pendingIds.has(m.id));
-      const mergedMessages = [...processedMessages, ...pendingToKeep];
-
-      setMessages(mergedMessages);
-
-      // Group messages by channel
-      const channelGroups: { [key: number]: MeshMessage[] } = {};
-      mergedMessages.forEach((msg: MeshMessage) => {
-        if (msg.channel === -1) return;
-        if (!channelGroups[msg.channel]) {
-          channelGroups[msg.channel] = [];
-        }
-        channelGroups[msg.channel].push(msg);
-      });
-
-      // Update unread counts
-      const currentSelected = selectedChannelRef.current;
-      let newUnreadCounts: { [key: number]: number };
-      if (unreadCountsData?.channels) {
-        newUnreadCounts = { ...unreadCountsData.channels };
-      } else {
-        newUnreadCounts = { ...unreadCounts };
+      // Fallback for currentNodeId
+      if (!currentNodeId && pollData.config?.localNodeInfo?.nodeId) {
+        setCurrentNodeId(pollData.config.localNodeInfo.nodeId);
       }
-      newUnreadCounts[currentSelected] = 0;
-      setUnreadCounts(newUnreadCounts);
-      setChannelMessages(channelGroups);
-    }
 
-    // Process config data
-    if (pollData.config) {
-      setDeviceInfo(pollData.config);
-    }
-
-    // Process device configuration data
-    if (pollData.deviceConfig) {
-      setDeviceConfig(pollData.deviceConfig);
-      if (pollData.deviceConfig.basic?.nodeId) {
-        setCurrentNodeId(pollData.deviceConfig.basic.nodeId);
+      // Process telemetry availability data
+      if (pollData.telemetryNodes) {
+        setNodesWithTelemetry(new Set(pollData.telemetryNodes.nodes || []));
+        setNodesWithWeatherTelemetry(
+          new Set(pollData.telemetryNodes.weather || [])
+        );
+        setNodesWithEstimatedPosition(
+          new Set(pollData.telemetryNodes.estimatedPosition || [])
+        );
+        setNodesWithPKC(new Set(pollData.telemetryNodes.pkc || []));
       }
-    }
 
-    // Fallback for currentNodeId
-    if (!currentNodeId && pollData.config?.localNodeInfo?.nodeId) {
-      setCurrentNodeId(pollData.config.localNodeInfo.nodeId);
-    }
+      // Process channels data
+      if (pollData.channels) {
+        setChannels(pollData.channels);
+      }
 
-    // Process telemetry availability data
-    if (pollData.telemetryNodes) {
-      setNodesWithTelemetry(new Set(pollData.telemetryNodes.nodes || []));
-      setNodesWithWeatherTelemetry(new Set(pollData.telemetryNodes.weather || []));
-      setNodesWithEstimatedPosition(new Set(pollData.telemetryNodes.estimatedPosition || []));
-      setNodesWithPKC(new Set(pollData.telemetryNodes.pkc || []));
-    }
-
-    // Process channels data
-    if (pollData.channels) {
-      setChannels(pollData.channels);
-    }
-
-    logger.debug("✅ Poll data processed successfully");
-  }, [
-    currentNodeId,
-    messages,
-    unreadCountsData,
-    unreadCounts,
-    playNotificationSound,
-    setNodes,
-    setMessages,
-    setPendingMessages,
-    setChannelMessages,
-    setUnreadCounts,
-    setDeviceInfo,
-    setDeviceConfig,
-    setCurrentNodeId,
-    setNodesWithTelemetry,
-    setNodesWithWeatherTelemetry,
-    setNodesWithEstimatedPosition,
-    setNodesWithPKC,
-    setChannels,
-  ]);
+      logger.debug("✅ Poll data processed successfully");
+    },
+    [
+      currentNodeId,
+      messages,
+      unreadCountsData,
+      unreadCounts,
+      playNotificationSound,
+      setNodes,
+      setMessages,
+      setPendingMessages,
+      setChannelMessages,
+      setUnreadCounts,
+      setDeviceInfo,
+      setDeviceConfig,
+      setCurrentNodeId,
+      setNodesWithTelemetry,
+      setNodesWithWeatherTelemetry,
+      setNodesWithEstimatedPosition,
+      setNodesWithPKC,
+      setChannels
+    ]
+  );
 
   // Mantener la ref actualizada con la última versión de processPollData
   useEffect(() => {
@@ -6547,7 +6563,7 @@ function App() {
             {(() => {
               // Find the local node from the nodes array
               // Try by currentNodeId first (available when user has config read permission)
-              let localNode = currentNodeId
+              const localNode = currentNodeId
                 ? nodes.find((n) => n.user?.id === currentNodeId)
                 : null;
 

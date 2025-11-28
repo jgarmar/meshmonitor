@@ -2,12 +2,16 @@
 # Post-create script for MeshMonitor DevContainer
 # Runs once when the container is first created
 
-set -e
+# Don't use set -e - we want to handle errors gracefully
+# set -e
 
 echo "=========================================="
 echo "  MeshMonitor DevContainer Setup"
 echo "=========================================="
 echo ""
+
+# Track if there are non-critical warnings
+HAS_WARNINGS=0
 
 # Step 0: Configure Git (no .gitconfig mounted to avoid Windows locking issues)
 echo "0. Configuring Git..."
@@ -34,10 +38,37 @@ fi
 
 echo ""
 
-# Step 1: Initialize git submodules (CRITICAL for protobuf definitions)
+# Step 1: Initialize git submodules (needed for protobuf definitions)
 echo "1. Initializing git submodules..."
-git submodule update --init --recursive
-echo "   ✓ Git submodules initialized successfully"
+
+# Check if protobufs are already present (e.g., from host mount)
+if [ -f "protobufs/meshtastic/mesh.proto" ]; then
+    echo "   ✓ Protobuf files already present (skipping submodule init)"
+else
+    # Try to initialize submodules with retry logic
+    SUBMODULE_INIT_SUCCESS=0
+    for attempt in 1 2 3; do
+        echo "   Attempt $attempt/3: Fetching submodules..."
+        if git submodule update --init --recursive 2>&1; then
+            SUBMODULE_INIT_SUCCESS=1
+            echo "   ✓ Git submodules initialized successfully"
+            break
+        else
+            echo "   ⚠ Attempt $attempt failed"
+            if [ $attempt -lt 3 ]; then
+                echo "   Waiting 5 seconds before retry..."
+                sleep 5
+            fi
+        fi
+    done
+
+    if [ $SUBMODULE_INIT_SUCCESS -eq 0 ]; then
+        echo "   ⚠ Failed to initialize git submodules (network issue?)"
+        echo "   This is likely due to DNS resolution issues inside the container."
+        echo "   You can manually run later: git submodule update --init --recursive"
+        HAS_WARNINGS=1
+    fi
+fi
 
 # Step 2: Verify protobufs exist
 echo ""
@@ -45,9 +76,11 @@ echo "2. Verifying Meshtastic protobuf definitions..."
 if [ -f "protobufs/meshtastic/mesh.proto" ]; then
     echo "   ✓ Protobuf files found"
 else
-    echo "   ✗ Protobuf files not found!"
-    echo "   The protobufs submodule may not be initialized correctly."
-    exit 1
+    echo "   ⚠ Protobuf files not found!"
+    echo "   The protobufs submodule could not be initialized."
+    echo "   Run manually when network is available: git submodule update --init --recursive"
+    echo "   Note: Some features may not work without protobufs."
+    HAS_WARNINGS=1
 fi
 
 # Step 2.5: Fix node_modules permissions (volume created by root)
@@ -58,6 +91,7 @@ if [ -d "/workspace/node_modules" ]; then
         echo "   ✓ node_modules ownership fixed"
     else
         echo "   ⚠ Failed to fix node_modules ownership (continuing anyway)"
+        HAS_WARNINGS=1
     fi
 else
     echo "   ℹ node_modules doesn't exist yet (will be created by npm install)"
@@ -76,8 +110,13 @@ export PUPPETEER_SKIP_DOWNLOAD=true
 export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 echo "   ℹ Skipping Puppeteer browser downloads"
 
-npm install
-echo "   ✓ Dependencies installed successfully"
+if npm install 2>&1; then
+    echo "   ✓ Dependencies installed successfully"
+else
+    echo "   ⚠ npm install failed (network issue?)"
+    echo "   You can run 'npm install' manually when network is available"
+    HAS_WARNINGS=1
+fi
 
 # Step 4: Auto-setup .env file if it doesn't exist
 echo ""
@@ -115,8 +154,9 @@ if npm install -g @anthropic-ai/claude-code 2>/dev/null; then
     echo "   ℹ Run 'claude' to start - you'll be prompted to authenticate"
     echo "   Authentication options: OAuth (recommended) or API key"
 else
-    echo "   ⚠ Claude Code CLI installation failed"
+    echo "   ⚠ Claude Code CLI installation failed (network issue?)"
     echo "   Install manually: npm install -g @anthropic-ai/claude-code"
+    HAS_WARNINGS=1
 fi
 
 # Step 7: Playwright browsers (SKIPPED - install manually if needed)
@@ -128,17 +168,37 @@ echo ""
 echo "8. Environment information:"
 echo "   Node.js: $(node --version)"
 echo "   npm: $(npm --version)"
-echo "   TypeScript: $(npx tsc --version)"
+echo "   TypeScript: $(npx tsc --version 2>/dev/null || echo 'Not installed')"
 echo "   Docker: $(docker --version 2>/dev/null || echo 'Installing...')"
 echo "   Claude CLI: $(claude --version 2>/dev/null || echo 'Not installed (optional)')"
 
 echo ""
-echo "=========================================="
-echo "  Setup Complete!"
-echo "=========================================="
+if [ $HAS_WARNINGS -eq 1 ]; then
+    echo "=========================================="
+    echo "  Setup Complete (with warnings)"
+    echo "=========================================="
+    echo ""
+    echo "⚠ Some steps failed (likely due to network issues)."
+    echo "  When network is available, run these commands:"
+    echo ""
+    echo "  # If protobufs missing:"
+    echo "  git submodule update --init --recursive"
+    echo ""
+    echo "  # If npm dependencies missing:"
+    echo "  npm install"
+    echo ""
+else
+    echo "=========================================="
+    echo "  Setup Complete!"
+    echo "=========================================="
+fi
 echo ""
 echo "Next steps:"
 echo "  1. Run: npm run test:run    # Verify tests pass"
 echo "  2. Run: npm run dev:full    # Start dev servers"
 echo "  3. Open: http://localhost:5173"
 echo ""
+
+# Always exit 0 to allow devcontainer to complete setup
+# Warnings are informational, not blocking
+exit 0

@@ -1,4 +1,10 @@
-import { useNodes, useToggleFavorite, useSendMessage, useUnreadCounts, useConnectionStatus } from '../hooks/useApi';
+import {
+  useNodes,
+  useToggleFavorite,
+  useSendMessage,
+  useUnreadCounts,
+  useConnectionStatus
+} from "../hooks/useApi";
 
 /**
  * Ejemplo de componente usando TanStack Query
@@ -10,12 +16,12 @@ import { useNodes, useToggleFavorite, useSendMessage, useUnreadCounts, useConnec
  */
 export function NodesListExample() {
   // 🎯 Query: Obtiene nodes con polling automático cada 5s
-  const { 
-    data: nodes = [], 
-    isLoading, 
-    error, 
+  const {
+    data: nodes = [],
+    isLoading,
+    error,
     isFetching,
-    refetch 
+    refetch
   } = useNodes();
 
   // 🎯 Mutation: Toggle favorito con actualización optimista
@@ -28,25 +34,28 @@ export function NodesListExample() {
   const handleToggleFavorite = (nodeNum: number, currentFavorite: boolean) => {
     // La UI se actualiza INMEDIATAMENTE (optimistic update)
     // Si falla, se revierte automáticamente
-    toggleFavoriteMutation.mutate({ 
-      nodeNum, 
-      isFavorite: !currentFavorite 
+    toggleFavoriteMutation.mutate({
+      nodeNum,
+      isFavorite: !currentFavorite
     });
   };
 
   // Handler para enviar mensaje
   const handleSendMessage = (nodeId: string) => {
-    sendMessageMutation.mutate({
-      toNodeId: nodeId,
-      text: "¡Hola desde TanStack Query!"
-    }, {
-      onSuccess: () => {
-        alert('Mensaje enviado!');
+    sendMessageMutation.mutate(
+      {
+        toNodeId: nodeId,
+        text: "¡Hola desde TanStack Query!"
       },
-      onError: (error) => {
-        alert(`Error: ${error.message}`);
+      {
+        onSuccess: () => {
+          alert("Mensaje enviado!");
+        },
+        onError: (error) => {
+          alert(`Error: ${error.message}`);
+        }
       }
-    });
+    );
   };
 
   // 📊 Estados de carga
@@ -73,8 +82,12 @@ export function NodesListExample() {
       <div className="header">
         <h2>Nodos ({nodes.length})</h2>
         <div className="status-indicators">
-          {isFetching && <span className="fetching-indicator">⟳ Actualizando...</span>}
-          {toggleFavoriteMutation.isPending && <span>💫 Guardando favorito...</span>}
+          {isFetching && (
+            <span className="fetching-indicator">⟳ Actualizando...</span>
+          )}
+          {toggleFavoriteMutation.isPending && (
+            <span>💫 Guardando favorito...</span>
+          )}
           {sendMessageMutation.isPending && <span>📤 Enviando mensaje...</span>}
         </div>
         <button onClick={() => refetch()}>🔄 Refrescar Ahora</button>
@@ -84,21 +97,23 @@ export function NodesListExample() {
         {nodes.map((node) => (
           <div key={node.nodeNum} className="node-card">
             <div className="node-header">
-              <h3>{node.user?.longName || 'Unknown'}</h3>
+              <h3>{node.user?.longName || "Unknown"}</h3>
               <button
-                onClick={() => handleToggleFavorite(node.nodeNum, node.isFavorite || false)}
-                className={`favorite-btn ${node.isFavorite ? 'active' : ''}`}
+                onClick={() =>
+                  handleToggleFavorite(node.nodeNum, node.isFavorite || false)
+                }
+                className={`favorite-btn ${node.isFavorite ? "active" : ""}`}
                 disabled={toggleFavoriteMutation.isPending}
               >
-                {node.isFavorite ? '⭐' : '☆'}
+                {node.isFavorite ? "⭐" : "☆"}
               </button>
             </div>
-            
+
             <div className="node-details">
               <p>NodeNum: {node.nodeNum}</p>
-              <p>ID: {node.user?.id || 'N/A'}</p>
-              <p>SNR: {node.snr || 'N/A'} dB</p>
-              <p>Hops: {node.hopsAway ?? 'N/A'}</p>
+              <p>ID: {node.user?.id || "N/A"}</p>
+              <p>SNR: {node.snr || "N/A"} dB</p>
+              <p>Hops: {node.hopsAway ?? "N/A"}</p>
             </div>
 
             {node.user?.id && (
@@ -117,10 +132,11 @@ export function NodesListExample() {
       {/* Indicador de estado de mutations */}
       {toggleFavoriteMutation.isError && (
         <div className="mutation-error">
-          ❌ Error al actualizar favorito: {toggleFavoriteMutation.error?.message}
+          ❌ Error al actualizar favorito:{" "}
+          {toggleFavoriteMutation.error?.message}
         </div>
       )}
-      
+
       {sendMessageMutation.isError && (
         <div className="mutation-error">
           ❌ Error al enviar mensaje: {sendMessageMutation.error?.message}
@@ -149,18 +165,25 @@ export function DashboardExample() {
           <h3>Nodos Activos</h3>
           <p className="stat-value">{nodes.length}</p>
         </div>
-        
+
         <div className="stat-card">
           <h3>Mensajes No Leídos</h3>
           <p className="stat-value">
-            {(Object.values(unreadCounts?.channels || {}) as number[]).reduce((a, b) => a + b, 0)}
+            {(Object.values(unreadCounts?.channels || {}) as number[]).reduce(
+              (a, b) => a + b,
+              0
+            )}
           </p>
         </div>
-        
+
         <div className="stat-card">
           <h3>Estado</h3>
-          <p className={`status ${connectionStatus?.connected ? 'connected' : 'disconnected'}`}>
-            {connectionStatus?.connected ? '🟢 Conectado' : '🔴 Desconectado'}
+          <p
+            className={`status ${
+              connectionStatus?.connected ? "connected" : "disconnected"
+            }`}
+          >
+            {connectionStatus?.connected ? "🟢 Conectado" : "🔴 Desconectado"}
           </p>
         </div>
       </div>

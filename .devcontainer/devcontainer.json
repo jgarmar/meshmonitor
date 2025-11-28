@@ -23,6 +23,7 @@
 
   // IDE customizations for optimal development experience
   "customizations": {
+    
     "vscode": {
       // Essential extensions for TypeScript/React development and testing
       "extensions": [

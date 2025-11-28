@@ -17,6 +17,16 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 # Set up workspace
 WORKDIR /workspace
 
+# Create .vscode-server directory structure with correct ownership
+# When Docker mounts an empty volume on this directory, it copies the structure with permissions
+RUN mkdir -p /home/node/.vscode-server/bin \
+             /home/node/.vscode-server/data/Machine \
+             /home/node/.vscode-server/extensions \
+             /home/node/.vscode-server-insiders/bin \
+             /home/node/.vscode-server-insiders/data/Machine \
+             /home/node/.vscode-server-insiders/extensions \
+    && chown -R node:node /home/node/.vscode-server /home/node/.vscode-server-insiders
+
 # Use non-root user for security
 USER node
 
