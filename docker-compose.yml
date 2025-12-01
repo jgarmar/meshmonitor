@@ -14,37 +14,12 @@ services:
 
     container_name: meshmonitor
     ports:
-      - "8080:3001"
+      - '8087:3001'
+      - '4404:4404'
     restart: unless-stopped
     volumes:
       - meshmonitor-data:/data
     env_file: .env
-    environment:
-      # Minimal configuration for http://localhost:8080
-      - NODE_ENV=development  # Use development mode for simple HTTP deployments
-      - TZ=America/New_York
-      - ALLOWED_ORIGINS=http://localhost:8080  # Required for CORS
-
-      # OPTIONAL: Uncomment and configure for production deployments
-      # See docs/configuration/production.md for full production setup guide
-
-      # For production with HTTPS reverse proxy (nginx, Caddy, Traefik):
-      # - NODE_ENV=production
-      # - SESSION_SECRET=your-generated-secret-here  # Required in production
-      # - TRUST_PROXY=true
-      # - ALLOWED_ORIGINS=https://yourdomain.com
-
-      # For production with direct HTTP (not recommended):
-      # - NODE_ENV=production
-      # - SESSION_SECRET=your-generated-secret-here  # Required in production
-      # - COOKIE_SECURE=false
-
-      # DISASTER RECOVERY: Restore from system backup
-      # To restore from a backup on container startup, set RESTORE_FROM_BACKUP
-      # to the backup directory name (e.g., 2025-11-08_151637)
-      # Backups must be in /data/system-backups/ directory
-      # See docs/operations/disaster-recovery.md for details
-      # - RESTORE_FROM_BACKUP=2025-11-08_151637
 
 volumes:
   meshmonitor-data:
