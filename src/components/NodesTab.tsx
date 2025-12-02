@@ -10,7 +10,7 @@ import { getHardwareModelName, getRoleName } from '../utils/nodeHelpers';
 import { formatTime, formatDateTime } from '../utils/datetime';
 import { getTilesetById } from '../config/tilesets';
 import { useMapContext } from '../contexts/MapContext';
-import { useData } from '../contexts/DataContext';
+import { useTelemetryNodes, useDeviceConfig } from '../hooks/useServerData';
 import { useUI } from '../contexts/UIContext';
 import { useSettings } from '../contexts/SettingsContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -108,13 +108,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     positionHistory,
   } = useMapContext();
 
+  // Get telemetry availability and device config from TanStack Query cache
   const {
-    currentNodeId,
     nodesWithTelemetry,
-    nodesWithWeatherTelemetry,
+    nodesWithWeather: nodesWithWeatherTelemetry,
     nodesWithEstimatedPosition,
     nodesWithPKC,
-  } = useData();
+  } = useTelemetryNodes();
+
+  const { currentNodeId } = useDeviceConfig();
 
   const {
     nodeFilter,

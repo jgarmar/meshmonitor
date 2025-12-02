@@ -1,6 +1,6 @@
 import React from 'react';
 import { useUI } from '../contexts/UIContext';
-import { useData } from '../contexts/DataContext';
+import { useChannels } from '../hooks/useServerData';
 
 interface NodeFilterPopupProps {
   isOpen: boolean;
@@ -9,7 +9,7 @@ interface NodeFilterPopupProps {
 
 export const NodeFilterPopup: React.FC<NodeFilterPopupProps> = ({ isOpen, onClose }) => {
   const { securityFilter, setSecurityFilter, channelFilter, setChannelFilter } = useUI();
-  const { channels } = useData();
+  const { channels } = useChannels();
 
   if (!isOpen) return null;
 
