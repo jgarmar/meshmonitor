@@ -51,24 +51,22 @@ interface NodesTabProps {
 // Helper function to check if a date is today
 const isToday = (date: Date): boolean => {
   const today = new Date();
-  return date.getDate() === today.getDate() &&
+  return (
+    date.getDate() === today.getDate() &&
     date.getMonth() === today.getMonth() &&
-    date.getFullYear() === today.getFullYear();
+    date.getFullYear() === today.getFullYear()
+  );
 };
 
 // Separate components for traceroutes that can update independently
 // These prevent marker re-renders when only the traceroute paths change
-const TraceroutePathsLayer = React.memo<{ paths: React.ReactNode; enabled: boolean }>(
-  ({ paths }) => {
-    return <>{paths}</>;
-  }
-);
+const TraceroutePathsLayer = React.memo<{ paths: React.ReactNode; enabled: boolean }>(({ paths }) => {
+  return <>{paths}</>;
+});
 
-const SelectedTracerouteLayer = React.memo<{ traceroute: React.ReactNode; enabled: boolean }>(
-  ({ traceroute }) => {
-    return <>{traceroute}</>;
-  }
-);
+const SelectedTracerouteLayer = React.memo<{ traceroute: React.ReactNode; enabled: boolean }>(({ traceroute }) => {
+  return <>{traceroute}</>;
+});
 
 const NodesTabComponent: React.FC<NodesTabProps> = ({
   processedNodes,
@@ -133,14 +131,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setIsNodeListCollapsed,
   } = useUI();
 
-  const {
-    timeFormat,
-    dateFormat,
-    mapTileset,
-    setMapTileset,
-    mapPinStyle,
-    customTilesets,
-  } = useSettings();
+  const { timeFormat, dateFormat, mapTileset, setMapTileset, mapPinStyle, customTilesets } = useSettings();
 
   const { hasPermission } = useAuth();
 
@@ -150,11 +141,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   useEffect(() => {
     // Check if the device supports touch
     const checkTouch = () => {
-      return (
-        'ontouchstart' in window ||
-        navigator.maxTouchPoints > 0 ||
-        (navigator as any).msMaxTouchPoints > 0
-      );
+      return 'ontouchstart' in window || navigator.maxTouchPoints > 0 || (navigator as any).msMaxTouchPoints > 0;
     };
     setIsTouchDevice(checkTouch());
   }, []);
@@ -231,40 +218,50 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   }, []); // Empty deps - function never changes
 
   // Stable callback factories for node item interactions
-  const handleNodeClick = useCallback((node: DeviceInfo) => {
-    return () => {
-      setSelectedNodeId(node.user?.id || null);
-      centerMapOnNode(node);
-      // Auto-collapse node list on mobile when a node with position is clicked
-      if (window.innerWidth <= 768) {
-        const hasPosition = node.position &&
-          node.position.latitude != null &&
-          node.position.longitude != null;
-        if (hasPosition) {
-          setIsNodeListCollapsed(true);
+  const handleNodeClick = useCallback(
+    (node: DeviceInfo) => {
+      return () => {
+        setSelectedNodeId(node.user?.id || null);
+        centerMapOnNode(node);
+        // Auto-collapse node list on mobile when a node with position is clicked
+        if (window.innerWidth <= 768) {
+          const hasPosition = node.position && node.position.latitude != null && node.position.longitude != null;
+          if (hasPosition) {
+            setIsNodeListCollapsed(true);
+          }
         }
-      }
-    };
-  }, [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed]);
+      };
+    },
+    [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed]
+  );
 
-  const handleFavoriteClick = useCallback((node: DeviceInfo) => {
-    return (e: React.MouseEvent) => toggleFavorite(node, e);
-  }, [toggleFavorite]);
+  const handleFavoriteClick = useCallback(
+    (node: DeviceInfo) => {
+      return (e: React.MouseEvent) => toggleFavorite(node, e);
+    },
+    [toggleFavorite]
+  );
 
-  const handleDMClick = useCallback((node: DeviceInfo) => {
-    return (e: React.MouseEvent) => {
-      e.stopPropagation();
-      setSelectedDMNode(node.user?.id || '');
-      setActiveTab('messages');
-    };
-  }, [setSelectedDMNode, setActiveTab]);
+  const handleDMClick = useCallback(
+    (node: DeviceInfo) => {
+      return (e: React.MouseEvent) => {
+        e.stopPropagation();
+        setSelectedDMNode(node.user?.id || '');
+        setActiveTab('messages');
+      };
+    },
+    [setSelectedDMNode, setActiveTab]
+  );
 
-  const handlePopupDMClick = useCallback((node: DeviceInfo) => {
-    return () => {
-      setSelectedDMNode(node.user!.id);
-      setActiveTab('messages');
-    };
-  }, [setSelectedDMNode, setActiveTab]);
+  const handlePopupDMClick = useCallback(
+    (node: DeviceInfo) => {
+      return () => {
+        setSelectedDMNode(node.user!.id);
+        setActiveTab('messages');
+      };
+    },
+    [setSelectedDMNode, setActiveTab]
+  );
 
   // Simple toggle callbacks
   const handleCollapseNodeList = useCallback(() => {
@@ -397,64 +394,65 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   };
 
   // Helper function to sort nodes
-  const sortNodes = useCallback((nodes: DeviceInfo[]): DeviceInfo[] => {
-    return [...nodes].sort((a, b) => {
-      let aVal: any, bVal: any;
+  const sortNodes = useCallback(
+    (nodes: DeviceInfo[]): DeviceInfo[] => {
+      return [...nodes].sort((a, b) => {
+        let aVal: any, bVal: any;
 
-      switch (sortField) {
-        case 'longName':
-          aVal = a.user?.longName || `Node ${a.nodeNum}`;
-          bVal = b.user?.longName || `Node ${b.nodeNum}`;
-          break;
-        case 'shortName':
-          aVal = a.user?.shortName || '';
-          bVal = b.user?.shortName || '';
-          break;
-        case 'id':
-          aVal = a.user?.id || a.nodeNum;
-          bVal = b.user?.id || b.nodeNum;
-          break;
-        case 'lastHeard':
-          aVal = a.lastHeard || 0;
-          bVal = b.lastHeard || 0;
-          break;
-        case 'snr':
-          aVal = a.snr ?? -999;
-          bVal = b.snr ?? -999;
-          break;
-        case 'battery':
-          aVal = a.deviceMetrics?.batteryLevel ?? -1;
-          bVal = b.deviceMetrics?.batteryLevel ?? -1;
-          break;
-        case 'hwModel':
-          aVal = a.user?.hwModel ?? 0;
-          bVal = b.user?.hwModel ?? 0;
-          break;
-        case 'hops':
-          aVal = a.hopsAway ?? 999;
-          bVal = b.hopsAway ?? 999;
-          break;
-        default:
-          return 0;
-      }
+        switch (sortField) {
+          case 'longName':
+            aVal = a.user?.longName || `Node ${a.nodeNum}`;
+            bVal = b.user?.longName || `Node ${b.nodeNum}`;
+            break;
+          case 'shortName':
+            aVal = a.user?.shortName || '';
+            bVal = b.user?.shortName || '';
+            break;
+          case 'id':
+            aVal = a.user?.id || a.nodeNum;
+            bVal = b.user?.id || b.nodeNum;
+            break;
+          case 'lastHeard':
+            aVal = a.lastHeard || 0;
+            bVal = b.lastHeard || 0;
+            break;
+          case 'snr':
+            aVal = a.snr ?? -999;
+            bVal = b.snr ?? -999;
+            break;
+          case 'battery':
+            aVal = a.deviceMetrics?.batteryLevel ?? -1;
+            bVal = b.deviceMetrics?.batteryLevel ?? -1;
+            break;
+          case 'hwModel':
+            aVal = a.user?.hwModel ?? 0;
+            bVal = b.user?.hwModel ?? 0;
+            break;
+          case 'hops':
+            aVal = a.hopsAway ?? 999;
+            bVal = b.hopsAway ?? 999;
+            break;
+          default:
+            return 0;
+        }
 
-      // Compare values
-      let comparison = 0;
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        comparison = aVal.localeCompare(bVal);
-      } else {
-        comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-      }
+        // Compare values
+        let comparison = 0;
+        if (typeof aVal === 'string' && typeof bVal === 'string') {
+          comparison = aVal.localeCompare(bVal);
+        } else {
+          comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+        }
 
-      return sortDirection === 'asc' ? comparison : -comparison;
-    });
-  }, [sortField, sortDirection]);
+        return sortDirection === 'asc' ? comparison : -comparison;
+      });
+    },
+    [sortField, sortDirection]
+  );
 
   // Calculate nodes with position
-  const nodesWithPosition = processedNodes.filter(node =>
-    node.position &&
-    node.position.latitude != null &&
-    node.position.longitude != null
+  const nodesWithPosition = processedNodes.filter(
+    node => node.position && node.position.latitude != null && node.position.longitude != null
   );
 
   // Memoize node positions to prevent React-Leaflet from resetting marker positions
@@ -490,7 +488,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
     // Fall back to average position of all nodes
     const avgLat = nodesWithPosition.reduce((sum, node) => sum + node.position!.latitude, 0) / nodesWithPosition.length;
-    const avgLng = nodesWithPosition.reduce((sum, node) => sum + node.position!.longitude, 0) / nodesWithPosition.length;
+    const avgLng =
+      nodesWithPosition.reduce((sum, node) => sum + node.position!.longitude, 0) / nodesWithPosition.length;
     return [avgLat, avgLng];
   };
 
@@ -507,222 +506,234 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             {isNodeListCollapsed ? '▶' : '◀'}
           </button>
           {!isNodeListCollapsed && (
-          <div className="sidebar-header-content">
-            <h3>Nodes ({(() => {
-              const filteredCount = processedNodes.filter(node => {
-                if (securityFilter === 'flaggedOnly') {
-                  return node.keyIsLowEntropy || node.duplicateKeyDetected;
-                }
-                if (securityFilter === 'hideFlagged') {
-                  return !node.keyIsLowEntropy && !node.duplicateKeyDetected;
-                }
-                return true;
-              }).length;
-              return securityFilter !== 'all' ? `${filteredCount}/${processedNodes.length}` : processedNodes.length;
-            })()})</h3>
-          </div>
+            <div className="sidebar-header-content">
+              <h3>
+                Nodes (
+                {(() => {
+                  const filteredCount = processedNodes.filter(node => {
+                    if (securityFilter === 'flaggedOnly') {
+                      return node.keyIsLowEntropy || node.duplicateKeyDetected;
+                    }
+                    if (securityFilter === 'hideFlagged') {
+                      return !node.keyIsLowEntropy && !node.duplicateKeyDetected;
+                    }
+                    return true;
+                  }).length;
+                  return securityFilter !== 'all' ? `${filteredCount}/${processedNodes.length}` : processedNodes.length;
+                })()}
+                )
+              </h3>
+            </div>
           )}
           {!isNodeListCollapsed && (
-          <div className="node-controls">
-            <input
-              type="text"
-              placeholder="Filter nodes..."
-              value={nodeFilter}
-              onChange={(e) => setNodeFilter(e.target.value)}
-              className="filter-input-small"
-            />
-            <div className="sort-controls">
-              <button
-                className="filter-popup-btn"
-                onClick={handleToggleFilterPopup}
-                title="Filter nodes"
-              >
-                Filter
-              </button>
-              <select
-                value={sortField}
-                onChange={(e) => setSortField(e.target.value as any)}
-                className="sort-dropdown"
-                title="Sort nodes by"
-              >
-                <option value="longName">Sort: Name</option>
-                <option value="shortName">Sort: Short Name</option>
-                <option value="id">Sort: ID</option>
-                <option value="lastHeard">Sort: Updated</option>
-                <option value="snr">Sort: Signal</option>
-                <option value="battery">Sort: Charge</option>
-                <option value="hwModel">Sort: Hardware</option>
-                <option value="hops">Sort: Hops</option>
-              </select>
-              <button
-                className="sort-direction-btn"
-                onClick={handleToggleSortDirection}
-                title={sortDirection === 'asc' ? 'Ascending' : 'Descending'}
-              >
-                {sortDirection === 'asc' ? '↑' : '↓'}
-              </button>
+            <div className="node-controls">
+              <input
+                type="text"
+                placeholder="Filter nodes..."
+                value={nodeFilter}
+                onChange={e => setNodeFilter(e.target.value)}
+                className="filter-input-small"
+              />
+              <div className="sort-controls">
+                <button className="filter-popup-btn" onClick={handleToggleFilterPopup} title="Filter nodes">
+                  Filter
+                </button>
+                <select
+                  value={sortField}
+                  onChange={e => setSortField(e.target.value as any)}
+                  className="sort-dropdown"
+                  title="Sort nodes by"
+                >
+                  <option value="longName">Sort: Name</option>
+                  <option value="shortName">Sort: Short Name</option>
+                  <option value="id">Sort: ID</option>
+                  <option value="lastHeard">Sort: Updated</option>
+                  <option value="snr">Sort: Signal</option>
+                  <option value="battery">Sort: Charge</option>
+                  <option value="hwModel">Sort: Hardware</option>
+                  <option value="hops">Sort: Hops</option>
+                </select>
+                <button
+                  className="sort-direction-btn"
+                  onClick={handleToggleSortDirection}
+                  title={sortDirection === 'asc' ? 'Ascending' : 'Descending'}
+                >
+                  {sortDirection === 'asc' ? '↑' : '↓'}
+                </button>
+              </div>
             </div>
-          </div>
           )}
         </div>
 
         {!isNodeListCollapsed && (
-        <div className="nodes-list">
-          {shouldShowData() ? (() => {
-            // Apply security and channel filters
-            const filteredNodes = processedNodes.filter(node => {
-              // Security filter
-              if (securityFilter === 'flaggedOnly') {
-                if (!node.keyIsLowEntropy && !node.duplicateKeyDetected) return false;
-              }
-              if (securityFilter === 'hideFlagged') {
-                if (node.keyIsLowEntropy || node.duplicateKeyDetected) return false;
-              }
+          <div className="nodes-list">
+            {shouldShowData() ? (
+              (() => {
+                // Apply security and channel filters
+                const filteredNodes = processedNodes.filter(node => {
+                  // Security filter
+                  if (securityFilter === 'flaggedOnly') {
+                    if (!node.keyIsLowEntropy && !node.duplicateKeyDetected) return false;
+                  }
+                  if (securityFilter === 'hideFlagged') {
+                    if (node.keyIsLowEntropy || node.duplicateKeyDetected) return false;
+                  }
 
-              // Channel filter
-              if (channelFilter !== 'all') {
-                const nodeChannel = node.channel ?? 0;
-                if (nodeChannel !== channelFilter) return false;
-              }
+                  // Channel filter
+                  if (channelFilter !== 'all') {
+                    const nodeChannel = node.channel ?? 0;
+                    if (nodeChannel !== channelFilter) return false;
+                  }
 
-              return true;
-            });
+                  return true;
+                });
 
-            // Sort nodes: favorites first, then non-favorites, each group sorted independently
-            const favorites = filteredNodes.filter(node => node.isFavorite);
-            const nonFavorites = filteredNodes.filter(node => !node.isFavorite);
-            const sortedFavorites = sortNodes(favorites);
-            const sortedNonFavorites = sortNodes(nonFavorites);
-            const sortedNodes = [...sortedFavorites, ...sortedNonFavorites];
+                // Sort nodes: favorites first, then non-favorites, each group sorted independently
+                const favorites = filteredNodes.filter(node => node.isFavorite);
+                const nonFavorites = filteredNodes.filter(node => !node.isFavorite);
+                const sortedFavorites = sortNodes(favorites);
+                const sortedNonFavorites = sortNodes(nonFavorites);
+                const sortedNodes = [...sortedFavorites, ...sortedNonFavorites];
 
-            return sortedNodes.length > 0 ? (
-              <>
-              {sortedNodes.map(node => (
-                <div
-                  key={node.nodeNum}
-                  className={`node-item ${selectedNodeId === node.user?.id ? 'selected' : ''}`}
-                  onClick={handleNodeClick(node)}
-                >
-                  <div className="node-header">
-                    <div className="node-name">
-                      <button
-                        className="favorite-star"
-                        title={node.isFavorite ? "Remove from favorites" : "Add to favorites"}
-                        onClick={handleFavoriteClick(node)}
+                return sortedNodes.length > 0 ? (
+                  <>
+                    {sortedNodes.map(node => (
+                      <div
+                        key={node.nodeNum}
+                        className={`node-item ${selectedNodeId === node.user?.id ? 'selected' : ''}`}
+                        onClick={handleNodeClick(node)}
                       >
-                        {node.isFavorite ? '⭐' : '☆'}
-                      </button>
-                      <div className="node-name-text">
-                        <div className="node-longname">
-                          {node.user?.longName || `Node ${node.nodeNum}`}
+                        <div className="node-header">
+                          <div className="node-name">
+                            <button
+                              className="favorite-star"
+                              title={node.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+                              onClick={handleFavoriteClick(node)}
+                            >
+                              {node.isFavorite ? '⭐' : '☆'}
+                            </button>
+                            <div className="node-name-text">
+                              <div className="node-longname">{node.user?.longName || `Node ${node.nodeNum}`}</div>
+                              {node.user?.role !== undefined &&
+                                node.user?.role !== null &&
+                                getRoleName(node.user.role) && (
+                                  <div className="node-role" title="Node Role">
+                                    {getRoleName(node.user.role)}
+                                  </div>
+                                )}
+                            </div>
+                          </div>
+                          <div className="node-actions">
+                            {hasPermission('messages', 'read') && (
+                              <button className="dm-icon" title="Send Direct Message" onClick={handleDMClick(node)}>
+                                💬
+                              </button>
+                            )}
+                            {(node.keyIsLowEntropy || node.duplicateKeyDetected) && (
+                              <span
+                                className="security-warning-icon"
+                                title={node.keySecurityIssueDetails || 'Key security issue detected'}
+                                style={{
+                                  fontSize: '16px',
+                                  color: '#f44336',
+                                  marginLeft: '4px',
+                                  cursor: 'help',
+                                }}
+                              >
+                                ⚠️
+                              </span>
+                            )}
+                            <div className="node-short">{node.user?.shortName || '-'}</div>
+                          </div>
                         </div>
-                        {node.user?.role !== undefined && node.user?.role !== null && getRoleName(node.user.role) && (
-                          <div className="node-role" title="Node Role">{getRoleName(node.user.role)}</div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="node-actions">
-                      {hasPermission('messages', 'read') && (
-                        <button
-                          className="dm-icon"
-                          title="Send Direct Message"
-                          onClick={handleDMClick(node)}
-                        >
-                          💬
-                        </button>
-                      )}
-                      {(node.keyIsLowEntropy || node.duplicateKeyDetected) && (
-                        <span
-                          className="security-warning-icon"
-                          title={node.keySecurityIssueDetails || 'Key security issue detected'}
-                          style={{
-                            fontSize: '16px',
-                            color: '#f44336',
-                            marginLeft: '4px',
-                            cursor: 'help'
-                          }}
-                        >
-                          ⚠️
-                        </span>
-                      )}
-                      <div className="node-short">
-                        {node.user?.shortName || '-'}
-                      </div>
-                    </div>
-                  </div>
 
-                  <div className="node-details">
-                    <div className="node-stats">
-                      {node.snr != null && (
-                        <span className="stat" title="Signal-to-Noise Ratio">
-                          📶 {node.snr.toFixed(1)}dB
-                        </span>
-                      )}
-                      {node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null && (
-                        <span className="stat" title={node.deviceMetrics.batteryLevel === 101 ? "Plugged In" : "Battery Level"}>
-                          {node.deviceMetrics.batteryLevel === 101 ? '🔌' : `🔋 ${node.deviceMetrics.batteryLevel}%`}
-                        </span>
-                      )}
-                      {node.hopsAway != null && (
-                        <span className="stat" title="Hops Away">
-                          🔗 {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
-                          {node.channel != null && node.channel !== 0 && ` (ch:${node.channel})`}
-                        </span>
-                      )}
-                    </div>
+                        <div className="node-details">
+                          <div className="node-stats">
+                            {node.snr != null && (
+                              <span className="stat" title="Signal-to-Noise Ratio">
+                                📶 {node.snr.toFixed(1)}dB
+                              </span>
+                            )}
+                            {node.deviceMetrics?.batteryLevel !== undefined &&
+                              node.deviceMetrics.batteryLevel !== null && (
+                                <span
+                                  className="stat"
+                                  title={node.deviceMetrics.batteryLevel === 101 ? 'Plugged In' : 'Battery Level'}
+                                >
+                                  {node.deviceMetrics.batteryLevel === 101
+                                    ? '🔌'
+                                    : `🔋 ${node.deviceMetrics.batteryLevel}%`}
+                                </span>
+                              )}
+                            {node.hopsAway != null && (
+                              <span className="stat" title="Hops Away">
+                                🔗 {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
+                                {node.channel != null && node.channel !== 0 && ` (ch:${node.channel})`}
+                              </span>
+                            )}
+                          </div>
 
-                    <div className="node-time">
-                      {node.lastHeard ? (() => {
-                        const date = new Date(node.lastHeard * 1000);
-                        return isToday(date)
-                          ? formatTime(date, timeFormat)
-                          : formatDateTime(date, timeFormat, dateFormat);
-                      })() : 'Never'}
-                    </div>
-                  </div>
+                          <div className="node-time">
+                            {node.lastHeard
+                              ? (() => {
+                                  const date = new Date(node.lastHeard * 1000);
+                                  return isToday(date)
+                                    ? formatTime(date, timeFormat)
+                                    : formatDateTime(date, timeFormat, dateFormat);
+                                })()
+                              : 'Never'}
+                          </div>
+                        </div>
 
-                  <div className="node-indicators">
-                    {node.position && node.position.latitude != null && node.position.longitude != null && (
-                      <div className="node-location" title="Location">
-                        📍 {node.position.latitude.toFixed(3)}, {node.position.longitude.toFixed(3)}
-                        {node.isMobile && <span title="Mobile Node (position varies > 1km)" style={{ marginLeft: '4px' }}>🚶</span>}
+                        <div className="node-indicators">
+                          {node.position && node.position.latitude != null && node.position.longitude != null && (
+                            <div className="node-location" title="Location">
+                              📍 {node.position.latitude.toFixed(3)}, {node.position.longitude.toFixed(3)}
+                              {node.isMobile && (
+                                <span title="Mobile Node (position varies > 1km)" style={{ marginLeft: '4px' }}>
+                                  🚶
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          {node.viaMqtt && (
+                            <div className="node-mqtt" title="Connected via MQTT">
+                              🌐
+                            </div>
+                          )}
+                          {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
+                            <div className="node-telemetry" title="Has Telemetry Data">
+                              📊
+                            </div>
+                          )}
+                          {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
+                            <div className="node-weather" title="Has Weather Data">
+                              ☀️
+                            </div>
+                          )}
+                          {node.user?.id && nodesWithPKC.has(node.user.id) && (
+                            <div className="node-pkc" title="Has Public Key Cryptography">
+                              🔐
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    )}
-                    {node.viaMqtt && (
-                      <div className="node-mqtt" title="Connected via MQTT">
-                        🌐
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
-                      <div className="node-telemetry" title="Has Telemetry Data">
-                        📊
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
-                      <div className="node-weather" title="Has Weather Data">
-                        ☀️
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithPKC.has(node.user.id) && (
-                      <div className="node-pkc" title="Has Public Key Cryptography">
-                        🔐
-                      </div>
-                    )}
+                    ))}
+                  </>
+                ) : (
+                  <div className="no-data">
+                    {securityFilter !== 'all'
+                      ? 'No nodes match security filter'
+                      : nodeFilter
+                      ? 'No nodes match filter'
+                      : 'No nodes detected'}
                   </div>
-                </div>
-              ))}
-              </>
+                );
+              })()
             ) : (
-              <div className="no-data">
-                {securityFilter !== 'all' ? 'No nodes match security filter' : (nodeFilter ? 'No nodes match filter' : 'No nodes detected')}
-              </div>
-            );
-          })() : (
-            <div className="no-data">
-              Connect to Meshtastic node
-            </div>
-          )}
-        </div>
+              <div className="no-data">Connect to Meshtastic node</div>
+            )}
+          </div>
         )}
       </div>
 
@@ -742,50 +753,34 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 <>
                   <div className="map-controls-title">Features</div>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showPaths}
-                      onChange={(e) => setShowPaths(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showPaths} onChange={e => setShowPaths(e.target.checked)} />
                     <span>Show Route Segments</span>
                   </label>
                   <label className="map-control-item">
                     <input
                       type="checkbox"
                       checked={showNeighborInfo}
-                      onChange={(e) => setShowNeighborInfo(e.target.checked)}
+                      onChange={e => setShowNeighborInfo(e.target.checked)}
                     />
                     <span>Show Neighbor Info</span>
                   </label>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showRoute}
-                      onChange={(e) => setShowRoute(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showRoute} onChange={e => setShowRoute(e.target.checked)} />
                     <span>Show Traceroute</span>
                   </label>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showMqttNodes}
-                      onChange={(e) => setShowMqttNodes(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showMqttNodes} onChange={e => setShowMqttNodes(e.target.checked)} />
                     <span>Show MQTT</span>
                   </label>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showMotion}
-                      onChange={(e) => setShowMotion(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showMotion} onChange={e => setShowMotion(e.target.checked)} />
                     <span>Show Position History</span>
                   </label>
                   <label className="map-control-item">
                     <input
                       type="checkbox"
                       checked={showAnimations}
-                      onChange={(e) => setShowAnimations(e.target.checked)}
+                      onChange={e => setShowAnimations(e.target.checked)}
                     />
                     <span>Show Animations</span>
                   </label>
@@ -794,7 +789,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       <input
                         type="checkbox"
                         checked={showPacketMonitor}
-                        onChange={(e) => setShowPacketMonitor(e.target.checked)}
+                        onChange={e => setShowPacketMonitor(e.target.checked)}
                       />
                       <span>Show Packet Monitor</span>
                     </label>
@@ -802,15 +797,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 </>
               )}
             </div>
-            <MapContainer
-              center={getMapCenter()}
-              zoom={mapZoom}
-              style={{ height: '100%', width: '100%' }}
-            >
-              <MapCenterController
-                centerTarget={mapCenterTarget}
-                onCenterComplete={handleCenterComplete}
-              />
+            <MapContainer center={getMapCenter()} zoom={mapZoom} style={{ height: '100%', width: '100%' }}>
+              <MapCenterController centerTarget={mapCenterTarget} onCenterComplete={handleCenterComplete} />
               {getTilesetById(activeTileset, customTilesets).isVector ? (
                 <VectorTileLayer
                   url={getTilesetById(activeTileset, customTilesets).url}
@@ -832,146 +820,152 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               {nodesWithPosition
                 .filter(node => showMqttNodes || !node.viaMqtt)
                 .map(node => {
-                const roleNum = typeof node.user?.role === 'string'
-                  ? parseInt(node.user.role, 10)
-                  : (typeof node.user?.role === 'number' ? node.user.role : 0);
-                const isRouter = roleNum === 2;
-                const isSelected = selectedNodeId === node.user?.id;
+                  const roleNum =
+                    typeof node.user?.role === 'string'
+                      ? parseInt(node.user.role, 10)
+                      : typeof node.user?.role === 'number'
+                      ? node.user.role
+                      : 0;
+                  const isRouter = roleNum === 2;
+                  const isSelected = selectedNodeId === node.user?.id;
 
-                // Get hop count for this node
-                // Local node always gets 0 hops (green), otherwise use hopsAway from protobuf
-                const isLocalNode = node.user?.id === currentNodeId;
-                const hops = isLocalNode ? 0 : (node.hopsAway ?? 999);
-                const showLabel = mapZoom >= 13; // Show labels when zoomed in
+                  // Get hop count for this node
+                  // Local node always gets 0 hops (green), otherwise use hopsAway from protobuf
+                  const isLocalNode = node.user?.id === currentNodeId;
+                  const hops = isLocalNode ? 0 : node.hopsAway ?? 999;
+                  const showLabel = mapZoom >= 13; // Show labels when zoomed in
 
-                const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
+                  const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
 
-                const markerIcon = createNodeIcon({
-                  hops: hops, // 0 (local) = green, 999 (no hops_away data) = grey
-                  isSelected,
-                  isRouter,
-                  shortName: node.user?.shortName,
-                  showLabel: showLabel || shouldAnimate, // Show label when animating OR zoomed in
-                  animate: shouldAnimate,
-                  pinStyle: mapPinStyle
-                });
+                  const markerIcon = createNodeIcon({
+                    hops: hops, // 0 (local) = green, 999 (no hops_away data) = grey
+                    isSelected,
+                    isRouter,
+                    shortName: node.user?.shortName,
+                    showLabel: showLabel || shouldAnimate, // Show label when animating OR zoomed in
+                    animate: shouldAnimate,
+                    pinStyle: mapPinStyle,
+                  });
 
-                // Use memoized position to prevent React-Leaflet from resetting marker position
-                const position = nodePositions.get(node.nodeNum)!;
+                  // Use memoized position to prevent React-Leaflet from resetting marker position
+                  const position = nodePositions.get(node.nodeNum)!;
 
-                return (
-              <Marker
-                key={node.nodeNum}
-                position={position}
-                icon={markerIcon}
-                zIndexOffset={shouldAnimate ? 10000 : 0}
-                ref={(ref) => handleMarkerRef(ref, node.user?.id)}
-              >
-                {!isTouchDevice && (
-                  <Tooltip direction="top" offset={[0, -20]} opacity={0.9} interactive>
-                    <div style={{ textAlign: 'center' }}>
-                      <div style={{ fontWeight: 'bold' }}>
-                        {node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}
-                      </div>
-                      {node.hopsAway !== undefined && (
-                        <div style={{ fontSize: '0.85em', opacity: 0.8 }}>
-                          {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
-                        </div>
-                      )}
-                    </div>
-                  </Tooltip>
-                )}
-                <Popup autoPan={false}>
-                  <div className="node-popup">
-                    <div className="node-popup-header">
-                      <div className="node-popup-title">{node.user?.longName || `Node ${node.nodeNum}`}</div>
-                      {node.user?.shortName && (
-                        <div className="node-popup-subtitle">{node.user.shortName}</div>
-                      )}
-                    </div>
-
-                    <div className="node-popup-grid">
-                      {node.user?.id && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">🆔</span>
-                          <span className="node-popup-value">{node.user.id}</span>
-                        </div>
-                      )}
-
-                      {node.user?.role !== undefined && (() => {
-                        const roleNum = typeof node.user.role === 'string'
-                          ? parseInt(node.user.role, 10)
-                          : node.user.role;
-                        const roleName = getRoleName(roleNum);
-                        return roleName ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">👤</span>
-                            <span className="node-popup-value">{roleName}</span>
+                  return (
+                    <Marker
+                      key={node.nodeNum}
+                      position={position}
+                      icon={markerIcon}
+                      zIndexOffset={shouldAnimate ? 10000 : 0}
+                      ref={ref => handleMarkerRef(ref, node.user?.id)}
+                    >
+                      {!isTouchDevice && (
+                        <Tooltip direction="top" offset={[0, -20]} opacity={0.9} interactive>
+                          <div style={{ textAlign: 'center' }}>
+                            <div style={{ fontWeight: 'bold' }}>
+                              {node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}
+                            </div>
+                            {node.hopsAway !== undefined && (
+                              <div style={{ fontSize: '0.85em', opacity: 0.8 }}>
+                                {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
+                              </div>
+                            )}
                           </div>
-                        ) : null;
-                      })()}
-
-                      {node.user?.hwModel !== undefined && (() => {
-                        const hwModelName = getHardwareModelName(node.user.hwModel);
-                        return hwModelName ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">🖥️</span>
-                            <span className="node-popup-value">{hwModelName}</span>
+                        </Tooltip>
+                      )}
+                      <Popup autoPan={false}>
+                        <div className="node-popup">
+                          <div className="node-popup-header">
+                            <div className="node-popup-title">{node.user?.longName || `Node ${node.nodeNum}`}</div>
+                            {node.user?.shortName && <div className="node-popup-subtitle">{node.user.shortName}</div>}
                           </div>
-                        ) : null;
-                      })()}
 
-                      {node.snr != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">📶</span>
-                          <span className="node-popup-value">{node.snr.toFixed(1)} dB</span>
+                          <div className="node-popup-grid">
+                            {node.user?.id && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">🆔</span>
+                                <span className="node-popup-value">{node.user.id}</span>
+                              </div>
+                            )}
+
+                            {node.user?.role !== undefined &&
+                              (() => {
+                                const roleNum =
+                                  typeof node.user.role === 'string' ? parseInt(node.user.role, 10) : node.user.role;
+                                const roleName = getRoleName(roleNum);
+                                return roleName ? (
+                                  <div className="node-popup-item">
+                                    <span className="node-popup-icon">👤</span>
+                                    <span className="node-popup-value">{roleName}</span>
+                                  </div>
+                                ) : null;
+                              })()}
+
+                            {node.user?.hwModel !== undefined &&
+                              (() => {
+                                const hwModelName = getHardwareModelName(node.user.hwModel);
+                                return hwModelName ? (
+                                  <div className="node-popup-item">
+                                    <span className="node-popup-icon">🖥️</span>
+                                    <span className="node-popup-value">{hwModelName}</span>
+                                  </div>
+                                ) : null;
+                              })()}
+
+                            {node.snr != null && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">📶</span>
+                                <span className="node-popup-value">{node.snr.toFixed(1)} dB</span>
+                              </div>
+                            )}
+
+                            {node.hopsAway != null && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">🔗</span>
+                                <span className="node-popup-value">
+                                  {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
+                                </span>
+                              </div>
+                            )}
+
+                            {node.position?.altitude != null && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">⛰️</span>
+                                <span className="node-popup-value">{node.position.altitude}m</span>
+                              </div>
+                            )}
+
+                            {node.deviceMetrics?.batteryLevel !== undefined &&
+                              node.deviceMetrics.batteryLevel !== null && (
+                                <div className="node-popup-item">
+                                  <span className="node-popup-icon">
+                                    {node.deviceMetrics.batteryLevel === 101 ? '🔌' : '🔋'}
+                                  </span>
+                                  <span className="node-popup-value">
+                                    {node.deviceMetrics.batteryLevel === 101
+                                      ? 'Plugged In'
+                                      : `${node.deviceMetrics.batteryLevel}%`}
+                                  </span>
+                                </div>
+                              )}
+                          </div>
+
+                          {node.lastHeard && (
+                            <div className="node-popup-footer">
+                              <span className="node-popup-icon">🕐</span>
+                              {formatDateTime(new Date(node.lastHeard * 1000), timeFormat, dateFormat)}
+                            </div>
+                          )}
+
+                          {node.user?.id && hasPermission('messages', 'read') && (
+                            <button className="node-popup-btn" onClick={handlePopupDMClick(node)}>
+                              💬 Direct Message
+                            </button>
+                          )}
                         </div>
-                      )}
-
-                      {node.hopsAway != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">🔗</span>
-                          <span className="node-popup-value">{node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}</span>
-                        </div>
-                      )}
-
-                      {node.position?.altitude != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">⛰️</span>
-                          <span className="node-popup-value">{node.position.altitude}m</span>
-                        </div>
-                      )}
-
-                      {node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">{node.deviceMetrics.batteryLevel === 101 ? '🔌' : '🔋'}</span>
-                          <span className="node-popup-value">
-                            {node.deviceMetrics.batteryLevel === 101 ? 'Plugged In' : `${node.deviceMetrics.batteryLevel}%`}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {node.lastHeard && (
-                      <div className="node-popup-footer">
-                        <span className="node-popup-icon">🕐</span>
-                        {formatDateTime(new Date(node.lastHeard * 1000), timeFormat, dateFormat)}
-                      </div>
-                    )}
-
-                    {node.user?.id && hasPermission('messages', 'read') && (
-                      <button
-                        className="node-popup-btn"
-                        onClick={handlePopupDMClick(node)}
-                      >
-                        💬 Direct Message
-                      </button>
-                    )}
-                  </div>
-                </Popup>
-              </Marker>
-                );
-              })}
+                      </Popup>
+                    </Marker>
+                  );
+                })}
 
               {/* Draw uncertainty circles for estimated positions */}
               {nodesWithPosition
@@ -986,7 +980,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
                   // Get hop color for the circle (same as marker)
                   const isLocalNode = node.user?.id === currentNodeId;
-                  const hops = isLocalNode ? 0 : (node.hopsAway ?? 999);
+                  const hops = isLocalNode ? 0 : node.hopsAway ?? 999;
                   const color = getHopColor(hops);
 
                   return (
@@ -1000,7 +994,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                         fillOpacity: 0.1,
                         opacity: 0.4,
                         weight: 2,
-                        dashArray: '5, 5'
+                        dashArray: '5, 5',
                       }}
                     />
                   );
@@ -1013,105 +1007,106 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <SelectedTracerouteLayer traceroute={selectedNodeTraceroute} enabled={showRoute} />
 
               {/* Draw neighbor info connections */}
-              {showNeighborInfo && neighborInfo.length > 0 && neighborInfo.map((ni, idx) => {
-                // Skip if either node doesn't have position
-                if (!ni.nodeLatitude || !ni.nodeLongitude || !ni.neighborLatitude || !ni.neighborLongitude) {
-                  return null;
-                }
+              {showNeighborInfo &&
+                neighborInfo.length > 0 &&
+                neighborInfo.map((ni, idx) => {
+                  // Skip if either node doesn't have position
+                  if (!ni.nodeLatitude || !ni.nodeLongitude || !ni.neighborLatitude || !ni.neighborLongitude) {
+                    return null;
+                  }
 
-                const positions: [number, number][] = [
-                  [ni.nodeLatitude, ni.nodeLongitude],
-                  [ni.neighborLatitude, ni.neighborLongitude]
-                ];
+                  const positions: [number, number][] = [
+                    [ni.nodeLatitude, ni.nodeLongitude],
+                    [ni.neighborLatitude, ni.neighborLongitude],
+                  ];
 
-                return (
-                  <Polyline
-                    key={`neighbor-${idx}`}
-                    positions={positions}
-                    color="#cba6f7"
-                    weight={4}
-                    opacity={0.7}
-                    dashArray="5, 5"
-                  >
-                    <Popup>
-                      <div className="route-popup">
-                        <h4>Neighbor Connection</h4>
-                        <div className="route-endpoints">
-                          <strong>{ni.nodeName}</strong> ↔ <strong>{ni.neighborName}</strong>
-                        </div>
-                        {ni.snr !== null && ni.snr !== undefined && (
-                          <div className="route-usage">
-                            SNR: <strong>{ni.snr.toFixed(1)} dB</strong>
+                  return (
+                    <Polyline
+                      key={`neighbor-${idx}`}
+                      positions={positions}
+                      color="#cba6f7"
+                      weight={4}
+                      opacity={0.7}
+                      dashArray="5, 5"
+                    >
+                      <Popup>
+                        <div className="route-popup">
+                          <h4>Neighbor Connection</h4>
+                          <div className="route-endpoints">
+                            <strong>{ni.nodeName}</strong> ↔ <strong>{ni.neighborName}</strong>
                           </div>
-                        )}
-                        <div className="route-usage">
-                          Last seen: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong>
+                          {ni.snr !== null && ni.snr !== undefined && (
+                            <div className="route-usage">
+                              SNR: <strong>{ni.snr.toFixed(1)} dB</strong>
+                            </div>
+                          )}
+                          <div className="route-usage">
+                            Last seen: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong>
+                          </div>
                         </div>
-                      </div>
-                    </Popup>
-                  </Polyline>
-                );
-              })}
+                      </Popup>
+                    </Polyline>
+                  );
+                })}
 
               {/* Note: Selected node traceroute with separate forward and back paths */}
               {/* This is handled by traceroutePathsElements passed from parent */}
 
               {/* Draw position history for mobile nodes */}
-              {showMotion && positionHistory.length > 1 && (() => {
-                const historyPositions: [number, number][] = positionHistory.map(p =>
-                  [p.latitude, p.longitude] as [number, number]
-                );
+              {showMotion &&
+                positionHistory.length > 1 &&
+                (() => {
+                  const historyPositions: [number, number][] = positionHistory.map(
+                    p => [p.latitude, p.longitude] as [number, number]
+                  );
 
-                const elements: React.ReactElement[] = [];
+                  const elements: React.ReactElement[] = [];
 
-                // Draw blue line for position history
-                elements.push(
-                  <Polyline
-                    key="position-history-line"
-                    positions={historyPositions}
-                    color="#0066ff"
-                    weight={3}
-                    opacity={0.7}
-                  >
-                    <Popup>
-                      <div className="route-popup">
-                        <h4>Position History</h4>
-                        <div className="route-usage">
-                          {positionHistory.length} position{positionHistory.length !== 1 ? 's' : ''} recorded
+                  // Draw blue line for position history
+                  elements.push(
+                    <Polyline
+                      key="position-history-line"
+                      positions={historyPositions}
+                      color="#0066ff"
+                      weight={3}
+                      opacity={0.7}
+                    >
+                      <Popup>
+                        <div className="route-popup">
+                          <h4>Position History</h4>
+                          <div className="route-usage">
+                            {positionHistory.length} position{positionHistory.length !== 1 ? 's' : ''} recorded
+                          </div>
+                          <div className="route-usage">
+                            {formatDateTime(new Date(positionHistory[0].timestamp), timeFormat, dateFormat)} -{' '}
+                            {formatDateTime(
+                              new Date(positionHistory[positionHistory.length - 1].timestamp),
+                              timeFormat,
+                              dateFormat
+                            )}
+                          </div>
                         </div>
-                        <div className="route-usage">
-                          {formatDateTime(new Date(positionHistory[0].timestamp), timeFormat, dateFormat)} - {formatDateTime(new Date(positionHistory[positionHistory.length - 1].timestamp), timeFormat, dateFormat)}
-                        </div>
-                      </div>
-                    </Popup>
-                  </Polyline>
-                );
+                      </Popup>
+                    </Polyline>
+                  );
 
-                // Generate arrow markers for position history
-                const historyArrows = generateArrowMarkers(
-                  historyPositions,
-                  'position-history',
-                  '#0066ff',
-                  0
-                );
-                elements.push(...historyArrows);
+                  // Generate arrow markers for position history
+                  const historyArrows = generateArrowMarkers(historyPositions, 'position-history', '#0066ff', 0);
+                  elements.push(...historyArrows);
 
-                return elements;
-              })()}
-          </MapContainer>
-          <TilesetSelector
-            selectedTilesetId={activeTileset}
-            onTilesetChange={setMapTileset}
-          />
-          {nodesWithPosition.length === 0 && (
-            <div className="map-overlay">
-              <div className="overlay-content">
-                <h3>📍 No Node Locations</h3>
-                <p>No nodes in your network are currently sharing location data.</p>
-                <p>Nodes with GPS enabled will appear as markers on this map.</p>
+                  return elements;
+                })()}
+            </MapContainer>
+            <TilesetSelector selectedTilesetId={activeTileset} onTilesetChange={setMapTileset} />
+            {nodesWithPosition.length === 0 && (
+              <div className="map-overlay">
+                <div className="overlay-content">
+                  <h3>📍 No Node Locations</h3>
+                  <p>No nodes in your network are currently sharing location data.</p>
+                  <p>Nodes with GPS enabled will appear as markers on this map.</p>
+                </div>
               </div>
-            </div>
-          )}
+            )}
           </>
         ) : (
           <div className="map-placeholder">
@@ -1126,18 +1121,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       {/* Packet Monitor Panel (Desktop Only) */}
       {showPacketMonitor && canViewPacketMonitor && (
         <div className="packet-monitor-container">
-          <PacketMonitorPanel
-            onClose={() => setShowPacketMonitor(false)}
-            onNodeClick={handlePacketNodeClick}
-          />
+          <PacketMonitorPanel onClose={() => setShowPacketMonitor(false)} onNodeClick={handlePacketNodeClick} />
         </div>
       )}
 
       {/* Node Filter Popup */}
-      <NodeFilterPopup
-        isOpen={showNodeFilterPopup}
-        onClose={() => setShowNodeFilterPopup(false)}
-      />
+      <NodeFilterPopup isOpen={showNodeFilterPopup} onClose={() => setShowNodeFilterPopup(false)} />
     </div>
   );
 };
@@ -1147,12 +1136,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
   // Check if favorite status changed for any node
   // Build sets of favorite node numbers for comparison
-  const prevFavorites = new Set(
-    prevProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum)
-  );
-  const nextFavorites = new Set(
-    nextProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum)
-  );
+  const prevFavorites = new Set(prevProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum));
+  const nextFavorites = new Set(nextProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum));
 
   // If the sets differ in size or content, favorites changed - must re-render
   if (prevFavorites.size !== nextFavorites.size) {
@@ -1175,8 +1160,10 @@ const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
       const prev = prevProps.processedNodes[i];
       const next = nextProps.processedNodes[i];
 
-      if (prev.position?.latitude !== next.position?.latitude ||
-          prev.position?.longitude !== next.position?.longitude) {
+      if (
+        prev.position?.latitude !== next.position?.latitude ||
+        prev.position?.longitude !== next.position?.longitude
+      ) {
         hasPositionChanges = true;
       }
 

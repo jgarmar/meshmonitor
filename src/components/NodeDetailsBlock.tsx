@@ -176,9 +176,7 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
           {snr !== undefined && (
             <div className="node-detail-card">
               <div className="node-detail-label">Signal (SNR)</div>
-              <div className={`node-detail-value ${getSignalClass(snr)}`}>
-                {formatSNR(snr)}
-              </div>
+              <div className={`node-detail-value ${getSignalClass(snr)}`}>{formatSNR(snr)}</div>
             </div>
           )}
 
@@ -186,9 +184,7 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
           {rssi !== undefined && (
             <div className="node-detail-card">
               <div className="node-detail-label">Signal (RSSI)</div>
-              <div className="node-detail-value">
-                {formatRSSI(rssi)}
-              </div>
+              <div className="node-detail-value">{formatRSSI(rssi)}</div>
             </div>
           )}
 
@@ -212,79 +208,69 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
             </div>
           )}
 
-        {/* Node ID */}
-        {node.nodeNum !== undefined && (
-          <div className="node-detail-card">
-            <div className="node-detail-label">Node ID</div>
-            <div className="node-detail-value">
-              <div>{formatNodeIdHex(node.nodeNum)}</div>
-              <div className="node-detail-secondary">{formatNodeIdDecimal(node.nodeNum)}</div>
+          {/* Node ID */}
+          {node.nodeNum !== undefined && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">Node ID</div>
+              <div className="node-detail-value">
+                <div>{formatNodeIdHex(node.nodeNum)}</div>
+                <div className="node-detail-secondary">{formatNodeIdDecimal(node.nodeNum)}</div>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Role */}
-        {role !== undefined && (
-          <div className="node-detail-card">
-            <div className="node-detail-label">Role</div>
-            <div className="node-detail-value">
-              {getDeviceRoleName(role)}
+          {/* Role */}
+          {role !== undefined && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">Role</div>
+              <div className="node-detail-value">{getDeviceRoleName(role)}</div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Channel */}
-        {node.channel !== undefined && (
-          <div className="node-detail-card">
-            <div className="node-detail-label">Channel</div>
-            <div className="node-detail-value">
-              {(() => {
-                const channel = (channels || []).find(ch => ch.id === node.channel);
-                return channel?.name
-                  ? `${node.channel} (${channel.name})`
-                  : `${node.channel}`;
-              })()}
+          {/* Channel */}
+          {node.channel !== undefined && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">Channel</div>
+              <div className="node-detail-value">
+                {(() => {
+                  const channel = (channels || []).find(ch => ch.id === node.channel);
+                  return channel?.name ? `${node.channel} (${channel.name})` : `${node.channel}`;
+                })()}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Firmware Version */}
-        {firmwareVersion && (
-          <div className="node-detail-card">
-            <div className="node-detail-label">Firmware</div>
-            <div className="node-detail-value">
-              {firmwareVersion}
+          {/* Firmware Version */}
+          {firmwareVersion && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">Firmware</div>
+              <div className="node-detail-value">{firmwareVersion}</div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Hops Away */}
-        {hopsAway !== undefined && (
-          <div className="node-detail-card">
-            <div className="node-detail-label">Hops Away</div>
-            <div className="node-detail-value">
-              {hopsAway === 0 ? 'Direct' : `${hopsAway} hop${hopsAway !== 1 ? 's' : ''}`}
+          {/* Hops Away */}
+          {hopsAway !== undefined && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">Hops Away</div>
+              <div className="node-detail-value">
+                {hopsAway === 0 ? 'Direct' : `${hopsAway} hop${hopsAway !== 1 ? 's' : ''}`}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Via MQTT */}
-        {viaMqtt && (
-          <div className="node-detail-card">
-            <div className="node-detail-label">Connection</div>
-            <div className="node-detail-value">
-              Via MQTT
+          {/* Via MQTT */}
+          {viaMqtt && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">Connection</div>
+              <div className="node-detail-value">Via MQTT</div>
             </div>
-          </div>
-        )}
+          )}
 
           {/* Last Heard */}
           {lastHeard !== undefined && (
             <div className="node-detail-card">
               <div className="node-detail-label">Last Heard</div>
-              <div className="node-detail-value">
-                {formatLastHeard(lastHeard)}
-              </div>
+              <div className="node-detail-value">{formatLastHeard(lastHeard)}</div>
             </div>
           )}
         </div>

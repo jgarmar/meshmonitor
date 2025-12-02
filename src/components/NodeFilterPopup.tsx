@@ -18,7 +18,7 @@ export const NodeFilterPopup: React.FC<NodeFilterPopupProps> = ({ isOpen, onClos
 
   return (
     <div className="filter-popup-overlay" onClick={onClose}>
-      <div className="filter-popup" onClick={(e) => e.stopPropagation()}>
+      <div className="filter-popup" onClick={e => e.stopPropagation()}>
         <div className="filter-popup-header">
           <h4>Filter Nodes</h4>
           <button className="filter-popup-close" onClick={onClose} aria-label="Close">
@@ -32,7 +32,7 @@ export const NodeFilterPopup: React.FC<NodeFilterPopupProps> = ({ isOpen, onClos
             <span className="filter-section-title">Security Status</span>
             <select
               value={securityFilter}
-              onChange={(e) => setSecurityFilter(e.target.value as 'all' | 'flaggedOnly' | 'hideFlagged')}
+              onChange={e => setSecurityFilter(e.target.value as 'all' | 'flaggedOnly' | 'hideFlagged')}
               className="filter-dropdown"
             >
               <option value="all">All Nodes</option>
@@ -46,7 +46,7 @@ export const NodeFilterPopup: React.FC<NodeFilterPopupProps> = ({ isOpen, onClos
             <span className="filter-section-title">Channel</span>
             <select
               value={channelFilter}
-              onChange={(e) => setChannelFilter(e.target.value === 'all' ? 'all' : parseInt(e.target.value))}
+              onChange={e => setChannelFilter(e.target.value === 'all' ? 'all' : parseInt(e.target.value))}
               className="filter-dropdown"
             >
               <option value="all">All Channels</option>
@@ -54,7 +54,8 @@ export const NodeFilterPopup: React.FC<NodeFilterPopupProps> = ({ isOpen, onClos
                 const channel = channels.find(ch => ch.id === channelId);
                 return (
                   <option key={channelId} value={channelId}>
-                    Channel {channelId}{channel?.name ? ` (${channel.name})` : ''}
+                    Channel {channelId}
+                    {channel?.name ? ` (${channel.name})` : ''}
                   </option>
                 );
               })}
