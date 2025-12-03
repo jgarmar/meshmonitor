@@ -1,7 +1,7 @@
 services:
   meshmonitor:
     # Option 1: Use pre-built image from GitHub Container Registry (recommended)
-    #image: ghcr.io/yeraze/meshmonitor:latest
+    # image: ghcr.io/yeraze/meshmonitor:latest
 
     # Option 2: Build locally (comment out 'image' above and uncomment below for development)
     build:
