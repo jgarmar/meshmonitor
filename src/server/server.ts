@@ -5,7 +5,8 @@ import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import databaseService from '../services/database.js';
+import databaseService, { DbMessage } from '../services/database.js';
+import { MeshMessage } from '../types/message.js';
 import meshtasticManager from './meshtasticManager.js';
 import meshtasticProtobufService from './meshtasticProtobufService.js';
 import { VirtualNodeServer } from './virtualNodeServer.js';
@@ -545,6 +546,10 @@ apiRouter.get('/nodes', optionalAuth(), (_req, res) => {
   try {
     const nodes = meshtasticManager.getAllNodes();
 
+    // Get all estimated positions in a single batch query (fixes N+1 query problem)
+    // This is much more efficient than querying each node individually
+    const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
+
     // Enhance nodes with estimated positions if no regular position is available
     // Mobile status is now pre-computed in the database during packet processing
     const enhancedNodes = nodes.map(node => {
@@ -554,19 +559,12 @@ apiRouter.get('/nodes', optionalAuth(), (_req, res) => {
 
       // If node doesn't have a regular position, check for estimated position
       if (!node.position?.latitude && !node.position?.longitude) {
-        // Get only the most recent estimated position (limit 1 of each type)
-        const positionTelemetry = databaseService.getPositionTelemetryByNode(node.user.id, 2);
-        const estimatedLatitudes = positionTelemetry.filter(t => t.telemetryType === 'estimated_latitude');
-        const estimatedLongitudes = positionTelemetry.filter(t => t.telemetryType === 'estimated_longitude');
-
-        if (estimatedLatitudes.length > 0 && estimatedLongitudes.length > 0) {
-          // Use the most recent estimated position
-          const latestEstimatedLat = estimatedLatitudes[0]; // getPositionTelemetryByNode returns most recent first
-          const latestEstimatedLon = estimatedLongitudes[0];
-
+        // Use batch-loaded estimated positions (O(1) lookup instead of DB query)
+        const estimatedPos = estimatedPositions.get(node.user.id);
+        if (estimatedPos) {
           enhancedNode.position = {
-            latitude: latestEstimatedLat.value,
-            longitude: latestEstimatedLon.value,
+            latitude: estimatedPos.latitude,
+            longitude: estimatedPos.longitude,
             altitude: node.position?.altitude
           };
         }
@@ -1018,10 +1016,40 @@ apiRouter.get('/messages', optionalAuth(), (req, res) => {
   }
 });
 
+// Helper function to transform DbMessage to MeshMessage format
+// This mirrors the transformation in meshtasticManager.getRecentMessages()
+function transformDbMessageToMeshMessage(msg: DbMessage): MeshMessage {
+  return {
+    id: msg.id,
+    from: msg.fromNodeId,
+    to: msg.toNodeId,
+    fromNodeId: msg.fromNodeId,
+    toNodeId: msg.toNodeId,
+    text: msg.text,
+    channel: msg.channel,
+    portnum: msg.portnum,
+    timestamp: new Date(msg.rxTime ?? msg.timestamp),
+    hopStart: msg.hopStart,
+    hopLimit: msg.hopLimit,
+    replyId: msg.replyId,
+    emoji: msg.emoji,
+    requestId: (msg as any).requestId,
+    wantAck: Boolean((msg as any).wantAck),
+    ackFailed: Boolean((msg as any).ackFailed),
+    routingErrorReceived: Boolean((msg as any).routingErrorReceived),
+    deliveryState: (msg as any).deliveryState,
+    acknowledged: msg.channel === -1
+      ? ((msg as any).deliveryState === 'confirmed' ? true : undefined)
+      : ((msg as any).deliveryState === 'delivered' || (msg as any).deliveryState === 'confirmed' ? true : undefined)
+  };
+}
+
 apiRouter.get('/messages/channel/:channel', optionalAuth(), (req, res) => {
   try {
     const requestedChannel = parseInt(req.params.channel);
-    const limit = parseInt(req.query.limit as string) || 100;
+    // Validate and clamp limit (1-500) and offset (0-50000) to prevent abuse
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit as string) || 100, 500));
+    const offset = Math.max(0, Math.min(parseInt(req.query.offset as string) || 0, 50000));
 
     // Check if this is a Primary channel request and map to channel 0 messages
     let messageChannel = requestedChannel;
@@ -1041,8 +1069,12 @@ apiRouter.get('/messages/channel/:channel', optionalAuth(), (req, res) => {
       });
     }
 
-    const messages = databaseService.getMessagesByChannel(messageChannel, limit);
-    res.json(messages);
+    // Fetch limit+1 to accurately detect if more messages exist
+    const dbMessages = databaseService.getMessagesByChannel(messageChannel, limit + 1, offset);
+    const hasMore = dbMessages.length > limit;
+    // Return only the requested limit
+    const messages = dbMessages.slice(0, limit).map(transformDbMessageToMeshMessage);
+    res.json({ messages, hasMore });
   } catch (error) {
     logger.error('Error fetching channel messages:', error);
     res.status(500).json({ error: 'Failed to fetch channel messages' });
@@ -1052,9 +1084,15 @@ apiRouter.get('/messages/channel/:channel', optionalAuth(), (req, res) => {
 apiRouter.get('/messages/direct/:nodeId1/:nodeId2', requirePermission('messages', 'read'), (req, res) => {
   try {
     const { nodeId1, nodeId2 } = req.params;
-    const limit = parseInt(req.query.limit as string) || 100;
-    const messages = databaseService.getDirectMessages(nodeId1, nodeId2, limit);
-    res.json(messages);
+    // Validate and clamp limit (1-500) and offset (0-50000) to prevent abuse
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit as string) || 100, 500));
+    const offset = Math.max(0, Math.min(parseInt(req.query.offset as string) || 0, 50000));
+    // Fetch limit+1 to accurately detect if more messages exist
+    const dbMessages = databaseService.getDirectMessages(nodeId1, nodeId2, limit + 1, offset);
+    const hasMore = dbMessages.length > limit;
+    // Return only the requested limit
+    const messages = dbMessages.slice(0, limit).map(transformDbMessageToMeshMessage);
+    res.json({ messages, hasMore });
   } catch (error) {
     logger.error('Error fetching direct messages:', error);
     res.status(500).json({ error: 'Failed to fetch direct messages' });
@@ -1064,7 +1102,7 @@ apiRouter.get('/messages/direct/:nodeId1/:nodeId2', requirePermission('messages'
 // Mark messages as read
 apiRouter.post('/messages/mark-read', optionalAuth(), (req, res) => {
   try {
-    const { messageIds, channelId, nodeId, beforeTimestamp } = req.body;
+    const { messageIds, channelId, nodeId, beforeTimestamp, allDMs } = req.body;
 
     // If marking by channelId, check per-channel read permission
     if (channelId !== undefined && channelId !== null && channelId !== -1) {
@@ -1078,8 +1116,8 @@ apiRouter.post('/messages/mark-read', optionalAuth(), (req, res) => {
       }
     }
 
-    // If marking by nodeId (DMs), check messages permission
-    if (nodeId && channelId === -1) {
+    // If marking by nodeId (DMs) or allDMs, check messages permission
+    if ((nodeId && channelId === -1) || allDMs) {
       const hasMessagesRead = req.user?.isAdmin || hasPermission(req.user!, 'messages', 'read');
       if (!hasMessagesRead) {
         return res.status(403).json({
@@ -1097,6 +1135,13 @@ apiRouter.post('/messages/mark-read', optionalAuth(), (req, res) => {
       // Mark specific messages as read
       databaseService.markMessagesAsRead(messageIds, userId);
       markedCount = messageIds.length;
+    } else if (allDMs) {
+      // Mark ALL DMs as read
+      const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+      if (!localNodeInfo) {
+        return res.status(500).json({ error: 'Local node not connected' });
+      }
+      markedCount = databaseService.markAllDMMessagesAsRead(localNodeInfo.nodeId, userId);
     } else if (channelId !== undefined) {
       // Mark all messages in a channel as read (specific channel permission already checked above)
       markedCount = databaseService.markChannelMessagesAsRead(channelId, userId, beforeTimestamp);
@@ -1108,7 +1153,7 @@ apiRouter.post('/messages/mark-read', optionalAuth(), (req, res) => {
       }
       markedCount = databaseService.markDMMessagesAsRead(localNodeInfo.nodeId, nodeId, userId, beforeTimestamp);
     } else {
-      return res.status(400).json({ error: 'Must provide messageIds, channelId, or nodeId' });
+      return res.status(400).json({ error: 'Must provide messageIds, channelId, nodeId, or allDMs' });
     }
 
     res.json({ marked: markedCount });
@@ -1909,10 +1954,25 @@ apiRouter.post('/position/request', requirePermission('messages', 'write'), asyn
 apiRouter.get('/traceroutes/recent', (req, res) => {
   try {
     const hoursParam = req.query.hours ? parseInt(req.query.hours as string) : 24;
-    const limit = req.query.limit ? parseInt(req.query.limit as string) : 100;
+    const cutoffTime = Date.now() - (hoursParam * 60 * 60 * 1000);
+
+    // Calculate dynamic default limit based on settings:
+    // Auto-traceroutes per hour * Max Node Age (hours) * 1.1 (padding for manual traceroutes)
+    let limit: number;
+    if (req.query.limit) {
+      // Use explicit limit if provided
+      limit = parseInt(req.query.limit as string);
+    } else {
+      // Calculate dynamic default based on traceroute settings
+      const tracerouteIntervalMinutes = parseInt(databaseService.getSetting('tracerouteIntervalMinutes') || '5');
+      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
+      const traceroutesPerHour = tracerouteIntervalMinutes > 0 ? 60 / tracerouteIntervalMinutes : 12;
+      limit = Math.ceil(traceroutesPerHour * maxNodeAgeHours * 1.1);
+      // Ensure a reasonable minimum
+      limit = Math.max(limit, 100);
+    }
 
     const allTraceroutes = databaseService.getAllTraceroutes(limit);
-    const cutoffTime = Date.now() - (hoursParam * 60 * 60 * 1000);
 
     const recentTraceroutes = allTraceroutes.filter(tr => tr.timestamp >= cutoffTime);
 
@@ -2295,6 +2355,10 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
     try {
       const nodes = meshtasticManager.getAllNodes();
 
+      // Get all estimated positions in a single batch query (fixes N+1 query problem)
+      // This is much more efficient than querying each node individually
+      const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
+
       // Enhance nodes with estimated positions if no regular position is available
       // Mobile status is now pre-computed in the database during packet processing
       const enhancedNodes = nodes.map(node => {
@@ -2304,18 +2368,12 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
         // If node doesn't have a regular position, check for estimated position
         if (!node.position?.latitude && !node.position?.longitude) {
-          // Get only the most recent estimated position (limit 1 of each type)
-          const positionTelemetry = databaseService.getPositionTelemetryByNode(node.user.id, 2);
-          const estimatedLatitudes = positionTelemetry.filter(t => t.telemetryType === 'estimated_latitude');
-          const estimatedLongitudes = positionTelemetry.filter(t => t.telemetryType === 'estimated_longitude');
-
-          if (estimatedLatitudes.length > 0 && estimatedLongitudes.length > 0) {
-            const latestEstimatedLat = estimatedLatitudes[0];
-            const latestEstimatedLon = estimatedLongitudes[0];
-
+          // Use batch-loaded estimated positions (O(1) lookup instead of DB query)
+          const estimatedPos = estimatedPositions.get(node.user.id);
+          if (estimatedPos) {
             enhancedNode.position = {
-              latitude: latestEstimatedLat.value,
-              longitude: latestEstimatedLon.value,
+              latitude: estimatedPos.latitude,
+              longitude: estimatedPos.longitude,
               altitude: node.position?.altitude
             };
           }

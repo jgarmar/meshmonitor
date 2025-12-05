@@ -1913,26 +1913,26 @@ class DatabaseService {
     return messages.map(message => this.normalizeBigInts(message));
   }
 
-  getMessagesByChannel(channel: number, limit: number = 100): DbMessage[] {
+  getMessagesByChannel(channel: number, limit: number = 100, offset: number = 0): DbMessage[] {
     const stmt = this.db.prepare(`
       SELECT * FROM messages
       WHERE channel = ?
       ORDER BY COALESCE(rxTime, timestamp) DESC
-      LIMIT ?
+      LIMIT ? OFFSET ?
     `);
-    const messages = stmt.all(channel, limit) as DbMessage[];
+    const messages = stmt.all(channel, limit, offset) as DbMessage[];
     return messages.map(message => this.normalizeBigInts(message));
   }
 
-  getDirectMessages(nodeId1: string, nodeId2: string, limit: number = 100): DbMessage[] {
+  getDirectMessages(nodeId1: string, nodeId2: string, limit: number = 100, offset: number = 0): DbMessage[] {
     const stmt = this.db.prepare(`
       SELECT * FROM messages
       WHERE (fromNodeId = ? AND toNodeId = ?)
          OR (fromNodeId = ? AND toNodeId = ?)
       ORDER BY COALESCE(rxTime, timestamp) DESC
-      LIMIT ?
+      LIMIT ? OFFSET ?
     `);
-    const messages = stmt.all(nodeId1, nodeId2, nodeId2, nodeId1, limit) as DbMessage[];
+    const messages = stmt.all(nodeId1, nodeId2, nodeId2, nodeId1, limit, offset) as DbMessage[];
     return messages.map(message => this.normalizeBigInts(message));
   }
 
@@ -2415,6 +2415,57 @@ class DatabaseService {
     const stmt = this.db.prepare(query);
     const telemetry = stmt.all(...params) as DbTelemetry[];
     return telemetry.map(t => this.normalizeBigInts(t));
+  }
+
+  /**
+   * Get the latest estimated positions for all nodes in a single query.
+   * This is much more efficient than querying each node individually (N+1 problem).
+   * Returns a Map of nodeId -> { latitude, longitude } for nodes with estimated positions.
+   */
+  getAllNodesEstimatedPositions(): Map<string, { latitude: number; longitude: number }> {
+    // Use a subquery to get the latest timestamp for each node/type combination,
+    // then join to get the actual values. This avoids the N+1 query problem.
+    const query = `
+      WITH LatestEstimates AS (
+        SELECT nodeId, telemetryType, MAX(timestamp) as maxTimestamp
+        FROM telemetry
+        WHERE telemetryType IN ('estimated_latitude', 'estimated_longitude')
+        GROUP BY nodeId, telemetryType
+      )
+      SELECT t.nodeId, t.telemetryType, t.value
+      FROM telemetry t
+      INNER JOIN LatestEstimates le
+        ON t.nodeId = le.nodeId
+        AND t.telemetryType = le.telemetryType
+        AND t.timestamp = le.maxTimestamp
+    `;
+
+    const stmt = this.db.prepare(query);
+    const results = stmt.all() as Array<{ nodeId: string; telemetryType: string; value: number }>;
+
+    // Build a map of nodeId -> { latitude, longitude }
+    const positionMap = new Map<string, { latitude: number; longitude: number }>();
+
+    for (const row of results) {
+      const existing = positionMap.get(row.nodeId) || { latitude: 0, longitude: 0 };
+
+      if (row.telemetryType === 'estimated_latitude') {
+        existing.latitude = row.value;
+      } else if (row.telemetryType === 'estimated_longitude') {
+        existing.longitude = row.value;
+      }
+
+      positionMap.set(row.nodeId, existing);
+    }
+
+    // Filter out entries that don't have both lat and lon
+    for (const [nodeId, pos] of positionMap) {
+      if (pos.latitude === 0 || pos.longitude === 0) {
+        positionMap.delete(nodeId);
+      }
+    }
+
+    return positionMap;
   }
 
   getTelemetryByNodeAveraged(nodeId: string, sinceTimestamp?: number, intervalMinutes?: number, maxHours?: number): DbTelemetry[] {
@@ -3479,6 +3530,25 @@ class DatabaseService {
       query += ` AND timestamp <= ?`;
       params.push(beforeTimestamp);
     }
+
+    const stmt = this.db.prepare(query);
+    const result = stmt.run(...params);
+    return Number(result.changes);
+  }
+
+  /**
+   * Mark all DM messages as read for the local node
+   * This marks all direct messages (channel = -1) involving the local node as read
+   */
+  markAllDMMessagesAsRead(localNodeId: string, userId: number | null): number {
+    const query = `
+      INSERT OR IGNORE INTO read_messages (message_id, user_id, read_at)
+      SELECT id, ?, ? FROM messages
+      WHERE (fromNodeId = ? OR toNodeId = ?)
+        AND portnum = 1
+        AND channel = -1
+    `;
+    const params: any[] = [userId, Date.now(), localNodeId, localNodeId];
 
     const stmt = this.db.prepare(query);
     const result = stmt.run(...params);

@@ -2699,6 +2699,35 @@ body {
 .messages-container::-webkit-scrollbar-thumb:hover {
   background: var(--ctp-overlay1);
 }
+
+/* Loading indicator for infinite scroll */
+.loading-more-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  color: var(--ctp-subtext0);
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--ctp-surface1);
+  margin-bottom: 0.5rem;
+}
+
+.loading-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--ctp-surface2);
+  border-top-color: var(--ctp-mauve);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Fullscreen Map Layout for Nodes */
 .nodes-split-view {
   position: fixed;
@@ -2795,8 +2824,9 @@ body {
 
 .sidebar-header-content {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
   margin-bottom: 0.75rem;
 }
 
@@ -2804,6 +2834,21 @@ body {
   margin: 0;
   color: var(--ctp-text);
   font-size: 1.1rem;
+}
+
+.mark-all-read-btn {
+  background: var(--ctp-surface1);
+  border: 1px solid var(--ctp-surface2);
+  color: var(--ctp-text);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.mark-all-read-btn:hover {
+  background: var(--ctp-surface2);
 }
 
 .filter-popup-btn {
