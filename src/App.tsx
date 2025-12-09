@@ -259,6 +259,9 @@ function App() {
   // Settings from context
   const {
     maxNodeAgeHours,
+    inactiveNodeThresholdHours,
+    inactiveNodeCheckIntervalMinutes,
+    inactiveNodeCooldownHours,
     tracerouteIntervalMinutes,
     temperatureUnit,
     distanceUnit,
@@ -278,6 +281,9 @@ function App() {
     solarMonitoringAzimuth,
     solarMonitoringDeclination,
     setMaxNodeAgeHours,
+    setInactiveNodeThresholdHours,
+    setInactiveNodeCheckIntervalMinutes,
+    setInactiveNodeCooldownHours,
     setTracerouteIntervalMinutes,
     setTemperatureUnit,
     setDistanceUnit,
@@ -362,6 +368,7 @@ function App() {
   const [themeColors, setThemeColors] = useState({
     mauve: '#cba6f7', // Default to Mocha theme colors
     red: '#f38ba8',
+    overlay0: '#6c7086', // For MQTT segments (muted gray)
   });
 
   // Update theme colors when theme changes
@@ -369,9 +376,10 @@ function App() {
     const rootStyle = getComputedStyle(document.documentElement);
     const mauve = rootStyle.getPropertyValue('--ctp-mauve').trim();
     const red = rootStyle.getPropertyValue('--ctp-red').trim();
+    const overlay0 = rootStyle.getPropertyValue('--ctp-overlay0').trim();
 
-    if (mauve && red) {
-      setThemeColors({ mauve, red });
+    if (mauve && red && overlay0) {
+      setThemeColors({ mauve, red, overlay0 });
     }
   }, [theme]);
 
@@ -731,6 +739,30 @@ function App() {
             const value = parseInt(settings.maxNodeAgeHours);
             setMaxNodeAgeHours(value);
             localStorage.setItem('maxNodeAgeHours', value.toString());
+          }
+
+          if (settings.inactiveNodeThresholdHours) {
+            const value = parseInt(settings.inactiveNodeThresholdHours);
+            if (!isNaN(value) && value > 0) {
+              setInactiveNodeThresholdHours(value);
+              localStorage.setItem('inactiveNodeThresholdHours', value.toString());
+            }
+          }
+
+          if (settings.inactiveNodeCheckIntervalMinutes) {
+            const value = parseInt(settings.inactiveNodeCheckIntervalMinutes);
+            if (!isNaN(value) && value > 0) {
+              setInactiveNodeCheckIntervalMinutes(value);
+              localStorage.setItem('inactiveNodeCheckIntervalMinutes', value.toString());
+            }
+          }
+
+          if (settings.inactiveNodeCooldownHours) {
+            const value = parseInt(settings.inactiveNodeCooldownHours);
+            if (!isNaN(value) && value > 0) {
+              setInactiveNodeCooldownHours(value);
+              localStorage.setItem('inactiveNodeCooldownHours', value.toString());
+            }
           }
 
           if (settings.tracerouteIntervalMinutes) {
@@ -4204,6 +4236,9 @@ function App() {
         {activeTab === 'settings' && (
           <SettingsTab
             maxNodeAgeHours={maxNodeAgeHours}
+            inactiveNodeThresholdHours={inactiveNodeThresholdHours}
+            inactiveNodeCheckIntervalMinutes={inactiveNodeCheckIntervalMinutes}
+            inactiveNodeCooldownHours={inactiveNodeCooldownHours}
             temperatureUnit={temperatureUnit}
             distanceUnit={distanceUnit}
             telemetryVisualizationHours={telemetryVisualizationHours}
@@ -4225,6 +4260,9 @@ function App() {
             nodes={nodes}
             baseUrl={baseUrl}
             onMaxNodeAgeChange={setMaxNodeAgeHours}
+            onInactiveNodeThresholdHoursChange={setInactiveNodeThresholdHours}
+            onInactiveNodeCheckIntervalMinutesChange={setInactiveNodeCheckIntervalMinutes}
+            onInactiveNodeCooldownHoursChange={setInactiveNodeCooldownHours}
             onTemperatureUnitChange={setTemperatureUnit}
             onDistanceUnitChange={setDistanceUnit}
             onTelemetryVisualizationChange={setTelemetryVisualizationHours}
