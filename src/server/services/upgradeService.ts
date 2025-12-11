@@ -318,8 +318,9 @@ class UpgradeService {
   /**
    * Check if an upgrade is currently in progress
    * Also cleans up stale upgrades that have been stuck for too long
+   * @public - Made public to allow external code to check upgrade status before triggering
    */
-  private async isUpgradeInProgress(): Promise<boolean> {
+  async isUpgradeInProgress(): Promise<boolean> {
     try {
       // First, clean up any stale upgrades (stuck for more than 30 minutes)
       const STALE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
@@ -368,6 +369,51 @@ class UpgradeService {
     } catch (error) {
       logger.error('❌ Failed to check upgrade progress:', error);
       return false;
+    }
+  }
+
+  /**
+   * Get the currently active upgrade, if any
+   * @returns The active upgrade details or null if no upgrade is in progress
+   */
+  async getActiveUpgrade(): Promise<{
+    upgradeId: string;
+    status: string;
+    progress: number;
+    currentStep: string;
+    fromVersion: string;
+    toVersion: string;
+    startedAt: number;
+  } | null> {
+    try {
+      const STALE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+      const staleThreshold = Date.now() - STALE_TIMEOUT_MS;
+
+      const row = databaseService.db.prepare(
+        `SELECT id, status, progress, currentStep, fromVersion, toVersion, startedAt
+         FROM upgrade_history
+         WHERE status IN ('pending', 'backing_up', 'downloading', 'restarting', 'health_check')
+         AND startedAt >= ?
+         ORDER BY startedAt DESC
+         LIMIT 1`
+      ).get(staleThreshold) as any;
+
+      if (!row) {
+        return null;
+      }
+
+      return {
+        upgradeId: row.id,
+        status: row.status,
+        progress: row.progress || 0,
+        currentStep: row.currentStep || 'Starting...',
+        fromVersion: row.fromVersion,
+        toVersion: row.toVersion,
+        startedAt: row.startedAt,
+      };
+    } catch (error) {
+      logger.error('❌ Failed to get active upgrade:', error);
+      return null;
     }
   }
 

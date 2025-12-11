@@ -112,6 +112,9 @@ class MeshtasticManager {
   private favoritesSupportCache: boolean | null = null;  // Cache firmware support check result
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
 
+  // Auto-welcome tracking to prevent race conditions
+  private welcomingNodes: Set<number> = new Set();  // Track nodes currently being welcomed
+
   // Virtual Node Server - Message capture for initialization sequence
   private initConfigCache: Array<{ type: string; data: Uint8Array }> = [];  // Store raw FromRadio messages with type metadata during init
   private isCapturingInitConfig = false;  // Flag to track when we're capturing messages
@@ -1298,13 +1301,15 @@ class MeshtasticManager {
         const portnum = meshPacket.decoded?.portnum ?? 0;
         const portnumName = meshtasticProtobufService.getPortNumName(portnum);
 
-        // Generate payload preview
+        // Generate payload preview and store decoded payload
         let payloadPreview = null;
+        let decodedPayload: any = null;
         if (isEncrypted) {
           payloadPreview = '🔒 <ENCRYPTED>';
         } else if (meshPacket.decoded?.payload) {
           try {
-            const processedPayload = meshtasticProtobufService.processPayload(portnum, meshPacket.decoded.payload);
+            decodedPayload = meshtasticProtobufService.processPayload(portnum, meshPacket.decoded.payload);
+            const processedPayload = decodedPayload;
             if (portnum === 1 && typeof processedPayload === 'string') {
               // TEXT_MESSAGE - show first 100 chars
               payloadPreview = processedPayload.substring(0, 100);
@@ -1381,6 +1386,11 @@ class MeshtasticManager {
         if (isEncrypted && meshPacket.encrypted) {
           // Convert Uint8Array to hex string for storage
           metadata.encrypted_payload = Buffer.from(meshPacket.encrypted).toString('hex');
+        }
+
+        // Include decoded payload for non-encrypted packets
+        if (decodedPayload !== null) {
+          metadata.decoded_payload = decodedPayload;
         }
 
         packetLogService.logPacket({
@@ -2725,6 +2735,15 @@ class MeshtasticManager {
         nodeData.isFavorite = nodeInfo.isFavorite;
         if (existingNode && existingNode.isFavorite !== nodeInfo.isFavorite) {
           logger.debug(`⭐ Updating favorite status for node ${nodeId} from ${existingNode.isFavorite} to ${nodeInfo.isFavorite}`);
+        }
+      }
+
+      // Always sync isIgnored from device to keep in sync with changes made while offline
+      // This ensures ignored nodes are updated when reconnecting
+      if (nodeInfo.isIgnored !== undefined) {
+        nodeData.isIgnored = nodeInfo.isIgnored;
+        if (existingNode && existingNode.isIgnored !== nodeInfo.isIgnored) {
+          logger.debug(`🚫 Updating ignored status for node ${nodeId} from ${existingNode.isIgnored} to ${nodeInfo.isIgnored}`);
         }
       }
 
@@ -4618,55 +4637,93 @@ class MeshtasticManager {
           ? message.hopStart - message.hopLimit
           : 0;
 
-      // Get auto-acknowledge message template
-      // Use the direct message template for 0 hops if available, otherwise fall back to standard template
-      const autoAckMessageDirect = databaseService.getSetting('autoAckMessageDirect') || '';
-      const autoAckMessageStandard = databaseService.getSetting('autoAckMessage') || '🤖 Copy, {NUMBER_HOPS} hops at {TIME}';
-      const autoAckMessage = (hopsTraveled === 0 && autoAckMessageDirect)
-        ? autoAckMessageDirect
-        : autoAckMessageStandard;
+      // Get response type settings
+      const autoAckTapbackEnabled = databaseService.getSetting('autoAckTapbackEnabled') === 'true';
+      const autoAckReplyEnabled = databaseService.getSetting('autoAckReplyEnabled') !== 'false'; // Default true for backward compatibility
 
-      // Format timestamp according to user preferences
-      const timestamp = new Date(message.timestamp);
-
-      // Get date and time format preferences from settings
-      const dateFormat = databaseService.getSetting('dateFormat') || 'MM/DD/YYYY';
-      const timeFormat = databaseService.getSetting('timeFormat') || '24';
-
-      // Use formatDate and formatTime utilities to respect user preferences
-      const receivedDate = formatDate(timestamp, dateFormat as 'MM/DD/YYYY' | 'DD/MM/YYYY');
-      const receivedTime = formatTime(timestamp, timeFormat as '12' | '24');
-
-      // Replace tokens in the message template
-      let ackText = await this.replaceAcknowledgementTokens(autoAckMessage, message.fromNodeId, fromNum, hopsTraveled, receivedDate, receivedTime, channelIndex, isDirectMessage, rxSnr, rxRssi);
+      // If neither tapback nor reply is enabled, skip
+      if (!autoAckTapbackEnabled && !autoAckReplyEnabled) {
+        logger.debug('⏭️  Skipping auto-acknowledge: both tapback and reply are disabled');
+        return;
+      }
 
       // Check if we should always use DM
       const autoAckUseDM = databaseService.getSetting('autoAckUseDM');
       const alwaysUseDM = autoAckUseDM === 'true';
-
-      // Don't make it a reply if we're changing channels (DM when triggered by channel message)
-      const replyId = (alwaysUseDM && !isDirectMessage) ? undefined : packetId;
 
       // Format target for logging
       const target = (alwaysUseDM || isDirectMessage)
         ? `!${fromNum.toString(16).padStart(8, '0')}`
         : `channel ${channelIndex}`;
 
-      logger.debug(`🤖 Auto-acknowledging message from ${message.fromNodeId}: "${messageText}" with "${ackText}" ${alwaysUseDM ? '(via DM)' : ''}`);
+      // Send tapback with hop count emoji if enabled
+      if (autoAckTapbackEnabled && packetId) {
+        // Hop count emojis: *️⃣ for 0 (direct), 1️⃣-7️⃣ for 1-7+ hops
+        const HOP_COUNT_EMOJIS = ['*️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣'];
+        const hopEmojiIndex = Math.min(hopsTraveled, 7); // Cap at 7 for 7+ hops
+        const hopEmoji = HOP_COUNT_EMOJIS[hopEmojiIndex];
 
-      // Use message queue to send auto-acknowledge with rate limiting and retry logic
-      messageQueueService.enqueue(
-        ackText,
-        (alwaysUseDM || isDirectMessage) ? fromNum : 0, // destination: node number for DM, 0 for channel
-        replyId, // replyId
-        () => {
-          logger.info(`✅ Auto-acknowledge delivered to ${target}`);
-        },
-        (reason: string) => {
-          logger.warn(`❌ Auto-acknowledge failed to ${target}: ${reason}`);
-        },
-        (alwaysUseDM || isDirectMessage) ? undefined : channelIndex // channel: undefined for DM, channel number for channel
-      );
+        logger.debug(`🤖 Auto-acknowledging with tapback ${hopEmoji} (${hopsTraveled} hops) to ${target}`);
+
+        // Send tapback reaction using sendTextMessage with emoji flag
+        // Use same routing logic as message reply: respect alwaysUseDM flag
+        try {
+          await this.sendTextMessage(
+            hopEmoji,
+            (alwaysUseDM || isDirectMessage) ? 0 : channelIndex,
+            (alwaysUseDM || isDirectMessage) ? fromNum : undefined,
+            packetId, // replyId - react to the original message
+            1 // emoji flag = 1 for tapback/reaction
+          );
+          logger.info(`✅ Auto-acknowledge tapback ${hopEmoji} delivered to ${target}`);
+        } catch (error) {
+          logger.warn(`❌ Auto-acknowledge tapback failed to ${target}:`, error);
+        }
+      }
+
+      // Send message reply if enabled
+      if (autoAckReplyEnabled) {
+        // Get auto-acknowledge message template
+        // Use the direct message template for 0 hops if available, otherwise fall back to standard template
+        const autoAckMessageDirect = databaseService.getSetting('autoAckMessageDirect') || '';
+        const autoAckMessageStandard = databaseService.getSetting('autoAckMessage') || '🤖 Copy, {NUMBER_HOPS} hops at {TIME}';
+        const autoAckMessage = (hopsTraveled === 0 && autoAckMessageDirect)
+          ? autoAckMessageDirect
+          : autoAckMessageStandard;
+
+        // Format timestamp according to user preferences
+        const timestamp = new Date(message.timestamp);
+
+        // Get date and time format preferences from settings
+        const dateFormat = databaseService.getSetting('dateFormat') || 'MM/DD/YYYY';
+        const timeFormat = databaseService.getSetting('timeFormat') || '24';
+
+        // Use formatDate and formatTime utilities to respect user preferences
+        const receivedDate = formatDate(timestamp, dateFormat as 'MM/DD/YYYY' | 'DD/MM/YYYY');
+        const receivedTime = formatTime(timestamp, timeFormat as '12' | '24');
+
+        // Replace tokens in the message template
+        const ackText = await this.replaceAcknowledgementTokens(autoAckMessage, message.fromNodeId, fromNum, hopsTraveled, receivedDate, receivedTime, channelIndex, isDirectMessage, rxSnr, rxRssi);
+
+        // Don't make it a reply if we're changing channels (DM when triggered by channel message)
+        const replyId = (alwaysUseDM && !isDirectMessage) ? undefined : packetId;
+
+        logger.debug(`🤖 Auto-acknowledging message from ${message.fromNodeId}: "${messageText}" with "${ackText}" ${alwaysUseDM ? '(via DM)' : ''}`);
+
+        // Use message queue to send auto-acknowledge with rate limiting and retry logic
+        messageQueueService.enqueue(
+          ackText,
+          (alwaysUseDM || isDirectMessage) ? fromNum : 0, // destination: node number for DM, 0 for channel
+          replyId, // replyId
+          () => {
+            logger.info(`✅ Auto-acknowledge message delivered to ${target}`);
+          },
+          (reason: string) => {
+            logger.warn(`❌ Auto-acknowledge message failed to ${target}: ${reason}`);
+          },
+          (alwaysUseDM || isDirectMessage) ? undefined : channelIndex // channel: undefined for DM, channel number for channel
+        );
+      }
     } catch (error) {
       logger.error('❌ Error in auto-acknowledge:', error);
     }
@@ -5344,6 +5401,12 @@ class MeshtasticManager {
         return;
       }
 
+      // RACE CONDITION PROTECTION: Check if we're already welcoming this node
+      if (this.welcomingNodes.has(nodeNum)) {
+        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already being welcomed in parallel`);
+        return;
+      }
+
       // Check if we've already welcomed this node
       const node = databaseService.getNode(nodeNum);
       if (!node) {
@@ -5354,65 +5417,80 @@ class MeshtasticManager {
       // Skip if node has already been welcomed (nodes should only be welcomed once)
       // Use explicit null/undefined check to handle edge case where welcomedAt might be 0
       if (node.welcomedAt !== null && node.welcomedAt !== undefined) {
-        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already welcomed previously`);
+        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already welcomed at ${new Date(node.welcomedAt).toISOString()}`);
         return;
       }
 
-      // Check if we should wait for name
-      const autoWelcomeWaitForName = databaseService.getSetting('autoWelcomeWaitForName');
-      if (autoWelcomeWaitForName === 'true') {
-        // Check if node has a proper name (not default "Node !xxxxxxxx")
-        if (!node.longName || node.longName.startsWith('Node !')) {
-          logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - waiting for proper name (current: ${node.longName})`);
+      // RACE CONDITION PROTECTION: Mark that we're welcoming this node
+      // This prevents duplicate welcomes if multiple packets arrive before database is updated
+      this.welcomingNodes.add(nodeNum);
+      logger.debug(`🔒 Locked auto-welcome for ${nodeId} to prevent duplicates`);
+
+      try {
+        // Check if we should wait for name
+        const autoWelcomeWaitForName = databaseService.getSetting('autoWelcomeWaitForName');
+        if (autoWelcomeWaitForName === 'true') {
+          // Check if node has a proper name (not default "Node !xxxxxxxx")
+          if (!node.longName || node.longName.startsWith('Node !')) {
+            logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - waiting for proper name (current: ${node.longName})`);
+            return;
+          }
+          if (!node.shortName || node.shortName === nodeId.substring(1, 5)) {
+            logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - waiting for proper short name (current: ${node.shortName})`);
+            return;
+          }
+        }
+
+        // Check if node exceeds maximum hop count
+        const autoWelcomeMaxHops = databaseService.getSetting('autoWelcomeMaxHops');
+        const maxHops = autoWelcomeMaxHops ? parseInt(autoWelcomeMaxHops) : 5; // Default to 5 hops
+        if (node.hopsAway !== undefined && node.hopsAway > maxHops) {
+          logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - too far away (${node.hopsAway} hops > ${maxHops} max)`);
           return;
         }
-        if (!node.shortName || node.shortName === nodeId.substring(1, 5)) {
-          logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - waiting for proper short name (current: ${node.shortName})`);
-          return;
+
+        // Get welcome message template
+        const autoWelcomeMessage = databaseService.getSetting('autoWelcomeMessage') || 'Welcome {LONG_NAME} ({SHORT_NAME}) to the mesh!';
+
+        // Replace tokens in the message template
+        const welcomeText = await this.replaceWelcomeTokens(autoWelcomeMessage, nodeNum, nodeId);
+
+        // Get target (DM or channel)
+        const autoWelcomeTarget = databaseService.getSetting('autoWelcomeTarget') || '0';
+
+        let destination: number | undefined;
+        let channel: number;
+
+        if (autoWelcomeTarget === 'dm') {
+          // Send as direct message
+          destination = nodeNum;
+          channel = 0;
+        } else {
+          // Send to channel
+          destination = undefined;
+          channel = parseInt(autoWelcomeTarget);
         }
+
+        logger.info(`👋 Sending auto-welcome to ${nodeId} (${node.longName}): "${welcomeText}" ${autoWelcomeTarget === 'dm' ? '(via DM)' : `(channel ${channel})`}`);
+
+        await this.sendTextMessage(welcomeText, channel, destination);
+
+        // Mark node as welcomed using atomic check-and-set operation
+        // This ensures the node is only marked if it hasn't been marked already
+        const wasMarked = databaseService.markNodeAsWelcomedIfNotAlready(nodeNum, nodeId);
+        if (wasMarked) {
+          logger.info(`✅ Node ${nodeId} welcomed successfully and marked in database`);
+        } else {
+          logger.warn(`⚠️  Node ${nodeId} was already marked as welcomed by another process`);
+        }
+      } finally {
+        // RACE CONDITION PROTECTION: Always remove from tracking set
+        // Use a small delay to ensure database write has completed
+        setTimeout(() => {
+          this.welcomingNodes.delete(nodeNum);
+          logger.debug(`🔓 Unlocked auto-welcome tracking for ${nodeId}`);
+        }, 100);
       }
-
-      // Check if node exceeds maximum hop count
-      const autoWelcomeMaxHops = databaseService.getSetting('autoWelcomeMaxHops');
-      const maxHops = autoWelcomeMaxHops ? parseInt(autoWelcomeMaxHops) : 5; // Default to 5 hops
-      if (node.hopsAway !== undefined && node.hopsAway > maxHops) {
-        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - too far away (${node.hopsAway} hops > ${maxHops} max)`);
-        return;
-      }
-
-      // Get welcome message template
-      const autoWelcomeMessage = databaseService.getSetting('autoWelcomeMessage') || 'Welcome {LONG_NAME} ({SHORT_NAME}) to the mesh!';
-
-      // Replace tokens in the message template
-      const welcomeText = await this.replaceWelcomeTokens(autoWelcomeMessage, nodeNum, nodeId);
-
-      // Get target (DM or channel)
-      const autoWelcomeTarget = databaseService.getSetting('autoWelcomeTarget') || '0';
-
-      let destination: number | undefined;
-      let channel: number;
-
-      if (autoWelcomeTarget === 'dm') {
-        // Send as direct message
-        destination = nodeNum;
-        channel = 0;
-      } else {
-        // Send to channel
-        destination = undefined;
-        channel = parseInt(autoWelcomeTarget);
-      }
-
-      logger.info(`👋 Sending auto-welcome to ${nodeId} (${node.longName}): "${welcomeText}" ${autoWelcomeTarget === 'dm' ? '(via DM)' : `(channel ${channel})`}`);
-
-      await this.sendTextMessage(welcomeText, channel, destination);
-
-      // Mark node as welcomed
-      databaseService.upsertNode({
-        nodeNum: nodeNum,
-        nodeId: nodeId,
-        welcomedAt: Date.now()
-      });
-      logger.debug(`✅ Marked ${nodeId} as welcomed`);
     } catch (error) {
       logger.error('❌ Error in auto-welcome:', error);
     }
@@ -6129,6 +6207,62 @@ class MeshtasticManager {
   }
 
   /**
+   * Send admin message to set a node as ignored on the device
+   */
+  async sendIgnoredNode(nodeNum: number): Promise<void> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    // Check firmware version support (ignored nodes use same version as favorites)
+    if (!this.supportsFavorites()) {
+      throw new Error('FIRMWARE_NOT_SUPPORTED');
+    }
+
+    try {
+      // For local TCP connections, try sending without session passkey first
+      // (there's a known bug where session keys don't work properly over TCP)
+      logger.debug('🚫 Attempting to set ignored node without session key (local TCP admin)');
+      const setIgnoredMsg = protobufService.createSetIgnoredNodeMessage(nodeNum, new Uint8Array()); // empty passkey
+      const adminPacket = protobufService.createAdminPacket(setIgnoredMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum); // send to local node
+
+      await this.transport.send(adminPacket);
+      logger.debug(`🚫 Sent set_ignored_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')})`);
+    } catch (error) {
+      logger.error('❌ Error sending ignored node admin message:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Send admin message to remove a node from ignored list on the device
+   */
+  async sendRemoveIgnoredNode(nodeNum: number): Promise<void> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    // Check firmware version support (ignored nodes use same version as favorites)
+    if (!this.supportsFavorites()) {
+      throw new Error('FIRMWARE_NOT_SUPPORTED');
+    }
+
+    try {
+      // For local TCP connections, try sending without session passkey first
+      // (there's a known bug where session keys don't work properly over TCP)
+      logger.debug('✅ Attempting to remove ignored node without session key (local TCP admin)');
+      const removeIgnoredMsg = protobufService.createRemoveIgnoredNodeMessage(nodeNum, new Uint8Array()); // empty passkey
+      const adminPacket = protobufService.createAdminPacket(removeIgnoredMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum); // send to local node
+
+      await this.transport.send(adminPacket);
+      logger.debug(`✅ Sent remove_ignored_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')})`);
+    } catch (error) {
+      logger.error('❌ Error sending remove ignored node admin message:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Send admin message to remove a node from the device NodeDB
    * This sends the remove_by_nodenum admin command to completely delete a node from the device
    */
@@ -6250,12 +6384,9 @@ class MeshtasticManager {
       const adminMsg = AdminMessage.create(adminMsgData);
       const encoded = AdminMessage.encode(adminMsg).finish();
 
-      // Send the request
-      const adminPacket = protobufService.createAdminPacket(encoded, destinationNodeNum, this.localNodeInfo.nodeNum);
-      await this.transport.send(adminPacket);
-      logger.debug(`📡 Requested ${isModuleConfig ? 'module' : 'device'} config type ${configType} from remote node ${destinationNodeNum}`);
-
       // Clear any existing config for this type before requesting (to ensure fresh data)
+      // This must happen BEFORE sending to prevent race conditions where responses arrive
+      // and get immediately deleted, causing polling loops to timeout
       // Map config types to their keys
       if (isModuleConfig) {
         const moduleConfigMap: { [key: number]: string } = {
@@ -6283,6 +6414,11 @@ class MeshtasticManager {
           }
         }
       }
+
+      // Send the request
+      const adminPacket = protobufService.createAdminPacket(encoded, destinationNodeNum, this.localNodeInfo.nodeNum);
+      await this.transport.send(adminPacket);
+      logger.debug(`📡 Requested ${isModuleConfig ? 'module' : 'device'} config type ${configType} from remote node ${destinationNodeNum}`);
 
       // Wait for the response (config responses can take time, especially over mesh)
       // Remote nodes may take longer due to mesh routing
@@ -6375,16 +6511,18 @@ class MeshtasticManager {
       });
       const encoded = AdminMessage.encode(adminMsg).finish();
 
-      // Send the request
-      const adminPacket = protobufService.createAdminPacket(encoded, destinationNodeNum, this.localNodeInfo.nodeNum);
-      await this.transport.send(adminPacket);
-      logger.debug(`📡 Requested channel ${channelIndex} from remote node ${destinationNodeNum}`);
-
       // Clear any existing channel for this index before requesting (to ensure fresh data)
+      // This must happen BEFORE sending to prevent race conditions where responses arrive
+      // and get immediately deleted, causing polling loops to timeout
       const nodeChannels = this.remoteNodeChannels.get(destinationNodeNum);
       if (nodeChannels) {
         nodeChannels.delete(channelIndex);
       }
+
+      // Send the request
+      const adminPacket = protobufService.createAdminPacket(encoded, destinationNodeNum, this.localNodeInfo.nodeNum);
+      await this.transport.send(adminPacket);
+      logger.debug(`📡 Requested channel ${channelIndex} from remote node ${destinationNodeNum}`);
       
       // Wait for the response
       // Use longer timeout for mesh routing - responses can take longer over mesh
@@ -6448,7 +6586,10 @@ class MeshtasticManager {
 
       // Create the owner request message with session passkey
       const root = getProtobufRoot();
-      const AdminMessage = root?.lookupType('meshtastic.AdminMessage');
+      if (!root) {
+        throw new Error('Protobuf definitions not loaded. Please ensure protobuf definitions are initialized.');
+      }
+      const AdminMessage = root.lookupType('meshtastic.AdminMessage');
       if (!AdminMessage) {
         throw new Error('AdminMessage type not found');
       }
@@ -6459,13 +6600,15 @@ class MeshtasticManager {
       });
       const encoded = AdminMessage.encode(adminMsg).finish();
 
+      // Clear any existing owner for this node before requesting (to ensure fresh data)
+      // This must happen BEFORE sending to prevent race conditions where responses arrive
+      // and get immediately deleted, causing polling loops to timeout
+      this.remoteNodeOwners.delete(destinationNodeNum);
+
       // Send the request
       const adminPacket = protobufService.createAdminPacket(encoded, destinationNodeNum, this.localNodeInfo.nodeNum);
       await this.transport.send(adminPacket);
       logger.debug(`📡 Requested owner info from remote node ${destinationNodeNum}`);
-
-      // Clear any existing owner for this node before requesting (to ensure fresh data)
-      this.remoteNodeOwners.delete(destinationNodeNum);
       
       // Wait for the response
       const maxWaitTime = 3000; // 3 seconds
@@ -6910,6 +7053,11 @@ class MeshtasticManager {
       // Add isFavorite if it exists
       if (node.isFavorite !== null && node.isFavorite !== undefined) {
         deviceInfo.isFavorite = Boolean(node.isFavorite);
+      }
+
+      // Add isIgnored if it exists
+      if (node.isIgnored !== null && node.isIgnored !== undefined) {
+        deviceInfo.isIgnored = Boolean(node.isIgnored);
       }
 
       // Add channel if it exists

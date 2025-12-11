@@ -34,6 +34,7 @@ import { duplicateKeySchedulerService } from './services/duplicateKeySchedulerSe
 import { solarMonitoringService } from './services/solarMonitoringService.js';
 import { inactiveNodeNotificationService } from './services/inactiveNodeNotificationService.js';
 import { getUserNotificationPreferences, saveUserNotificationPreferences } from './utils/notificationFiltering.js';
+import { upgradeService } from './services/upgradeService.js';
 
 const require = createRequire(import.meta.url);
 const packageJson = require('../../package.json');
@@ -879,6 +880,147 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
     logger.error('Error setting node favorite:', error);
     const errorResponse: ApiErrorResponse = {
       error: 'Failed to set node favorite',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Set node ignored status (with optional device sync)
+apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), async (req, res) => {
+  try {
+    const { nodeId } = req.params;
+    const { isIgnored, syncToDevice = true } = req.body;
+
+    if (typeof isIgnored !== 'boolean') {
+      const errorResponse: ApiErrorResponse = {
+        error: 'isIgnored must be a boolean',
+        code: 'INVALID_PARAMETER_TYPE',
+        details: 'Expected boolean value for isIgnored parameter',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    // Convert nodeId (hex string like !a1b2c3d4) to nodeNum (integer)
+    const nodeNumStr = nodeId.replace('!', '');
+
+    // Validate hex string format (must be exactly 8 hex characters)
+    if (!/^[0-9a-fA-F]{8}$/.test(nodeNumStr)) {
+      const errorResponse: ApiErrorResponse = {
+        error: 'Invalid nodeId format',
+        code: 'INVALID_NODE_ID',
+        details: 'nodeId must be in format !XXXXXXXX (8 hex characters)',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    const nodeNum = parseInt(nodeNumStr, 16);
+
+    // Update ignored status in database
+    databaseService.setNodeIgnored(nodeNum, isIgnored);
+
+    // Broadcast updated NodeInfo to virtual node clients
+    const virtualNodeServer = (global as any).virtualNodeServer;
+    if (virtualNodeServer) {
+      try {
+        // Fetch the updated node from database
+        const node = databaseService.getNode(nodeNum);
+        if (node) {
+          // Create NodeInfo message with updated ignored status
+          const nodeInfoMessage = await meshtasticProtobufService.createNodeInfo({
+            nodeNum: node.nodeNum,
+            user: {
+              id: node.nodeId,
+              longName: node.longName || 'Unknown',
+              shortName: node.shortName || '????',
+              hwModel: node.hwModel || 0,
+              role: node.role,
+              publicKey: node.publicKey,
+            },
+            position:
+              node.latitude && node.longitude
+                ? {
+                    latitude: node.latitude,
+                    longitude: node.longitude,
+                    altitude: node.altitude || 0,
+                    time: node.lastHeard || Math.floor(Date.now() / 1000),
+                  }
+                : undefined,
+            deviceMetrics:
+              node.batteryLevel !== undefined ||
+              node.voltage !== undefined ||
+              node.channelUtilization !== undefined ||
+              node.airUtilTx !== undefined
+                ? {
+                    batteryLevel: node.batteryLevel,
+                    voltage: node.voltage,
+                    channelUtilization: node.channelUtilization,
+                    airUtilTx: node.airUtilTx,
+                  }
+                : undefined,
+            snr: node.snr,
+            lastHeard: node.lastHeard,
+            hopsAway: node.hopsAway,
+            isIgnored: isIgnored,
+          });
+
+          if (nodeInfoMessage) {
+            await virtualNodeServer.broadcastToClients(nodeInfoMessage);
+            logger.debug(`✅ Broadcasted ignored status update to virtual node clients for node ${nodeNum}`);
+          }
+        }
+      } catch (error) {
+        logger.error(`⚠️ Failed to broadcast ignored update to virtual node clients for node ${nodeNum}:`, error);
+        // Don't fail the request if broadcast fails
+      }
+    }
+
+    // Sync to device if requested
+    let deviceSyncStatus: 'success' | 'failed' | 'skipped' = 'skipped';
+    let deviceSyncError: string | undefined;
+
+    if (syncToDevice) {
+      try {
+        if (isIgnored) {
+          await meshtasticManager.sendIgnoredNode(nodeNum);
+        } else {
+          await meshtasticManager.sendRemoveIgnoredNode(nodeNum);
+        }
+        deviceSyncStatus = 'success';
+        logger.debug(`✅ Synced ignored status to device for node ${nodeNum}`);
+      } catch (error) {
+        // Special handling for firmware version incompatibility
+        if (error instanceof Error && error.message === 'FIRMWARE_NOT_SUPPORTED') {
+          deviceSyncStatus = 'skipped';
+          logger.debug(
+            `ℹ️ Device sync skipped for node ${nodeNum}: firmware does not support ignored nodes (requires >= 2.7.0)`
+          );
+          // Don't set deviceSyncError - this is expected behavior for pre-2.7 firmware
+        } else {
+          deviceSyncStatus = 'failed';
+          deviceSyncError = error instanceof Error ? error.message : 'Unknown error';
+          logger.error(`⚠️ Failed to sync ignored status to device for node ${nodeNum}:`, error);
+        }
+        // Don't fail the whole request if device sync fails
+      }
+    }
+
+    res.json({
+      success: true,
+      nodeNum,
+      isIgnored,
+      deviceSync: {
+        status: deviceSyncStatus,
+        error: deviceSyncError,
+      },
+    });
+  } catch (error) {
+    logger.error('Error setting node ignored:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to set node ignored',
       code: 'INTERNAL_ERROR',
       details: error instanceof Error ? error.message : 'Unknown error occurred',
     };
@@ -2103,7 +2245,11 @@ apiRouter.get('/traceroutes/recent', (req, res) => {
       try {
         if (tr.route) {
           const routeArray = JSON.parse(tr.route);
-          hopCount = routeArray.length;
+          // Verify routeArray is actually an array before accessing .length
+          if (Array.isArray(routeArray)) {
+            hopCount = routeArray.length;
+          }
+          // If routeArray is not an array, hopCount remains 999
         }
       } catch (e) {
         hopCount = 999;
@@ -2150,7 +2296,11 @@ apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', (req, res) => {
       try {
         if (tr.route) {
           const routeArray = JSON.parse(tr.route);
-          hopCount = routeArray.length;
+          // Verify routeArray is actually an array before accessing .length
+          if (Array.isArray(routeArray)) {
+            hopCount = routeArray.length;
+          }
+          // If routeArray is not an array, hopCount remains 999
         }
       } catch (e) {
         hopCount = 999;
@@ -2458,6 +2608,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       telemetryNodes?: any;
       config?: any;
       deviceConfig?: any;
+      traceroutes?: any[];
     } = {};
 
     // 1. Connection status (always available)
@@ -2732,6 +2883,44 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       }
     } catch (error) {
       logger.error('Error fetching device config in poll:', error);
+    }
+
+    // 9. Recent traceroutes (for dashboard widget and node view)
+    try {
+      const hoursParam = 24;
+      const cutoffTime = Date.now() - hoursParam * 60 * 60 * 1000;
+
+      // Calculate dynamic default limit based on settings
+      const tracerouteIntervalMinutes = parseInt(databaseService.getSetting('tracerouteIntervalMinutes') || '5');
+      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
+      const traceroutesPerHour = tracerouteIntervalMinutes > 0 ? 60 / tracerouteIntervalMinutes : 12;
+      let limit = Math.ceil(traceroutesPerHour * maxNodeAgeHours * 1.1);
+      limit = Math.max(limit, 100);
+
+      const allTraceroutes = databaseService.getAllTraceroutes(limit);
+      const recentTraceroutes = allTraceroutes.filter(tr => tr.timestamp >= cutoffTime);
+
+      // Add hopCount for each traceroute
+      const traceroutesWithHops = recentTraceroutes.map(tr => {
+        let hopCount = 999;
+        try {
+          if (tr.route) {
+            const routeArray = JSON.parse(tr.route);
+            // Verify routeArray is actually an array before accessing .length
+            if (Array.isArray(routeArray)) {
+              hopCount = routeArray.length;
+            }
+            // If routeArray is not an array, hopCount remains 999
+          }
+        } catch (e) {
+          hopCount = 999;
+        }
+        return { ...tr, hopCount };
+      });
+
+      result.traceroutes = traceroutesWithHops;
+    } catch (error) {
+      logger.error('Error fetching traceroutes in poll:', error);
     }
 
     res.json(result);
@@ -3281,9 +3470,8 @@ apiRouter.post('/settings/traceroute-interval', requirePermission('settings', 'w
 // Get auto-traceroute node filter settings
 apiRouter.get('/settings/traceroute-nodes', requirePermission('settings', 'read'), (_req, res) => {
   try {
-    const enabled = databaseService.isAutoTracerouteNodeFilterEnabled();
-    const nodeNums = databaseService.getAutoTracerouteNodes();
-    res.json({ enabled, nodeNums });
+    const settings = databaseService.getTracerouteFilterSettings();
+    res.json(settings);
   } catch (error) {
     logger.error('Error fetching auto-traceroute node filter:', error);
     res.status(500).json({ error: 'Failed to fetch auto-traceroute node filter' });
@@ -3293,7 +3481,7 @@ apiRouter.get('/settings/traceroute-nodes', requirePermission('settings', 'read'
 // Update auto-traceroute node filter settings
 apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'write'), (req, res) => {
   try {
-    const { enabled, nodeNums } = req.body;
+    const { enabled, nodeNums, filterChannels, filterRoles, filterHwModels, filterNameRegex } = req.body;
 
     // Validate input
     if (typeof enabled !== 'boolean') {
@@ -3311,11 +3499,65 @@ apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'writ
       }
     }
 
-    // Update settings
-    databaseService.setAutoTracerouteNodeFilterEnabled(enabled);
-    databaseService.setAutoTracerouteNodes(nodeNums);
+    // Validate optional filter arrays
+    const validateIntArray = (arr: unknown, name: string): number[] => {
+      if (arr === undefined || arr === null) return [];
+      if (!Array.isArray(arr)) {
+        throw new Error(`Invalid ${name} value. Must be an array.`);
+      }
+      for (const item of arr) {
+        if (!Number.isInteger(item) || item < 0) {
+          throw new Error(`All ${name} values must be non-negative integers.`);
+        }
+      }
+      return arr as number[];
+    };
 
-    res.json({ success: true, enabled, nodeNums });
+    let validatedChannels: number[];
+    let validatedRoles: number[];
+    let validatedHwModels: number[];
+    try {
+      validatedChannels = validateIntArray(filterChannels, 'filterChannels');
+      validatedRoles = validateIntArray(filterRoles, 'filterRoles');
+      validatedHwModels = validateIntArray(filterHwModels, 'filterHwModels');
+    } catch (error) {
+      return res.status(400).json({ error: (error as Error).message });
+    }
+
+    // Validate regex if provided
+    let validatedRegex = '.*';
+    if (filterNameRegex !== undefined && filterNameRegex !== null) {
+      if (typeof filterNameRegex !== 'string') {
+        return res.status(400).json({ error: 'Invalid filterNameRegex value. Must be a string.' });
+      }
+      // Test that regex is valid
+      try {
+        new RegExp(filterNameRegex);
+        validatedRegex = filterNameRegex;
+      } catch {
+        return res.status(400).json({ error: 'Invalid filterNameRegex value. Must be a valid regular expression.' });
+      }
+    }
+
+    // Update all settings
+    databaseService.setTracerouteFilterSettings({
+      enabled,
+      nodeNums,
+      filterChannels: validatedChannels,
+      filterRoles: validatedRoles,
+      filterHwModels: validatedHwModels,
+      filterNameRegex: validatedRegex,
+    });
+
+    res.json({
+      success: true,
+      enabled,
+      nodeNums,
+      filterChannels: validatedChannels,
+      filterRoles: validatedRoles,
+      filterHwModels: validatedHwModels,
+      filterNameRegex: validatedRegex,
+    });
   } catch (error) {
     logger.error('Error updating auto-traceroute node filter:', error);
     res.status(500).json({ error: 'Failed to update auto-traceroute node filter' });
@@ -3434,6 +3676,9 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'autoAckDirectMessages',
       'autoAckUseDM',
       'autoAckSkipIncompleteNodes',
+      'autoAckTapbackEnabled',
+      'autoAckReplyEnabled',
+      'customTapbackEmojis',
       'autoAnnounceEnabled',
       'autoAnnounceIntervalHours',
       'autoAnnounceMessage',
@@ -3470,6 +3715,7 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'inactiveNodeThresholdHours',
       'inactiveNodeCheckIntervalMinutes',
       'inactiveNodeCooldownHours',
+      'autoUpgradeImmediate',
     ];
     const filteredSettings: Record<string, string> = {};
 
@@ -4995,6 +5241,18 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
         }
         adminMessage = protobufService.createRemoveFavoriteNodeMessage(params.nodeNum, sessionPasskey || undefined);
         break;
+      case 'setIgnoredNode':
+        if (params.nodeNum === undefined) {
+          return res.status(400).json({ error: 'nodeNum is required for setIgnoredNode' });
+        }
+        adminMessage = protobufService.createSetIgnoredNodeMessage(params.nodeNum, sessionPasskey || undefined);
+        break;
+      case 'removeIgnoredNode':
+        if (params.nodeNum === undefined) {
+          return res.status(400).json({ error: 'nodeNum is required for removeIgnoredNode' });
+        }
+        adminMessage = protobufService.createRemoveIgnoredNodeMessage(params.nodeNum, sessionPasskey || undefined);
+        break;
       default:
         return res.status(400).json({ error: `Unknown command: ${command}` });
     }
@@ -5241,6 +5499,48 @@ apiRouter.get('/version/check', optionalAuth(), async (_req, res) => {
     // Only mark update as available if it's a newer version AND container image exists
     const updateAvailable = isNewerVersion && imageReady;
 
+    // Check if auto-upgrade immediate is enabled and trigger upgrade automatically
+    let autoUpgradeTriggered = false;
+    if (updateAvailable && upgradeService.isEnabled()) {
+      const autoUpgradeImmediate = databaseService.getSetting('autoUpgradeImmediate') === 'true';
+      if (autoUpgradeImmediate) {
+        // Check if an upgrade is already in progress before triggering
+        try {
+          const inProgress = await upgradeService.isUpgradeInProgress();
+          if (inProgress) {
+            logger.debug(`ℹ️ Auto-upgrade skipped: upgrade already in progress`);
+          } else {
+            logger.info(`🚀 Auto-upgrade immediate enabled, triggering upgrade to ${latestVersion}`);
+            const upgradeResult = await upgradeService.triggerUpgrade(
+              { targetVersion: latestVersion, backup: true },
+              currentVersion,
+              'system-auto-upgrade'
+            );
+            if (upgradeResult.success) {
+              autoUpgradeTriggered = true;
+              logger.info(`✅ Auto-upgrade triggered successfully: ${upgradeResult.upgradeId}`);
+              databaseService.auditLog(
+                null,
+                'auto_upgrade_triggered',
+                'system',
+                `Auto-upgrade initiated: ${currentVersion} → ${latestVersion}`,
+                null
+              );
+            } else {
+              // Check if failure was due to upgrade already in progress (race condition)
+              if (upgradeResult.message === 'An upgrade is already in progress') {
+                logger.debug(`ℹ️ Auto-upgrade skipped: upgrade started by another process`);
+              } else {
+                logger.warn(`⚠️ Auto-upgrade failed to trigger: ${upgradeResult.message}`);
+              }
+            }
+          }
+        } catch (upgradeError) {
+          logger.error('❌ Error triggering auto-upgrade:', upgradeError);
+        }
+      }
+    }
+
     const result = {
       updateAvailable,
       currentVersion,
@@ -5249,6 +5549,7 @@ apiRouter.get('/version/check', optionalAuth(), async (_req, res) => {
       releaseName: release.name,
       publishedAt: release.published_at,
       imageReady,
+      autoUpgradeTriggered,
     };
 
     // Cache the result

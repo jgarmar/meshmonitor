@@ -218,8 +218,38 @@ recreate_container() {
       log "Using project name: $COMPOSE_PROJECT_NAME"
     fi
 
-    docker compose $project_flag $compose_files stop "$CONTAINER_NAME" 2>/dev/null || true
-    docker compose $project_flag $compose_files rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    # Stop container via compose
+    if ! docker compose $project_flag $compose_files stop "$CONTAINER_NAME" 2>/dev/null; then
+      log_warn "Compose stop failed, trying direct docker stop..."
+      docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    fi
+
+    # Remove container via compose
+    if ! docker compose $project_flag $compose_files rm -f "$CONTAINER_NAME" 2>/dev/null; then
+      log_warn "Compose rm failed, trying direct docker rm..."
+      docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    fi
+
+    # Verify container is actually gone (critical for ARM/Raspberry Pi where Docker can be slower)
+    local wait_count=0
+    local max_wait=30
+    while docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; do
+      wait_count=$((wait_count + 1))
+      if [ $wait_count -ge $max_wait ]; then
+        log_error "Container still exists after ${max_wait}s - forcing removal"
+        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+        sleep 2
+        # Final check
+        if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+          log_error "Unable to remove container - manual intervention required"
+          return 1
+        fi
+        break
+      fi
+      log "Waiting for container removal... (${wait_count}s)"
+      sleep 1
+    done
+    log_success "Container removed successfully"
 
     # Recreate using docker compose (this properly handles all configuration)
     if docker compose $project_flag $compose_files up -d --no-deps "$CONTAINER_NAME"; then
@@ -258,8 +288,29 @@ recreate_container() {
 
     # Stop and remove old container
     log "Stopping current container..."
-    docker stop "$CONTAINER_NAME" || true
-    docker rm "$CONTAINER_NAME" || true
+    docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+    # Verify container is actually gone (critical for ARM/Raspberry Pi where Docker can be slower)
+    local wait_count=0
+    local max_wait=30
+    while docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; do
+      wait_count=$((wait_count + 1))
+      if [ $wait_count -ge $max_wait ]; then
+        log_error "Container still exists after ${max_wait}s - forcing removal"
+        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+        sleep 2
+        if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+          log_error "Unable to remove container - manual intervention required"
+          rm -f "$env_file"
+          return 1
+        fi
+        break
+      fi
+      log "Waiting for container removal... (${wait_count}s)"
+      sleep 1
+    done
+    log_success "Container removed successfully"
 
     # Start new container with same configuration
     log "Starting new container..."
@@ -334,6 +385,70 @@ wait_for_health() {
 
   log_error "Health check timeout after ${max_wait}s"
   return 1
+}
+
+# Clean up old Docker images to free disk space
+cleanup_old_images() {
+  log "Cleaning up old MeshMonitor images..."
+
+  # Get the current image ID being used by the container
+  local current_image_id=$(docker inspect --format='{{.Image}}' "$CONTAINER_NAME" 2>/dev/null | cut -d':' -f2 | cut -c1-12)
+
+  if [ -z "$current_image_id" ]; then
+    log_warn "Could not determine current image ID, skipping cleanup"
+    return 0
+  fi
+
+  log "Current image ID: $current_image_id"
+
+  # Find all MeshMonitor images (excluding the current one)
+  local old_images=$(docker images "${IMAGE_NAME}" --format '{{.ID}} {{.Tag}}' 2>/dev/null | while read id tag; do
+    # Get short ID for comparison
+    local short_id=$(echo "$id" | cut -c1-12)
+    if [ "$short_id" != "$current_image_id" ]; then
+      echo "$id"
+    fi
+  done)
+
+  if [ -z "$old_images" ]; then
+    log "No old images to clean up"
+    return 0
+  fi
+
+  # Count images to be removed
+  local image_count=$(echo "$old_images" | wc -l)
+  log "Found $image_count old image(s) to remove"
+
+  # Remove each old image
+  local removed=0
+  local failed=0
+  for image_id in $old_images; do
+    if docker rmi "$image_id" 2>/dev/null; then
+      removed=$((removed + 1))
+      log "Removed image: $image_id"
+    else
+      failed=$((failed + 1))
+      log_warn "Could not remove image: $image_id (may be in use)"
+    fi
+  done
+
+  if [ $removed -gt 0 ]; then
+    log_success "Cleaned up $removed old image(s)"
+  fi
+
+  if [ $failed -gt 0 ]; then
+    log_warn "$failed image(s) could not be removed"
+  fi
+
+  # Also clean up dangling images (untagged images from the build process)
+  local dangling=$(docker images -f "dangling=true" -q 2>/dev/null)
+  if [ -n "$dangling" ]; then
+    log "Removing dangling images..."
+    echo "$dangling" | xargs docker rmi 2>/dev/null || true
+    log_success "Dangling images cleaned up"
+  fi
+
+  return 0
 }
 
 # Perform upgrade
@@ -415,6 +530,10 @@ perform_upgrade() {
     log_error "Health check failed - upgrade may have issues"
     return 1
   fi
+
+  # Step 5: Clean up old images to free disk space
+  write_status "cleanup"
+  cleanup_old_images
 
   # Success!
   write_status "complete"

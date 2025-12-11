@@ -35,6 +35,7 @@ import { migration as perChannelPermissionsMigration } from '../server/migration
 import { migration as apiTokensMigration } from '../server/migrations/025_add_api_tokens.js';
 import { migration as cascadeForeignKeysMigration } from '../server/migrations/028_add_cascade_to_foreign_keys.js';
 import { migration as userMapPreferencesMigration } from '../server/migrations/030_add_user_map_preferences.js';
+import { migration as isIgnoredMigration } from '../server/migrations/033_add_is_ignored_to_nodes.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
 
 // Configuration constants for traceroute history
@@ -65,6 +66,7 @@ export interface DbNode {
   firmwareVersion?: string;
   channel?: number;
   isFavorite?: boolean;
+  isIgnored?: boolean;
   mobile?: number; // 0 = not mobile, 1 = mobile (moved >100m)
   rebootCount?: number;
   publicKey?: string;
@@ -401,6 +403,7 @@ class DatabaseService {
     this.runAutoWelcomeMigration();
     this.runUserMapPreferencesMigration();
     this.runInactiveNodeNotificationMigration();
+    this.runIsIgnoredMigration();
     this.ensureAutomationDefaults();
     this.isInitialized = true;
   }
@@ -413,6 +416,8 @@ class DatabaseService {
         autoAckEnabled: 'false',
         autoAckRegex: '^(test|ping)',
         autoAckUseDM: 'false',
+        autoAckTapbackEnabled: 'false',
+        autoAckReplyEnabled: 'true',
         autoAnnounceEnabled: 'false',
         autoAnnounceIntervalHours: '6',
         autoAnnounceMessage: 'MeshMonitor {VERSION} online for {DURATION} {FEATURES}',
@@ -420,7 +425,8 @@ class DatabaseService {
         autoAnnounceOnStart: 'false',
         autoAnnounceUseSchedule: 'false',
         autoAnnounceSchedule: '0 */6 * * *',
-        tracerouteIntervalMinutes: '0'
+        tracerouteIntervalMinutes: '0',
+        autoUpgradeImmediate: 'false'
       };
 
       Object.entries(automationSettings).forEach(([key, defaultValue]) => {
@@ -1035,6 +1041,25 @@ class DatabaseService {
       logger.debug('✅ User map preferences migration completed successfully');
     } catch (error) {
       logger.error('❌ Failed to run user map preferences migration:', error);
+      throw error;
+    }
+  }
+
+  private runIsIgnoredMigration(): void {
+    const migrationKey = 'migration_033_is_ignored';
+    try {
+      const currentStatus = this.getSetting(migrationKey);
+      if (currentStatus === 'completed') {
+        logger.debug('✅ isIgnored migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 033: Add isIgnored column to nodes table...');
+      isIgnoredMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ isIgnored migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run isIgnored migration:', error);
       throw error;
     }
   }
@@ -1791,6 +1816,22 @@ class DatabaseService {
     const stmt = this.db.prepare('UPDATE nodes SET welcomedAt = ? WHERE welcomedAt IS NULL');
     const result = stmt.run(now);
     return result.changes;
+  }
+
+  /**
+   * Atomically mark a specific node as welcomed if not already welcomed.
+   * This prevents race conditions where multiple processes try to welcome the same node.
+   * Returns true if the node was marked, false if already welcomed.
+   */
+  markNodeAsWelcomedIfNotAlready(nodeNum: number, nodeId: string): boolean {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      UPDATE nodes
+      SET welcomedAt = ?, updatedAt = ?
+      WHERE nodeNum = ? AND nodeId = ? AND welcomedAt IS NULL
+    `);
+    const result = stmt.run(now, now, nodeNum, nodeId);
+    return result.changes > 0;
   }
 
   /**
@@ -2739,12 +2780,47 @@ class DatabaseService {
 
     // Check if node filter is enabled
     const filterEnabled = this.isAutoTracerouteNodeFilterEnabled();
-    const allowedNodes = filterEnabled ? this.getAutoTracerouteNodes() : [];
 
-    // Build the node filter clause
+    // Get all filter settings
+    const specificNodes = this.getAutoTracerouteNodes();
+    const filterChannels = this.getTracerouteFilterChannels();
+    const filterRoles = this.getTracerouteFilterRoles();
+    const filterHwModels = this.getTracerouteFilterHwModels();
+    const filterNameRegex = this.getTracerouteFilterNameRegex();
+
+    // Build the node filter clause using UNION logic
+    // Each filter ADDS nodes to the eligible set
     let nodeFilterClause = '';
-    if (filterEnabled && allowedNodes.length > 0) {
-      nodeFilterClause = `AND n.nodeNum IN (${allowedNodes.join(',')})`;
+    if (filterEnabled) {
+      const filterConditions: string[] = [];
+
+      // Add specific node numbers
+      if (specificNodes.length > 0) {
+        filterConditions.push(`n.nodeNum IN (${specificNodes.join(',')})`);
+      }
+
+      // Add nodes matching channel filter
+      if (filterChannels.length > 0) {
+        filterConditions.push(`n.channel IN (${filterChannels.join(',')})`);
+      }
+
+      // Add nodes matching role filter
+      if (filterRoles.length > 0) {
+        filterConditions.push(`n.role IN (${filterRoles.join(',')})`);
+      }
+
+      // Add nodes matching hardware model filter
+      if (filterHwModels.length > 0) {
+        filterConditions.push(`n.hwModel IN (${filterHwModels.join(',')})`);
+      }
+
+      // If we have any SQL-based filters, combine them with OR (union logic)
+      // Regex filter will be applied in JavaScript after the query
+      if (filterConditions.length > 0) {
+        nodeFilterClause = `AND (${filterConditions.join(' OR ')})`;
+      }
+      // If no SQL filters but we have a regex (not default), we'll filter all nodes by regex
+      // If no filters at all and regex is default '.*', all nodes are eligible
     }
 
     // Get all nodes that are eligible for traceroute based on their status
@@ -2777,7 +2853,7 @@ class DatabaseService {
       ORDER BY n.lastHeard DESC
     `);
 
-    const eligibleNodes = stmt.all(
+    let eligibleNodes = stmt.all(
       localNodeNum,
       localNodeNum,
       localNodeNum,
@@ -2785,6 +2861,21 @@ class DatabaseService {
       localNodeNum,
       now - TWENTY_FOUR_HOURS_MS
     ) as DbNode[];
+
+    // Apply regex name filter in JavaScript (SQLite doesn't support regex natively)
+    // Only filter if it's not the default '.*' which matches everything
+    if (filterEnabled && filterNameRegex && filterNameRegex !== '.*') {
+      try {
+        const regex = new RegExp(filterNameRegex, 'i');
+        eligibleNodes = eligibleNodes.filter(node => {
+          const name = node.longName || node.shortName || node.nodeId || '';
+          return regex.test(name);
+        });
+      } catch (e) {
+        // Invalid regex, log and continue with unfiltered results
+        logger.warn(`Invalid traceroute filter regex: ${filterNameRegex}`, e);
+      }
+    }
 
     if (eligibleNodes.length === 0) {
       return null;
@@ -2887,6 +2978,100 @@ class DatabaseService {
   setAutoTracerouteNodeFilterEnabled(enabled: boolean): void {
     this.setSetting('tracerouteNodeFilterEnabled', enabled ? 'true' : 'false');
     logger.debug(`✅ Auto-traceroute node filter ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  // Advanced traceroute filter settings (stored as JSON in settings table)
+  getTracerouteFilterChannels(): number[] {
+    const value = this.getSetting('tracerouteFilterChannels');
+    if (!value) return [];
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+
+  setTracerouteFilterChannels(channels: number[]): void {
+    this.setSetting('tracerouteFilterChannels', JSON.stringify(channels));
+    logger.debug(`✅ Set traceroute filter channels: ${channels.join(', ') || 'none'}`);
+  }
+
+  getTracerouteFilterRoles(): number[] {
+    const value = this.getSetting('tracerouteFilterRoles');
+    if (!value) return [];
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+
+  setTracerouteFilterRoles(roles: number[]): void {
+    this.setSetting('tracerouteFilterRoles', JSON.stringify(roles));
+    logger.debug(`✅ Set traceroute filter roles: ${roles.join(', ') || 'none'}`);
+  }
+
+  getTracerouteFilterHwModels(): number[] {
+    const value = this.getSetting('tracerouteFilterHwModels');
+    if (!value) return [];
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+
+  setTracerouteFilterHwModels(hwModels: number[]): void {
+    this.setSetting('tracerouteFilterHwModels', JSON.stringify(hwModels));
+    logger.debug(`✅ Set traceroute filter hardware models: ${hwModels.join(', ') || 'none'}`);
+  }
+
+  getTracerouteFilterNameRegex(): string {
+    const value = this.getSetting('tracerouteFilterNameRegex');
+    // Default to '.*' (match all) if not set
+    return value || '.*';
+  }
+
+  setTracerouteFilterNameRegex(regex: string): void {
+    this.setSetting('tracerouteFilterNameRegex', regex);
+    logger.debug(`✅ Set traceroute filter name regex: ${regex}`);
+  }
+
+  // Get all traceroute filter settings at once
+  getTracerouteFilterSettings(): {
+    enabled: boolean;
+    nodeNums: number[];
+    filterChannels: number[];
+    filterRoles: number[];
+    filterHwModels: number[];
+    filterNameRegex: string;
+  } {
+    return {
+      enabled: this.isAutoTracerouteNodeFilterEnabled(),
+      nodeNums: this.getAutoTracerouteNodes(),
+      filterChannels: this.getTracerouteFilterChannels(),
+      filterRoles: this.getTracerouteFilterRoles(),
+      filterHwModels: this.getTracerouteFilterHwModels(),
+      filterNameRegex: this.getTracerouteFilterNameRegex(),
+    };
+  }
+
+  // Set all traceroute filter settings at once
+  setTracerouteFilterSettings(settings: {
+    enabled: boolean;
+    nodeNums: number[];
+    filterChannels: number[];
+    filterRoles: number[];
+    filterHwModels: number[];
+    filterNameRegex: string;
+  }): void {
+    this.setAutoTracerouteNodeFilterEnabled(settings.enabled);
+    this.setAutoTracerouteNodes(settings.nodeNums);
+    this.setTracerouteFilterChannels(settings.filterChannels);
+    this.setTracerouteFilterRoles(settings.filterRoles);
+    this.setTracerouteFilterHwModels(settings.filterHwModels);
+    this.setTracerouteFilterNameRegex(settings.filterNameRegex);
+    logger.debug('✅ Updated all traceroute filter settings');
   }
 
   getTelemetryByType(telemetryType: string, limit: number = 100): DbTelemetry[] {
@@ -3238,6 +3423,26 @@ class DatabaseService {
     }
 
     logger.debug(`${isFavorite ? '⭐' : '☆'} Node ${nodeNum} favorite status set to: ${isFavorite} (${result.changes} row updated)`);
+  }
+
+  // Ignored operations
+  setNodeIgnored(nodeNum: number, isIgnored: boolean): void {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      UPDATE nodes SET
+        isIgnored = ?,
+        updatedAt = ?
+      WHERE nodeNum = ?
+    `);
+    const result = stmt.run(isIgnored ? 1 : 0, now, nodeNum);
+
+    if (result.changes === 0) {
+      const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+      logger.warn(`⚠️ Failed to update ignored status for node ${nodeId} (${nodeNum}): node not found in database`);
+      throw new Error(`Node ${nodeId} not found`);
+    }
+
+    logger.debug(`${isIgnored ? '🚫' : '✅'} Node ${nodeNum} ignored status set to: ${isIgnored} (${result.changes} row updated)`);
   }
 
   // Authentication and Authorization
