@@ -55,24 +55,22 @@ interface NodesTabProps {
 // Helper function to check if a date is today
 const isToday = (date: Date): boolean => {
   const today = new Date();
-  return date.getDate() === today.getDate() &&
+  return (
+    date.getDate() === today.getDate() &&
     date.getMonth() === today.getMonth() &&
-    date.getFullYear() === today.getFullYear();
+    date.getFullYear() === today.getFullYear()
+  );
 };
 
 // Separate components for traceroutes that can update independently
 // These prevent marker re-renders when only the traceroute paths change
-const TraceroutePathsLayer = React.memo<{ paths: React.ReactNode; enabled: boolean }>(
-  ({ paths }) => {
-    return <>{paths}</>;
-  }
-);
+const TraceroutePathsLayer = React.memo<{ paths: React.ReactNode; enabled: boolean }>(({ paths }) => {
+  return <>{paths}</>;
+});
 
-const SelectedTracerouteLayer = React.memo<{ traceroute: React.ReactNode; enabled: boolean }>(
-  ({ traceroute }) => {
-    return <>{traceroute}</>;
-  }
-);
+const SelectedTracerouteLayer = React.memo<{ traceroute: React.ReactNode; enabled: boolean }>(({ traceroute }) => {
+  return <>{traceroute}</>;
+});
 
 const NodesTabComponent: React.FC<NodesTabProps> = ({
   processedNodes,
@@ -141,14 +139,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setIsNodeListCollapsed,
   } = useUI();
 
-  const {
-    timeFormat,
-    dateFormat,
-    mapTileset,
-    setMapTileset,
-    mapPinStyle,
-    customTilesets,
-  } = useSettings();
+  const { timeFormat, dateFormat, mapTileset, setMapTileset, mapPinStyle, customTilesets } = useSettings();
 
   const { hasPermission } = useAuth();
 
@@ -158,11 +149,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   useEffect(() => {
     // Check if the device supports touch
     const checkTouch = () => {
-      return (
-        'ontouchstart' in window ||
-        navigator.maxTouchPoints > 0 ||
-        (navigator as any).msMaxTouchPoints > 0
-      );
+      return 'ontouchstart' in window || navigator.maxTouchPoints > 0 || (navigator as any).msMaxTouchPoints > 0;
     };
     setIsTouchDevice(checkTouch());
   }, []);
@@ -182,12 +169,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     size: packetMonitorHeight,
     isResizing: isPacketMonitorResizing,
     handleMouseDown: handlePacketMonitorResizeStart,
-    handleTouchStart: handlePacketMonitorTouchStart
+    handleTouchStart: handlePacketMonitorTouchStart,
   } = useResizable({
     id: 'packet-monitor-height',
     defaultHeight: Math.round(window.innerHeight * 0.35),
     minHeight: 150,
-    maxHeight: Math.round(window.innerHeight * 0.7)
+    maxHeight: Math.round(window.innerHeight * 0.7),
   });
 
   // Track if packet logging is enabled on the server
@@ -381,40 +368,50 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const stopPropagation = useCallback((e: React.MouseEvent) => e.stopPropagation(), []);
 
   // Stable callback factories for node item interactions
-  const handleNodeClick = useCallback((node: DeviceInfo) => {
-    return () => {
-      setSelectedNodeId(node.user?.id || null);
-      centerMapOnNode(node);
-      // Auto-collapse node list on mobile when a node with position is clicked
-      if (window.innerWidth <= 768) {
-        const hasPosition = node.position &&
-          node.position.latitude != null &&
-          node.position.longitude != null;
-        if (hasPosition) {
-          setIsNodeListCollapsed(true);
+  const handleNodeClick = useCallback(
+    (node: DeviceInfo) => {
+      return () => {
+        setSelectedNodeId(node.user?.id || null);
+        centerMapOnNode(node);
+        // Auto-collapse node list on mobile when a node with position is clicked
+        if (window.innerWidth <= 768) {
+          const hasPosition = node.position && node.position.latitude != null && node.position.longitude != null;
+          if (hasPosition) {
+            setIsNodeListCollapsed(true);
+          }
         }
-      }
-    };
-  }, [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed]);
+      };
+    },
+    [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed]
+  );
 
-  const handleFavoriteClick = useCallback((node: DeviceInfo) => {
-    return (e: React.MouseEvent) => toggleFavorite(node, e);
-  }, [toggleFavorite]);
+  const handleFavoriteClick = useCallback(
+    (node: DeviceInfo) => {
+      return (e: React.MouseEvent) => toggleFavorite(node, e);
+    },
+    [toggleFavorite]
+  );
 
-  const handleDMClick = useCallback((node: DeviceInfo) => {
-    return (e: React.MouseEvent) => {
-      e.stopPropagation();
-      setSelectedDMNode(node.user?.id || '');
-      setActiveTab('messages');
-    };
-  }, [setSelectedDMNode, setActiveTab]);
+  const handleDMClick = useCallback(
+    (node: DeviceInfo) => {
+      return (e: React.MouseEvent) => {
+        e.stopPropagation();
+        setSelectedDMNode(node.user?.id || '');
+        setActiveTab('messages');
+      };
+    },
+    [setSelectedDMNode, setActiveTab]
+  );
 
-  const handlePopupDMClick = useCallback((node: DeviceInfo) => {
-    return () => {
-      setSelectedDMNode(node.user!.id);
-      setActiveTab('messages');
-    };
-  }, [setSelectedDMNode, setActiveTab]);
+  const handlePopupDMClick = useCallback(
+    (node: DeviceInfo) => {
+      return () => {
+        setSelectedDMNode(node.user!.id);
+        setActiveTab('messages');
+      };
+    },
+    [setSelectedDMNode, setActiveTab]
+  );
 
   // Simple toggle callbacks
   const handleCollapseNodeList = useCallback(() => {
@@ -435,92 +432,104 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   }, [sortDirection, setSortDirection]);
 
   // Drag handlers for sidebar
-  const handleDragStart = useCallback((e: React.MouseEvent) => {
-    if (isNodeListCollapsed || isTouchDevice) return; // Disable drag on mobile
-    // Don't start drag if clicking on an input, button, select, or anything inside node-controls
-    // Check this FIRST before doing anything else
-    const target = e.target as HTMLElement;
-    const isInteractiveElement = 
-      target.tagName === 'INPUT' || 
-      target.tagName === 'BUTTON' || 
-      target.tagName === 'SELECT' || 
-      target.tagName === 'OPTION' ||
-      target.closest('.node-controls') !== null ||
-      target.closest('input') !== null ||
-      target.closest('button') !== null ||
-      target.closest('select') !== null;
-    
-    if (isInteractiveElement) {
-      // Don't prevent default - allow normal interaction
-      e.stopPropagation();
-      return;
-    }
-    e.preventDefault();
-    setIsDragging(true);
-    setDragStart({
-      x: e.clientX - sidebarPosition.x,
-      y: e.clientY - sidebarPosition.y,
-    });
-  }, [isNodeListCollapsed, sidebarPosition, isTouchDevice]);
+  const handleDragStart = useCallback(
+    (e: React.MouseEvent) => {
+      if (isNodeListCollapsed || isTouchDevice) return; // Disable drag on mobile
+      // Don't start drag if clicking on an input, button, select, or anything inside node-controls
+      // Check this FIRST before doing anything else
+      const target = e.target as HTMLElement;
+      const isInteractiveElement =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'BUTTON' ||
+        target.tagName === 'SELECT' ||
+        target.tagName === 'OPTION' ||
+        target.closest('.node-controls') !== null ||
+        target.closest('input') !== null ||
+        target.closest('button') !== null ||
+        target.closest('select') !== null;
 
-  const handleDragMove = useCallback((e: MouseEvent) => {
-    if (!isDragging) return;
-    
-    const splitView = document.querySelector('.nodes-split-view');
-    if (!splitView) return;
-    
-    const rect = splitView.getBoundingClientRect();
-    const sidebarWidth = sidebarSize.width || 350;
-    const maxX = rect.width - sidebarWidth - 20; // Leave some margin
-    const maxY = rect.height - 100; // Minimum height for header
-    
-    const newX = Math.max(0, Math.min(maxX, e.clientX - dragStart.x));
-    const newY = Math.max(0, Math.min(maxY, e.clientY - dragStart.y));
-    
-    setSidebarPosition({ x: newX, y: newY });
-  }, [isDragging, dragStart, sidebarSize]);
+      if (isInteractiveElement) {
+        // Don't prevent default - allow normal interaction
+        e.stopPropagation();
+        return;
+      }
+      e.preventDefault();
+      setIsDragging(true);
+      setDragStart({
+        x: e.clientX - sidebarPosition.x,
+        y: e.clientY - sidebarPosition.y,
+      });
+    },
+    [isNodeListCollapsed, sidebarPosition, isTouchDevice]
+  );
+
+  const handleDragMove = useCallback(
+    (e: MouseEvent) => {
+      if (!isDragging) return;
+
+      const splitView = document.querySelector('.nodes-split-view');
+      if (!splitView) return;
+
+      const rect = splitView.getBoundingClientRect();
+      const sidebarWidth = sidebarSize.width || 350;
+      const maxX = rect.width - sidebarWidth - 20; // Leave some margin
+      const maxY = rect.height - 100; // Minimum height for header
+
+      const newX = Math.max(0, Math.min(maxX, e.clientX - dragStart.x));
+      const newY = Math.max(0, Math.min(maxY, e.clientY - dragStart.y));
+
+      setSidebarPosition({ x: newX, y: newY });
+    },
+    [isDragging, dragStart, sidebarSize]
+  );
 
   const handleDragEnd = useCallback(() => {
     setIsDragging(false);
   }, []);
 
   // Resize handlers for sidebar
-  const handleResizeStart = useCallback((e: React.MouseEvent) => {
-    if (isNodeListCollapsed || isTouchDevice) return; // Disable resize on mobile
-    e.preventDefault();
-    e.stopPropagation();
-    setIsResizing(true);
-    const sidebar = sidebarRef.current;
-    const currentHeight = sidebar ? sidebar.offsetHeight : 0;
-    setResizeStart({
-      x: e.clientX,
-      y: e.clientY,
-      width: sidebarSize.width || 350,
-      height: sidebarSize.height || currentHeight,
-    });
-  }, [isNodeListCollapsed, sidebarSize, isTouchDevice]);
+  const handleResizeStart = useCallback(
+    (e: React.MouseEvent) => {
+      if (isNodeListCollapsed || isTouchDevice) return; // Disable resize on mobile
+      e.preventDefault();
+      e.stopPropagation();
+      setIsResizing(true);
+      const sidebar = sidebarRef.current;
+      const currentHeight = sidebar ? sidebar.offsetHeight : 0;
+      setResizeStart({
+        x: e.clientX,
+        y: e.clientY,
+        width: sidebarSize.width || 350,
+        height: sidebarSize.height || currentHeight,
+      });
+    },
+    [isNodeListCollapsed, sidebarSize, isTouchDevice]
+  );
 
-  const handleResizeMove = useCallback((e: MouseEvent) => {
-    if (!isResizing) return;
-    
-    const splitView = document.querySelector('.nodes-split-view');
-    if (!splitView) return;
-    
-    const rect = splitView.getBoundingClientRect();
-    const deltaX = e.clientX - resizeStart.x;
-    const deltaY = e.clientY - resizeStart.y;
-    
-    const minWidth = 250;
-    const maxWidth = Math.min(800, rect.width - sidebarPosition.x - 20);
-    const minHeight = 200;
-    const maxHeight = rect.height - sidebarPosition.y - 20;
-    
-    const newWidth = Math.max(minWidth, Math.min(maxWidth, resizeStart.width + deltaX));
-    // Always set height when resizing (user is explicitly resizing)
-    const newHeight = Math.max(minHeight, Math.min(maxHeight, resizeStart.height + deltaY));
-    
-    setSidebarSize({ width: newWidth, height: newHeight });
-  }, [isResizing, resizeStart, sidebarPosition]);
+  const handleResizeMove = useCallback(
+    (e: MouseEvent) => {
+      if (!isResizing) return;
+
+      const splitView = document.querySelector('.nodes-split-view');
+      if (!splitView) return;
+
+      const rect = splitView.getBoundingClientRect();
+      const deltaX = e.clientX - resizeStart.x;
+      const deltaY = e.clientY - resizeStart.y;
+
+      const minWidth = 250;
+      const maxWidth = Math.min(800, rect.width - sidebarPosition.x - 20);
+      const minHeight = 200;
+      const maxHeight = rect.height - sidebarPosition.y - 20;
+
+      const newWidth = Math.max(minWidth, Math.min(maxWidth, resizeStart.width + deltaX));
+      // Always set height when resizing (user is explicitly resizing)
+      const newHeight = Math.max(minHeight, Math.min(maxHeight, resizeStart.height + deltaY));
+
+      setSidebarSize({ width: newWidth, height: newHeight });
+    },
+    [isResizing, resizeStart, sidebarPosition]
+  );
 
   const handleResizeEnd = useCallback(() => {
     setIsResizing(false);
@@ -533,7 +542,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       document.addEventListener('mouseup', handleDragEnd);
       document.body.style.cursor = 'grabbing';
       document.body.style.userSelect = 'none';
-      
+
       return () => {
         document.removeEventListener('mousemove', handleDragMove);
         document.removeEventListener('mouseup', handleDragEnd);
@@ -549,7 +558,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       document.addEventListener('mouseup', handleResizeEnd);
       document.body.style.cursor = 'nwse-resize';
       document.body.style.userSelect = 'none';
-      
+
       return () => {
         document.removeEventListener('mousemove', handleResizeMove);
         document.removeEventListener('mouseup', handleResizeEnd);
@@ -560,55 +569,61 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   }, [isResizing, handleResizeMove, handleResizeEnd]);
 
   // Map controls drag handlers
-  const handleMapControlsDragStart = useCallback((e: React.MouseEvent) => {
-    if (isMapControlsCollapsed || isTouchDevice) return; // Disable drag on mobile
-    e.preventDefault();
-    e.stopPropagation();
+  const handleMapControlsDragStart = useCallback(
+    (e: React.MouseEvent) => {
+      if (isMapControlsCollapsed || isTouchDevice) return; // Disable drag on mobile
+      e.preventDefault();
+      e.stopPropagation();
 
-    // If position is default (-1), calculate actual position from element
-    let currentX = mapControlsPosition.x;
-    let currentY = mapControlsPosition.y;
+      // If position is default (-1), calculate actual position from element
+      let currentX = mapControlsPosition.x;
+      let currentY = mapControlsPosition.y;
 
-    if (currentX === -1) {
-      // Convert from CSS right: 10px to left-based coordinates
-      const mapContainer = document.querySelector('.map-container');
-      const controls = mapControlsRef.current;
-      if (mapContainer && controls) {
-        const containerRect = mapContainer.getBoundingClientRect();
-        const controlsRect = controls.getBoundingClientRect();
-        currentX = controlsRect.left - containerRect.left;
-        currentY = controlsRect.top - containerRect.top;
-        // Update the position to be explicit
-        setMapControlsPosition({ x: currentX, y: currentY });
+      if (currentX === -1) {
+        // Convert from CSS right: 10px to left-based coordinates
+        const mapContainer = document.querySelector('.map-container');
+        const controls = mapControlsRef.current;
+        if (mapContainer && controls) {
+          const containerRect = mapContainer.getBoundingClientRect();
+          const controlsRect = controls.getBoundingClientRect();
+          currentX = controlsRect.left - containerRect.left;
+          currentY = controlsRect.top - containerRect.top;
+          // Update the position to be explicit
+          setMapControlsPosition({ x: currentX, y: currentY });
+        }
       }
-    }
 
-    setIsDraggingMapControls(true);
-    setMapControlsDragStart({
-      x: e.clientX - currentX,
-      y: e.clientY - currentY,
-    });
-  }, [isMapControlsCollapsed, mapControlsPosition, isTouchDevice]);
+      setIsDraggingMapControls(true);
+      setMapControlsDragStart({
+        x: e.clientX - currentX,
+        y: e.clientY - currentY,
+      });
+    },
+    [isMapControlsCollapsed, mapControlsPosition, isTouchDevice]
+  );
 
-  const handleMapControlsDragMove = useCallback((e: MouseEvent) => {
-    if (!isDraggingMapControls) return;
-    
-    const mapContainer = document.querySelector('.map-container');
-    if (!mapContainer) return;
-    
-    const rect = mapContainer.getBoundingClientRect();
-    const controls = mapControlsRef.current;
-    if (!controls) return;
-    
-    const controlsRect = controls.getBoundingClientRect();
-    const maxX = rect.width - controlsRect.width - 10;
-    const maxY = rect.height - controlsRect.height - 10;
-    
-    const newX = Math.max(10, Math.min(maxX, e.clientX - mapControlsDragStart.x - rect.left));
-    const newY = Math.max(10, Math.min(maxY, e.clientY - mapControlsDragStart.y - rect.top));
-    
-    setMapControlsPosition({ x: newX, y: newY });
-  }, [isDraggingMapControls, mapControlsDragStart]);
+  const handleMapControlsDragMove = useCallback(
+    (e: MouseEvent) => {
+      if (!isDraggingMapControls) return;
+
+      const mapContainer = document.querySelector('.map-container');
+      if (!mapContainer) return;
+
+      const rect = mapContainer.getBoundingClientRect();
+      const controls = mapControlsRef.current;
+      if (!controls) return;
+
+      const controlsRect = controls.getBoundingClientRect();
+      const maxX = rect.width - controlsRect.width - 10;
+      const maxY = rect.height - controlsRect.height - 10;
+
+      const newX = Math.max(10, Math.min(maxX, e.clientX - mapControlsDragStart.x - rect.left));
+      const newY = Math.max(10, Math.min(maxY, e.clientY - mapControlsDragStart.y - rect.top));
+
+      setMapControlsPosition({ x: newX, y: newY });
+    },
+    [isDraggingMapControls, mapControlsDragStart]
+  );
 
   const handleMapControlsDragEnd = useCallback(() => {
     setIsDraggingMapControls(false);
@@ -621,7 +636,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       document.addEventListener('mouseup', handleMapControlsDragEnd);
       document.body.style.cursor = 'grabbing';
       document.body.style.userSelect = 'none';
-      
+
       return () => {
         document.removeEventListener('mousemove', handleMapControlsDragMove);
         document.removeEventListener('mouseup', handleMapControlsDragEnd);
@@ -749,64 +764,65 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   };
 
   // Helper function to sort nodes
-  const sortNodes = useCallback((nodes: DeviceInfo[]): DeviceInfo[] => {
-    return [...nodes].sort((a, b) => {
-      let aVal: any, bVal: any;
+  const sortNodes = useCallback(
+    (nodes: DeviceInfo[]): DeviceInfo[] => {
+      return [...nodes].sort((a, b) => {
+        let aVal: any, bVal: any;
 
-      switch (sortField) {
-        case 'longName':
-          aVal = a.user?.longName || `Node ${a.nodeNum}`;
-          bVal = b.user?.longName || `Node ${b.nodeNum}`;
-          break;
-        case 'shortName':
-          aVal = a.user?.shortName || '';
-          bVal = b.user?.shortName || '';
-          break;
-        case 'id':
-          aVal = a.user?.id || a.nodeNum;
-          bVal = b.user?.id || b.nodeNum;
-          break;
-        case 'lastHeard':
-          aVal = a.lastHeard || 0;
-          bVal = b.lastHeard || 0;
-          break;
-        case 'snr':
-          aVal = a.snr ?? -999;
-          bVal = b.snr ?? -999;
-          break;
-        case 'battery':
-          aVal = a.deviceMetrics?.batteryLevel ?? -1;
-          bVal = b.deviceMetrics?.batteryLevel ?? -1;
-          break;
-        case 'hwModel':
-          aVal = a.user?.hwModel ?? 0;
-          bVal = b.user?.hwModel ?? 0;
-          break;
-        case 'hops':
-          aVal = a.hopsAway ?? 999;
-          bVal = b.hopsAway ?? 999;
-          break;
-        default:
-          return 0;
-      }
+        switch (sortField) {
+          case 'longName':
+            aVal = a.user?.longName || `Node ${a.nodeNum}`;
+            bVal = b.user?.longName || `Node ${b.nodeNum}`;
+            break;
+          case 'shortName':
+            aVal = a.user?.shortName || '';
+            bVal = b.user?.shortName || '';
+            break;
+          case 'id':
+            aVal = a.user?.id || a.nodeNum;
+            bVal = b.user?.id || b.nodeNum;
+            break;
+          case 'lastHeard':
+            aVal = a.lastHeard || 0;
+            bVal = b.lastHeard || 0;
+            break;
+          case 'snr':
+            aVal = a.snr ?? -999;
+            bVal = b.snr ?? -999;
+            break;
+          case 'battery':
+            aVal = a.deviceMetrics?.batteryLevel ?? -1;
+            bVal = b.deviceMetrics?.batteryLevel ?? -1;
+            break;
+          case 'hwModel':
+            aVal = a.user?.hwModel ?? 0;
+            bVal = b.user?.hwModel ?? 0;
+            break;
+          case 'hops':
+            aVal = a.hopsAway ?? 999;
+            bVal = b.hopsAway ?? 999;
+            break;
+          default:
+            return 0;
+        }
 
-      // Compare values
-      let comparison = 0;
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        comparison = aVal.localeCompare(bVal);
-      } else {
-        comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-      }
+        // Compare values
+        let comparison = 0;
+        if (typeof aVal === 'string' && typeof bVal === 'string') {
+          comparison = aVal.localeCompare(bVal);
+        } else {
+          comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+        }
 
-      return sortDirection === 'asc' ? comparison : -comparison;
-    });
-  }, [sortField, sortDirection]);
+        return sortDirection === 'asc' ? comparison : -comparison;
+      });
+    },
+    [sortField, sortDirection]
+  );
 
   // Calculate nodes with position
-  const nodesWithPosition = processedNodes.filter(node =>
-    node.position &&
-    node.position.latitude != null &&
-    node.position.longitude != null
+  const nodesWithPosition = processedNodes.filter(
+    node => node.position && node.position.latitude != null && node.position.longitude != null
   );
 
   // Memoize node positions to prevent React-Leaflet from resetting marker positions
@@ -842,7 +858,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
     // Fall back to average position of all nodes
     const avgLat = nodesWithPosition.reduce((sum, node) => sum + node.position!.latitude, 0) / nodesWithPosition.length;
-    const avgLng = nodesWithPosition.reduce((sum, node) => sum + node.position!.longitude, 0) / nodesWithPosition.length;
+    const avgLng =
+      nodesWithPosition.reduce((sum, node) => sum + node.position!.longitude, 0) / nodesWithPosition.length;
     return [avgLat, avgLng];
   };
 
@@ -856,10 +873,14 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           left: isNodeListCollapsed ? undefined : `${sidebarPosition.x}px`,
           top: isNodeListCollapsed ? undefined : `${sidebarPosition.y}px`,
           width: isNodeListCollapsed ? undefined : `${sidebarSize.width}px`,
-          height: isNodeListCollapsed ? undefined : (sidebarSize.height ? `${sidebarSize.height}px` : 'auto'),
-          maxHeight: isNodeListCollapsed ? undefined : (sidebarSize.height ? `${sidebarSize.height}px` : 'calc(100% - 32px)'),
+          height: isNodeListCollapsed ? undefined : sidebarSize.height ? `${sidebarSize.height}px` : 'auto',
+          maxHeight: isNodeListCollapsed
+            ? undefined
+            : sidebarSize.height
+            ? `${sidebarSize.height}px`
+            : 'calc(100% - 32px)',
         }}
-        onMouseDown={(e) => {
+        onMouseDown={e => {
           // If clicking on node-controls or any interactive element, don't let the drag handler run
           const target = e.target as HTMLElement;
           if (
@@ -875,359 +896,362 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         <div
           className="sidebar-header"
           onMouseDown={handleDragStart}
-          style={{ cursor: (isNodeListCollapsed || isTouchDevice) ? 'default' : 'grab' }}
+          style={{ cursor: isNodeListCollapsed || isTouchDevice ? 'default' : 'grab' }}
         >
           <button
             className="collapse-nodes-btn"
             onClick={handleCollapseNodeList}
             title={isNodeListCollapsed ? 'Expand node list' : 'Collapse node list'}
-            onMouseDown={(e) => e.stopPropagation()}
+            onMouseDown={e => e.stopPropagation()}
           >
             {isNodeListCollapsed ? '▶' : '◀'}
           </button>
           {!isNodeListCollapsed && (
-          <div className="sidebar-header-content">
-            <h3>Nodes ({(() => {
-              const filteredCount = processedNodes.filter(node => {
-                // Security filter
-                if (securityFilter === 'flaggedOnly') {
-                  if (!node.keyIsLowEntropy && !node.duplicateKeyDetected) return false;
-                }
-                if (securityFilter === 'hideFlagged') {
-                  if (node.keyIsLowEntropy || node.duplicateKeyDetected) return false;
-                }
-                // Incomplete nodes filter
-                if (!showIncompleteNodes && !isNodeComplete(node)) {
-                  return false;
-                }
-                return true;
-              }).length;
-              const isFiltered = securityFilter !== 'all' || !showIncompleteNodes;
-              return isFiltered ? `${filteredCount}/${processedNodes.length}` : processedNodes.length;
-            })()})</h3>
-          </div>
+            <div className="sidebar-header-content">
+              <h3>
+                Nodes (
+                {(() => {
+                  const filteredCount = processedNodes.filter(node => {
+                    // Security filter
+                    if (securityFilter === 'flaggedOnly') {
+                      if (!node.keyIsLowEntropy && !node.duplicateKeyDetected) return false;
+                    }
+                    if (securityFilter === 'hideFlagged') {
+                      if (node.keyIsLowEntropy || node.duplicateKeyDetected) return false;
+                    }
+                    // Incomplete nodes filter
+                    if (!showIncompleteNodes && !isNodeComplete(node)) {
+                      return false;
+                    }
+                    return true;
+                  }).length;
+                  const isFiltered = securityFilter !== 'all' || !showIncompleteNodes;
+                  return isFiltered ? `${filteredCount}/${processedNodes.length}` : processedNodes.length;
+                })()}
+                )
+              </h3>
+            </div>
           )}
           {!isNodeListCollapsed && (
-          <div className="node-controls">
-            <input
-              type="text"
-              placeholder={t('nodes.filter_placeholder')}
-              value={nodesNodeFilter}
-              onChange={(e) => setNodesNodeFilter(e.target.value)}
-              onMouseDown={stopPropagation}
-              className="filter-input-small"
-            />
-            <div className="sort-controls">
-              <button
-                className="filter-popup-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation();
-                  handleToggleFilterPopup();
-                }}
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation();
-                }}
-                title={t('nodes.filter_title')}
-              >
-                {t('common.filter')}
-              </button>
-              <select
-                value={sortField}
-                onChange={(e) => setSortField(e.target.value as any)}
+            <div className="node-controls">
+              <input
+                type="text"
+                placeholder={t('nodes.filter_placeholder')}
+                value={nodesNodeFilter}
+                onChange={e => setNodesNodeFilter(e.target.value)}
                 onMouseDown={stopPropagation}
-                className="sort-dropdown"
-                title={t('nodes.sort_by')}
-              >
-                <option value="longName">{t('nodes.sort_name')}</option>
-                <option value="shortName">{t('nodes.sort_short_name')}</option>
-                <option value="id">{t('nodes.sort_id')}</option>
-                <option value="lastHeard">{t('nodes.sort_updated')}</option>
-                <option value="snr">{t('nodes.sort_signal')}</option>
-                <option value="battery">{t('nodes.sort_charge')}</option>
-                <option value="hwModel">{t('nodes.sort_hardware')}</option>
-                <option value="hops">{t('nodes.sort_hops')}</option>
-              </select>
-              <button
-                className="sort-direction-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation();
-                  handleToggleSortDirection();
-                }}
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation();
-                }}
-                title={sortDirection === 'asc' ? t('nodes.ascending') : t('nodes.descending')}
-              >
-                {sortDirection === 'asc' ? '↑' : '↓'}
-              </button>
+                className="filter-input-small"
+              />
+              <div className="sort-controls">
+                <button
+                  className="filter-popup-btn"
+                  onClick={e => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    handleToggleFilterPopup();
+                  }}
+                  onMouseDown={e => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                  }}
+                  title={t('nodes.filter_title')}
+                >
+                  {t('common.filter')}
+                </button>
+                <select
+                  value={sortField}
+                  onChange={e => setSortField(e.target.value as any)}
+                  onMouseDown={stopPropagation}
+                  className="sort-dropdown"
+                  title={t('nodes.sort_by')}
+                >
+                  <option value="longName">{t('nodes.sort_name')}</option>
+                  <option value="shortName">{t('nodes.sort_short_name')}</option>
+                  <option value="id">{t('nodes.sort_id')}</option>
+                  <option value="lastHeard">{t('nodes.sort_updated')}</option>
+                  <option value="snr">{t('nodes.sort_signal')}</option>
+                  <option value="battery">{t('nodes.sort_charge')}</option>
+                  <option value="hwModel">{t('nodes.sort_hardware')}</option>
+                  <option value="hops">{t('nodes.sort_hops')}</option>
+                </select>
+                <button
+                  className="sort-direction-btn"
+                  onClick={e => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    handleToggleSortDirection();
+                  }}
+                  onMouseDown={e => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                  }}
+                  title={sortDirection === 'asc' ? t('nodes.ascending') : t('nodes.descending')}
+                >
+                  {sortDirection === 'asc' ? '↑' : '↓'}
+                </button>
+              </div>
             </div>
-          </div>
           )}
         </div>
         {!isNodeListCollapsed && (
-        <div className="nodes-list">
-          {shouldShowData() ? (() => {
-            // Apply security, channel, and incomplete node filters
-            const filteredNodes = processedNodes.filter(node => {
-              // Security filter
-              if (securityFilter === 'flaggedOnly') {
-                if (!node.keyIsLowEntropy && !node.duplicateKeyDetected) return false;
-              }
-              if (securityFilter === 'hideFlagged') {
-                if (node.keyIsLowEntropy || node.duplicateKeyDetected) return false;
-              }
+          <div className="nodes-list">
+            {shouldShowData() ? (
+              (() => {
+                // Apply security, channel, and incomplete node filters
+                const filteredNodes = processedNodes.filter(node => {
+                  // Security filter
+                  if (securityFilter === 'flaggedOnly') {
+                    if (!node.keyIsLowEntropy && !node.duplicateKeyDetected) return false;
+                  }
+                  if (securityFilter === 'hideFlagged') {
+                    if (node.keyIsLowEntropy || node.duplicateKeyDetected) return false;
+                  }
 
-              // Channel filter
-              if (channelFilter !== 'all') {
-                const nodeChannel = node.channel ?? 0;
-                if (nodeChannel !== channelFilter) return false;
-              }
+                  // Channel filter
+                  if (channelFilter !== 'all') {
+                    const nodeChannel = node.channel ?? 0;
+                    if (nodeChannel !== channelFilter) return false;
+                  }
 
-              // Incomplete nodes filter - hide nodes missing name/hwModel info
-              if (!showIncompleteNodes && !isNodeComplete(node)) {
-                return false;
-              }
+                  // Incomplete nodes filter - hide nodes missing name/hwModel info
+                  if (!showIncompleteNodes && !isNodeComplete(node)) {
+                    return false;
+                  }
 
-              return true;
-            });
+                  return true;
+                });
 
-            // Sort nodes: favorites first, then non-favorites, each group sorted independently
-            const favorites = filteredNodes.filter(node => node.isFavorite);
-            const nonFavorites = filteredNodes.filter(node => !node.isFavorite);
-            const sortedFavorites = sortNodes(favorites);
-            const sortedNonFavorites = sortNodes(nonFavorites);
-            const sortedNodes = [...sortedFavorites, ...sortedNonFavorites];
+                // Sort nodes: favorites first, then non-favorites, each group sorted independently
+                const favorites = filteredNodes.filter(node => node.isFavorite);
+                const nonFavorites = filteredNodes.filter(node => !node.isFavorite);
+                const sortedFavorites = sortNodes(favorites);
+                const sortedNonFavorites = sortNodes(nonFavorites);
+                const sortedNodes = [...sortedFavorites, ...sortedNonFavorites];
 
-            return sortedNodes.length > 0 ? (
-              <>
-              {sortedNodes.map(node => (
-                <div
-                  key={node.nodeNum}
-                  className={`node-item ${selectedNodeId === node.user?.id ? 'selected' : ''}`}
-                  onClick={handleNodeClick(node)}
-                >
-                  <div className="node-header">
-                    <div className="node-name">
-                      <button
-                        className="favorite-star"
-                        title={node.isFavorite ? t('nodes.remove_favorite') : t('nodes.add_favorite')}
-                        onClick={handleFavoriteClick(node)}
+                return sortedNodes.length > 0 ? (
+                  <>
+                    {sortedNodes.map(node => (
+                      <div
+                        key={node.nodeNum}
+                        className={`node-item ${selectedNodeId === node.user?.id ? 'selected' : ''}`}
+                        onClick={handleNodeClick(node)}
                       >
-                        {node.isFavorite ? '⭐' : '☆'}
-                      </button>
-                      <div className="node-name-text">
-                        <div className="node-longname">
-                          {node.user?.longName || `Node ${node.nodeNum}`}
+                        <div className="node-header">
+                          <div className="node-name">
+                            <button
+                              className="favorite-star"
+                              title={node.isFavorite ? t('nodes.remove_favorite') : t('nodes.add_favorite')}
+                              onClick={handleFavoriteClick(node)}
+                            >
+                              {node.isFavorite ? '⭐' : '☆'}
+                            </button>
+                            <div className="node-name-text">
+                              <div className="node-longname">{node.user?.longName || `Node ${node.nodeNum}`}</div>
+                              {node.user?.role !== undefined &&
+                                node.user?.role !== null &&
+                                getRoleName(node.user.role) && (
+                                  <div className="node-role" title={t('nodes.node_role')}>
+                                    {getRoleName(node.user.role)}
+                                  </div>
+                                )}
+                            </div>
+                          </div>
+                          <div className="node-actions">
+                            {hasPermission('messages', 'read') && (
+                              <button className="dm-icon" title={t('nodes.send_dm')} onClick={handleDMClick(node)}>
+                                💬
+                              </button>
+                            )}
+                            {(node.keyIsLowEntropy || node.duplicateKeyDetected) && (
+                              <span
+                                className="security-warning-icon"
+                                title={node.keySecurityIssueDetails || 'Key security issue detected'}
+                                style={{
+                                  fontSize: '16px',
+                                  color: '#f44336',
+                                  marginLeft: '4px',
+                                  cursor: 'help',
+                                }}
+                              >
+                                ⚠️
+                              </span>
+                            )}
+                            <div className="node-short">{node.user?.shortName || '-'}</div>
+                          </div>
                         </div>
-                        {node.user?.role !== undefined && node.user?.role !== null && getRoleName(node.user.role) && (
-                          <div className="node-role" title={t('nodes.node_role')}>{getRoleName(node.user.role)}</div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="node-actions">
-                      {hasPermission('messages', 'read') && (
-                        <button
-                          className="dm-icon"
-                          title={t('nodes.send_dm')}
-                          onClick={handleDMClick(node)}
-                        >
-                          💬
-                        </button>
-                      )}
-                      {(node.keyIsLowEntropy || node.duplicateKeyDetected) && (
-                        <span
-                          className="security-warning-icon"
-                          title={node.keySecurityIssueDetails || 'Key security issue detected'}
-                          style={{
-                            fontSize: '16px',
-                            color: '#f44336',
-                            marginLeft: '4px',
-                            cursor: 'help'
-                          }}
-                        >
-                          ⚠️
-                        </span>
-                      )}
-                      <div className="node-short">
-                        {node.user?.shortName || '-'}
-                      </div>
-                    </div>
-                  </div>
 
-                  <div className="node-details">
-                    <div className="node-stats">
-                      {node.snr != null && (
-                        <span className="stat" title={t('nodes.snr')}>
-                          📶 {node.snr.toFixed(1)}dB
-                        </span>
-                      )}
-                      {node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null && (
-                        <span className="stat" title={node.deviceMetrics.batteryLevel === 101 ? t('nodes.plugged_in') : t('nodes.battery_level')}>
-                          {node.deviceMetrics.batteryLevel === 101 ? '🔌' : `🔋 ${node.deviceMetrics.batteryLevel}%`}
-                        </span>
-                      )}
-                      {node.hopsAway != null && (
-                        <span className="stat" title={t('nodes.hops_away')}>
-                          🔗 {node.hopsAway} {t('nodes.hop', { count: node.hopsAway })}
-                          {node.channel != null && node.channel !== 0 && ` (ch:${node.channel})`}
-                        </span>
-                      )}
-                    </div>
+                        <div className="node-details">
+                          <div className="node-stats">
+                            {node.snr != null && (
+                              <span className="stat" title={t('nodes.snr')}>
+                                📶 {node.snr.toFixed(1)}dB
+                              </span>
+                            )}
+                            {node.deviceMetrics?.batteryLevel !== undefined &&
+                              node.deviceMetrics.batteryLevel !== null && (
+                                <span
+                                  className="stat"
+                                  title={
+                                    node.deviceMetrics.batteryLevel === 101
+                                      ? t('nodes.plugged_in')
+                                      : t('nodes.battery_level')
+                                  }
+                                >
+                                  {node.deviceMetrics.batteryLevel === 101
+                                    ? '🔌'
+                                    : `🔋 ${node.deviceMetrics.batteryLevel}%`}
+                                </span>
+                              )}
+                            {node.hopsAway != null && (
+                              <span className="stat" title={t('nodes.hops_away')}>
+                                🔗 {node.hopsAway} {t('nodes.hop', { count: node.hopsAway })}
+                                {node.channel != null && node.channel !== 0 && ` (ch:${node.channel})`}
+                              </span>
+                            )}
+                          </div>
 
-                    <div className="node-time">
-                      {node.lastHeard ? (() => {
-                        const date = new Date(node.lastHeard * 1000);
-                        return isToday(date)
-                          ? formatTime(date, timeFormat)
-                          : formatDateTime(date, timeFormat, dateFormat);
-                      })() : t('time.never')}
-                    </div>
-                  </div>
+                          <div className="node-time">
+                            {node.lastHeard
+                              ? (() => {
+                                  const date = new Date(node.lastHeard * 1000);
+                                  return isToday(date)
+                                    ? formatTime(date, timeFormat)
+                                    : formatDateTime(date, timeFormat, dateFormat);
+                                })()
+                              : t('time.never')}
+                          </div>
+                        </div>
 
-                  <div className="node-indicators">
-                    {node.position && node.position.latitude != null && node.position.longitude != null && (
-                      <div className="node-location" title={t('nodes.location')}>
-                        📍 {node.position.latitude.toFixed(3)}, {node.position.longitude.toFixed(3)}
-                        {node.isMobile && <span title={t('nodes.mobile_node')} style={{ marginLeft: '4px' }}>🚶</span>}
+                        <div className="node-indicators">
+                          {node.position && node.position.latitude != null && node.position.longitude != null && (
+                            <div className="node-location" title={t('nodes.location')}>
+                              📍 {node.position.latitude.toFixed(3)}, {node.position.longitude.toFixed(3)}
+                              {node.isMobile && (
+                                <span title={t('nodes.mobile_node')} style={{ marginLeft: '4px' }}>
+                                  🚶
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          {node.viaMqtt && (
+                            <div className="node-mqtt" title={t('nodes.via_mqtt')}>
+                              🌐
+                            </div>
+                          )}
+                          {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
+                            <div className="node-telemetry" title={t('nodes.has_telemetry')}>
+                              📊
+                            </div>
+                          )}
+                          {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
+                            <div className="node-weather" title={t('nodes.has_weather')}>
+                              ☀️
+                            </div>
+                          )}
+                          {node.user?.id && nodesWithPKC.has(node.user.id) && (
+                            <div className="node-pkc" title={t('nodes.has_pkc')}>
+                              🔐
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    )}
-                    {node.viaMqtt && (
-                      <div className="node-mqtt" title={t('nodes.via_mqtt')}>
-                        🌐
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
-                      <div className="node-telemetry" title={t('nodes.has_telemetry')}>
-                        📊
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
-                      <div className="node-weather" title={t('nodes.has_weather')}>
-                        ☀️
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithPKC.has(node.user.id) && (
-                      <div className="node-pkc" title={t('nodes.has_pkc')}>
-                        🔐
-                      </div>
-                    )}
+                    ))}
+                  </>
+                ) : (
+                  <div className="no-data">
+                    {securityFilter !== 'all'
+                      ? 'No nodes match security filter'
+                      : nodesNodeFilter
+                      ? 'No nodes match filter'
+                      : 'No nodes detected'}
                   </div>
-                </div>
-              ))}
-              </>
+                );
+              })()
             ) : (
-              <div className="no-data">
-                {securityFilter !== 'all' ? 'No nodes match security filter' : (nodesNodeFilter ? 'No nodes match filter' : 'No nodes detected')}
-              </div>
-            );
-          })() : (
-            <div className="no-data">
-              Connect to Meshtastic node
-            </div>
-          )}
-        </div>
+              <div className="no-data">Connect to Meshtastic node</div>
+            )}
+          </div>
         )}
         {!isNodeListCollapsed && (
-          <div
-            className="sidebar-resize-handle"
-            onMouseDown={handleResizeStart}
-            title="Drag to resize"
-          />
+          <div className="sidebar-resize-handle" onMouseDown={handleResizeStart} title="Drag to resize" />
         )}
       </div>
 
       {/* Right Side - Map and Optional Packet Monitor */}
       <div
         className={`map-container ${showPacketMonitor && canViewPacketMonitor ? 'with-packet-monitor' : ''}`}
-        style={showPacketMonitor && canViewPacketMonitor ? { height: `calc(100% - ${packetMonitorHeight}px)` } : undefined}
+        style={
+          showPacketMonitor && canViewPacketMonitor ? { height: `calc(100% - ${packetMonitorHeight}px)` } : undefined
+        }
       >
         {shouldShowData() ? (
           <>
             <div
               ref={mapControlsRef}
               className={`map-controls ${isMapControlsCollapsed ? 'collapsed' : ''}`}
-              style={isTouchDevice ? undefined : (
-                // If collapsed, don't apply any position styles (use CSS defaults)
-                // If position is default (-1), don't apply left (CSS will use right: 10px)
-                isMapControlsCollapsed ? undefined : {
-                  left: mapControlsPosition.x === -1 ? undefined : `${mapControlsPosition.x}px`,
-                  top: `${mapControlsPosition.y}px`,
-                  right: mapControlsPosition.x === -1 ? undefined : 'auto',
-                }
-              )}
+              style={
+                isTouchDevice
+                  ? undefined
+                  : // If collapsed, don't apply any position styles (use CSS defaults)
+                  // If position is default (-1), don't apply left (CSS will use right: 10px)
+                  isMapControlsCollapsed
+                  ? undefined
+                  : {
+                      left: mapControlsPosition.x === -1 ? undefined : `${mapControlsPosition.x}px`,
+                      top: `${mapControlsPosition.y}px`,
+                      right: mapControlsPosition.x === -1 ? undefined : 'auto',
+                    }
+              }
             >
               <button
                 className="map-controls-collapse-btn"
                 onClick={handleCollapseMapControls}
                 title={isMapControlsCollapsed ? 'Expand controls' : 'Collapse controls'}
-                onMouseDown={(e) => e.stopPropagation()}
+                onMouseDown={e => e.stopPropagation()}
               >
                 {isMapControlsCollapsed ? '▼' : '▲'}
               </button>
               <div
                 className="map-controls-header"
                 style={{
-                  cursor: (isMapControlsCollapsed || isTouchDevice) ? 'default' : (isDraggingMapControls ? 'grabbing' : 'grab'),
+                  cursor:
+                    isMapControlsCollapsed || isTouchDevice ? 'default' : isDraggingMapControls ? 'grabbing' : 'grab',
                 }}
                 onMouseDown={handleMapControlsDragStart}
               >
-                {!isMapControlsCollapsed && (
-                  <div className="map-controls-title">
-                    Features
-                  </div>
-                )}
+                {!isMapControlsCollapsed && <div className="map-controls-title">Features</div>}
               </div>
               {!isMapControlsCollapsed && (
                 <>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showPaths}
-                      onChange={(e) => setShowPaths(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showPaths} onChange={e => setShowPaths(e.target.checked)} />
                     <span>Show Route Segments</span>
                   </label>
                   <label className="map-control-item">
                     <input
                       type="checkbox"
                       checked={showNeighborInfo}
-                      onChange={(e) => setShowNeighborInfo(e.target.checked)}
+                      onChange={e => setShowNeighborInfo(e.target.checked)}
                     />
                     <span>Show Neighbor Info</span>
                   </label>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showRoute}
-                      onChange={(e) => setShowRoute(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showRoute} onChange={e => setShowRoute(e.target.checked)} />
                     <span>Show Traceroute</span>
                   </label>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showMqttNodes}
-                      onChange={(e) => setShowMqttNodes(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showMqttNodes} onChange={e => setShowMqttNodes(e.target.checked)} />
                     <span>Show MQTT</span>
                   </label>
                   <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showMotion}
-                      onChange={(e) => setShowMotion(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={showMotion} onChange={e => setShowMotion(e.target.checked)} />
                     <span>Show Position History</span>
                   </label>
                   <label className="map-control-item">
                     <input
                       type="checkbox"
                       checked={showAnimations}
-                      onChange={(e) => setShowAnimations(e.target.checked)}
+                      onChange={e => setShowAnimations(e.target.checked)}
                     />
                     <span>Show Animations</span>
                   </label>
@@ -1235,7 +1259,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     <input
                       type="checkbox"
                       checked={showEstimatedPositions}
-                      onChange={(e) => setShowEstimatedPositions(e.target.checked)}
+                      onChange={e => setShowEstimatedPositions(e.target.checked)}
                     />
                     <span>Show Estimated Positions</span>
                   </label>
@@ -1244,7 +1268,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       <input
                         type="checkbox"
                         checked={showPacketMonitor}
-                        onChange={(e) => setShowPacketMonitor(e.target.checked)}
+                        onChange={e => setShowPacketMonitor(e.target.checked)}
                       />
                       <span>Show Packet Monitor</span>
                     </label>
@@ -1252,15 +1276,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 </>
               )}
             </div>
-            <MapContainer
-              center={getMapCenter()}
-              zoom={mapZoom}
-              style={{ height: '100%', width: '100%' }}
-            >
-              <MapCenterController
-                centerTarget={mapCenterTarget}
-                onCenterComplete={handleCenterComplete}
-              />
+            <MapContainer center={getMapCenter()} zoom={mapZoom} style={{ height: '100%', width: '100%' }}>
+              <MapCenterController centerTarget={mapCenterTarget} onCenterComplete={handleCenterComplete} />
               {getTilesetById(activeTileset, customTilesets).isVector ? (
                 <VectorTileLayer
                   url={getTilesetById(activeTileset, customTilesets).url}
@@ -1280,181 +1297,193 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <SpiderfierController ref={spiderfierRef} zoomLevel={mapZoom} />
               <MapLegend />
               {nodesWithPosition
-                .filter(node => (showMqttNodes || !node.viaMqtt) && (showIncompleteNodes || isNodeComplete(node)) && (showEstimatedPositions || !node.user?.id || !nodesWithEstimatedPosition.has(node.user.id)))
+                .filter(
+                  node =>
+                    (showMqttNodes || !node.viaMqtt) &&
+                    (showIncompleteNodes || isNodeComplete(node)) &&
+                    (showEstimatedPositions || !node.user?.id || !nodesWithEstimatedPosition.has(node.user.id))
+                )
                 .map(node => {
-                const roleNum = typeof node.user?.role === 'string'
-                  ? parseInt(node.user.role, 10)
-                  : (typeof node.user?.role === 'number' ? node.user.role : 0);
-                const isRouter = roleNum === 2;
-                const isSelected = selectedNodeId === node.user?.id;
+                  const roleNum =
+                    typeof node.user?.role === 'string'
+                      ? parseInt(node.user.role, 10)
+                      : typeof node.user?.role === 'number'
+                      ? node.user.role
+                      : 0;
+                  const isRouter = roleNum === 2;
+                  const isSelected = selectedNodeId === node.user?.id;
 
-                // Get hop count for this node
-                // Local node always gets 0 hops (green), otherwise use hopsAway from protobuf
-                const isLocalNode = node.user?.id === currentNodeId;
-                const hops = isLocalNode ? 0 : (node.hopsAway ?? 999);
-                const showLabel = mapZoom >= 13; // Show labels when zoomed in
-
-                const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
-
-                const markerIcon = createNodeIcon({
-                  hops: hops, // 0 (local) = green, 999 (no hops_away data) = grey
-                  isSelected,
-                  isRouter,
-                  shortName: node.user?.shortName,
-                  showLabel: showLabel || shouldAnimate, // Show label when animating OR zoomed in
-                  animate: shouldAnimate,
-                  pinStyle: mapPinStyle
-                });
-
-                // Use memoized position to prevent React-Leaflet from resetting marker position
-                const position = nodePositions.get(node.nodeNum)!;
-
-                return (
-              <Marker
-                key={node.nodeNum}
-                position={position}
-                icon={markerIcon}
-                zIndexOffset={shouldAnimate ? 10000 : 0}
-                ref={(ref) => handleMarkerRef(ref, node.user?.id)}
-              >
-                {!isTouchDevice && (
-                  <Tooltip direction="top" offset={[0, -20]} opacity={0.9} interactive>
-                    <div style={{ textAlign: 'center' }}>
-                      <div style={{ fontWeight: 'bold' }}>
-                        {node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}
-                      </div>
-                      {node.hopsAway !== undefined && (
-                        <div style={{ fontSize: '0.85em', opacity: 0.8 }}>
-                          {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
-                        </div>
-                      )}
-                    </div>
-                  </Tooltip>
-                )}
-                <Popup autoPan={false}>
-                  <div className="node-popup">
-                    <div className="node-popup-header">
-                      <div className="node-popup-title">{node.user?.longName || `Node ${node.nodeNum}`}</div>
-                      {node.user?.shortName && (
-                        <div className="node-popup-subtitle">{node.user.shortName}</div>
-                      )}
-                    </div>
-
-                    <div className="node-popup-grid">
-                      {node.user?.id && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">🆔</span>
-                          <span className="node-popup-value">{node.user.id}</span>
-                        </div>
-                      )}
-
-                      {node.user?.role !== undefined && (() => {
-                        const roleNum = typeof node.user.role === 'string'
-                          ? parseInt(node.user.role, 10)
-                          : node.user.role;
-                        const roleName = getRoleName(roleNum);
-                        return roleName ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">👤</span>
-                            <span className="node-popup-value">{roleName}</span>
-                          </div>
-                        ) : null;
-                      })()}
-
-                      {node.user?.hwModel !== undefined && (() => {
-                        const hwModelName = getHardwareModelName(node.user.hwModel);
-                        return hwModelName ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">🖥️</span>
-                            <span className="node-popup-value">{hwModelName}</span>
-                          </div>
-                        ) : null;
-                      })()}
-
-                      {node.snr != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">📶</span>
-                          <span className="node-popup-value">{node.snr.toFixed(1)} dB</span>
-                        </div>
-                      )}
-
-                      {node.hopsAway != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">🔗</span>
-                          <span className="node-popup-value">{node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}</span>
-                        </div>
-                      )}
-
-                      {node.position?.altitude != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">⛰️</span>
-                          <span className="node-popup-value">{node.position.altitude}m</span>
-                        </div>
-                      )}
-
-                      {node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">{node.deviceMetrics.batteryLevel === 101 ? '🔌' : '🔋'}</span>
-                          <span className="node-popup-value">
-                            {node.deviceMetrics.batteryLevel === 101 ? 'Plugged In' : `${node.deviceMetrics.batteryLevel}%`}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {node.lastHeard && (
-                      <div className="node-popup-footer">
-                        <span className="node-popup-icon">🕐</span>
-                        {formatDateTime(new Date(node.lastHeard * 1000), timeFormat, dateFormat)}
-                      </div>
-                    )}
-
-                    {node.user?.id && hasPermission('messages', 'read') && (
-                      <button
-                        className="node-popup-btn"
-                        onClick={handlePopupDMClick(node)}
-                      >
-                        💬 Direct Message
-                      </button>
-                    )}
-                  </div>
-                </Popup>
-              </Marker>
-                );
-              })}
-
-              {/* Draw uncertainty circles for estimated positions */}
-              {showEstimatedPositions && nodesWithPosition
-                .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id))
-                .map(node => {
-                  // Calculate radius based on precision bits (higher precision = smaller circle)
-                  // Meshtastic uses precision_bits to reduce coordinate precision
-                  // Each precision bit reduces precision by ~1 bit, roughly doubling the uncertainty
-                  // We'll use a base radius and scale it
-                  const baseRadiusMeters = 500; // Base uncertainty radius
-                  const radiusMeters = baseRadiusMeters; // Can be adjusted based on precision_bits if available
-
-                  // Get hop color for the circle (same as marker)
+                  // Get hop count for this node
+                  // Local node always gets 0 hops (green), otherwise use hopsAway from protobuf
                   const isLocalNode = node.user?.id === currentNodeId;
-                  const hops = isLocalNode ? 0 : (node.hopsAway ?? 999);
-                  const color = getHopColor(hops);
+                  const hops = isLocalNode ? 0 : node.hopsAway ?? 999;
+                  const showLabel = mapZoom >= 13; // Show labels when zoomed in
+
+                  const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
+
+                  const markerIcon = createNodeIcon({
+                    hops: hops, // 0 (local) = green, 999 (no hops_away data) = grey
+                    isSelected,
+                    isRouter,
+                    shortName: node.user?.shortName,
+                    showLabel: showLabel || shouldAnimate, // Show label when animating OR zoomed in
+                    animate: shouldAnimate,
+                    pinStyle: mapPinStyle,
+                  });
+
+                  // Use memoized position to prevent React-Leaflet from resetting marker position
+                  const position = nodePositions.get(node.nodeNum)!;
 
                   return (
-                    <Circle
-                      key={`estimated-${node.nodeNum}`}
-                      center={[node.position!.latitude, node.position!.longitude]}
-                      radius={radiusMeters}
-                      pathOptions={{
-                        color: color,
-                        fillColor: color,
-                        fillOpacity: 0.1,
-                        opacity: 0.4,
-                        weight: 2,
-                        dashArray: '5, 5'
-                      }}
-                    />
+                    <Marker
+                      key={node.nodeNum}
+                      position={position}
+                      icon={markerIcon}
+                      zIndexOffset={shouldAnimate ? 10000 : 0}
+                      ref={ref => handleMarkerRef(ref, node.user?.id)}
+                    >
+                      {!isTouchDevice && (
+                        <Tooltip direction="top" offset={[0, -20]} opacity={0.9} interactive>
+                          <div style={{ textAlign: 'center' }}>
+                            <div style={{ fontWeight: 'bold' }}>
+                              {node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}
+                            </div>
+                            {node.hopsAway !== undefined && (
+                              <div style={{ fontSize: '0.85em', opacity: 0.8 }}>
+                                {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
+                              </div>
+                            )}
+                          </div>
+                        </Tooltip>
+                      )}
+                      <Popup autoPan={false}>
+                        <div className="node-popup">
+                          <div className="node-popup-header">
+                            <div className="node-popup-title">{node.user?.longName || `Node ${node.nodeNum}`}</div>
+                            {node.user?.shortName && <div className="node-popup-subtitle">{node.user.shortName}</div>}
+                          </div>
+
+                          <div className="node-popup-grid">
+                            {node.user?.id && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">🆔</span>
+                                <span className="node-popup-value">{node.user.id}</span>
+                              </div>
+                            )}
+
+                            {node.user?.role !== undefined &&
+                              (() => {
+                                const roleNum =
+                                  typeof node.user.role === 'string' ? parseInt(node.user.role, 10) : node.user.role;
+                                const roleName = getRoleName(roleNum);
+                                return roleName ? (
+                                  <div className="node-popup-item">
+                                    <span className="node-popup-icon">👤</span>
+                                    <span className="node-popup-value">{roleName}</span>
+                                  </div>
+                                ) : null;
+                              })()}
+
+                            {node.user?.hwModel !== undefined &&
+                              (() => {
+                                const hwModelName = getHardwareModelName(node.user.hwModel);
+                                return hwModelName ? (
+                                  <div className="node-popup-item">
+                                    <span className="node-popup-icon">🖥️</span>
+                                    <span className="node-popup-value">{hwModelName}</span>
+                                  </div>
+                                ) : null;
+                              })()}
+
+                            {node.snr != null && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">📶</span>
+                                <span className="node-popup-value">{node.snr.toFixed(1)} dB</span>
+                              </div>
+                            )}
+
+                            {node.hopsAway != null && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">🔗</span>
+                                <span className="node-popup-value">
+                                  {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
+                                </span>
+                              </div>
+                            )}
+
+                            {node.position?.altitude != null && (
+                              <div className="node-popup-item">
+                                <span className="node-popup-icon">⛰️</span>
+                                <span className="node-popup-value">{node.position.altitude}m</span>
+                              </div>
+                            )}
+
+                            {node.deviceMetrics?.batteryLevel !== undefined &&
+                              node.deviceMetrics.batteryLevel !== null && (
+                                <div className="node-popup-item">
+                                  <span className="node-popup-icon">
+                                    {node.deviceMetrics.batteryLevel === 101 ? '🔌' : '🔋'}
+                                  </span>
+                                  <span className="node-popup-value">
+                                    {node.deviceMetrics.batteryLevel === 101
+                                      ? 'Plugged In'
+                                      : `${node.deviceMetrics.batteryLevel}%`}
+                                  </span>
+                                </div>
+                              )}
+                          </div>
+
+                          {node.lastHeard && (
+                            <div className="node-popup-footer">
+                              <span className="node-popup-icon">🕐</span>
+                              {formatDateTime(new Date(node.lastHeard * 1000), timeFormat, dateFormat)}
+                            </div>
+                          )}
+
+                          {node.user?.id && hasPermission('messages', 'read') && (
+                            <button className="node-popup-btn" onClick={handlePopupDMClick(node)}>
+                              💬 Direct Message
+                            </button>
+                          )}
+                        </div>
+                      </Popup>
+                    </Marker>
                   );
                 })}
+
+              {/* Draw uncertainty circles for estimated positions */}
+              {showEstimatedPositions &&
+                nodesWithPosition
+                  .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id))
+                  .map(node => {
+                    // Calculate radius based on precision bits (higher precision = smaller circle)
+                    // Meshtastic uses precision_bits to reduce coordinate precision
+                    // Each precision bit reduces precision by ~1 bit, roughly doubling the uncertainty
+                    // We'll use a base radius and scale it
+                    const baseRadiusMeters = 500; // Base uncertainty radius
+                    const radiusMeters = baseRadiusMeters; // Can be adjusted based on precision_bits if available
+
+                    // Get hop color for the circle (same as marker)
+                    const isLocalNode = node.user?.id === currentNodeId;
+                    const hops = isLocalNode ? 0 : node.hopsAway ?? 999;
+                    const color = getHopColor(hops);
+
+                    return (
+                      <Circle
+                        key={`estimated-${node.nodeNum}`}
+                        center={[node.position!.latitude, node.position!.longitude]}
+                        radius={radiusMeters}
+                        pathOptions={{
+                          color: color,
+                          fillColor: color,
+                          fillOpacity: 0.1,
+                          opacity: 0.4,
+                          weight: 2,
+                          dashArray: '5, 5',
+                        }}
+                      />
+                    );
+                  })}
 
               {/* Draw traceroute paths (independent layer) */}
               <TraceroutePathsLayer paths={traceroutePathsElements} enabled={showPaths} />
@@ -1463,110 +1492,114 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <SelectedTracerouteLayer traceroute={selectedNodeTraceroute} enabled={showRoute} />
 
               {/* Draw neighbor info connections */}
-              {showNeighborInfo && neighborInfo.length > 0 && neighborInfo.map((ni, idx) => {
-                // Skip if either node doesn't have position
-                if (!ni.nodeLatitude || !ni.nodeLongitude || !ni.neighborLatitude || !ni.neighborLongitude) {
-                  return null;
-                }
+              {showNeighborInfo &&
+                neighborInfo.length > 0 &&
+                neighborInfo.map((ni, idx) => {
+                  // Skip if either node doesn't have position
+                  if (!ni.nodeLatitude || !ni.nodeLongitude || !ni.neighborLatitude || !ni.neighborLongitude) {
+                    return null;
+                  }
 
-                // Filter out segments where either endpoint is not visible (Issue #1149)
-                if (visibleNodeNums && (!visibleNodeNums.has(ni.nodeNum) || !visibleNodeNums.has(ni.neighborNodeNum))) {
-                  return null;
-                }
+                  // Filter out segments where either endpoint is not visible (Issue #1149)
+                  if (
+                    visibleNodeNums &&
+                    (!visibleNodeNums.has(ni.nodeNum) || !visibleNodeNums.has(ni.neighborNodeNum))
+                  ) {
+                    return null;
+                  }
 
-                const positions: [number, number][] = [
-                  [ni.nodeLatitude, ni.nodeLongitude],
-                  [ni.neighborLatitude, ni.neighborLongitude]
-                ];
+                  const positions: [number, number][] = [
+                    [ni.nodeLatitude, ni.nodeLongitude],
+                    [ni.neighborLatitude, ni.neighborLongitude],
+                  ];
 
-                return (
-                  <Polyline
-                    key={`neighbor-${idx}`}
-                    positions={positions}
-                    color="#cba6f7"
-                    weight={4}
-                    opacity={0.7}
-                    dashArray="5, 5"
-                  >
-                    <Popup>
-                      <div className="route-popup">
-                        <h4>Neighbor Connection</h4>
-                        <div className="route-endpoints">
-                          <strong>{ni.nodeName}</strong> ↔ <strong>{ni.neighborName}</strong>
-                        </div>
-                        {ni.snr !== null && ni.snr !== undefined && (
-                          <div className="route-usage">
-                            SNR: <strong>{ni.snr.toFixed(1)} dB</strong>
+                  return (
+                    <Polyline
+                      key={`neighbor-${idx}`}
+                      positions={positions}
+                      color="#cba6f7"
+                      weight={4}
+                      opacity={0.7}
+                      dashArray="5, 5"
+                    >
+                      <Popup>
+                        <div className="route-popup">
+                          <h4>Neighbor Connection</h4>
+                          <div className="route-endpoints">
+                            <strong>{ni.nodeName}</strong> ↔ <strong>{ni.neighborName}</strong>
                           </div>
-                        )}
-                        <div className="route-usage">
-                          Last seen: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong>
+                          {ni.snr !== null && ni.snr !== undefined && (
+                            <div className="route-usage">
+                              SNR: <strong>{ni.snr.toFixed(1)} dB</strong>
+                            </div>
+                          )}
+                          <div className="route-usage">
+                            Last seen: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong>
+                          </div>
                         </div>
-                      </div>
-                    </Popup>
-                  </Polyline>
-                );
-              })}
+                      </Popup>
+                    </Polyline>
+                  );
+                })}
 
               {/* Note: Selected node traceroute with separate forward and back paths */}
               {/* This is handled by traceroutePathsElements passed from parent */}
 
               {/* Draw position history for mobile nodes */}
-              {showMotion && positionHistory.length > 1 && (() => {
-                const historyPositions: [number, number][] = positionHistory.map(p =>
-                  [p.latitude, p.longitude] as [number, number]
-                );
+              {showMotion &&
+                positionHistory.length > 1 &&
+                (() => {
+                  const historyPositions: [number, number][] = positionHistory.map(
+                    p => [p.latitude, p.longitude] as [number, number]
+                  );
 
-                const elements: React.ReactElement[] = [];
+                  const elements: React.ReactElement[] = [];
 
-                // Draw blue line for position history
-                elements.push(
-                  <Polyline
-                    key="position-history-line"
-                    positions={historyPositions}
-                    color="#0066ff"
-                    weight={3}
-                    opacity={0.7}
-                  >
-                    <Popup>
-                      <div className="route-popup">
-                        <h4>Position History</h4>
-                        <div className="route-usage">
-                          {positionHistory.length} position{positionHistory.length !== 1 ? 's' : ''} recorded
+                  // Draw blue line for position history
+                  elements.push(
+                    <Polyline
+                      key="position-history-line"
+                      positions={historyPositions}
+                      color="#0066ff"
+                      weight={3}
+                      opacity={0.7}
+                    >
+                      <Popup>
+                        <div className="route-popup">
+                          <h4>Position History</h4>
+                          <div className="route-usage">
+                            {positionHistory.length} position{positionHistory.length !== 1 ? 's' : ''} recorded
+                          </div>
+                          <div className="route-usage">
+                            {formatDateTime(new Date(positionHistory[0].timestamp), timeFormat, dateFormat)} -{' '}
+                            {formatDateTime(
+                              new Date(positionHistory[positionHistory.length - 1].timestamp),
+                              timeFormat,
+                              dateFormat
+                            )}
+                          </div>
                         </div>
-                        <div className="route-usage">
-                          {formatDateTime(new Date(positionHistory[0].timestamp), timeFormat, dateFormat)} - {formatDateTime(new Date(positionHistory[positionHistory.length - 1].timestamp), timeFormat, dateFormat)}
-                        </div>
-                      </div>
-                    </Popup>
-                  </Polyline>
-                );
+                      </Popup>
+                    </Polyline>
+                  );
 
-                // Generate arrow markers for position history
-                const historyArrows = generateArrowMarkers(
-                  historyPositions,
-                  'position-history',
-                  '#0066ff',
-                  0
-                );
-                elements.push(...historyArrows);
+                  // Generate arrow markers for position history
+                  const historyArrows = generateArrowMarkers(historyPositions, 'position-history', '#0066ff', 0);
+                  elements.push(...historyArrows);
 
-                return elements;
-              })()}
-          </MapContainer>
-          <TilesetSelector
-            selectedTilesetId={activeTileset}
-            onTilesetChange={setMapTileset}
-          />
-          {nodesWithPosition.length === 0 && (
-            <div className="map-overlay">
-              <div className="overlay-content">
-                <h3>📍 No Node Locations</h3>
-                <p>No nodes in your network are currently sharing location data.</p>
-                <p>Nodes with GPS enabled will appear as markers on this map.</p>
+                  return elements;
+                })()}
+            </MapContainer>
+            <TilesetSelector selectedTilesetId={activeTileset} onTilesetChange={setMapTileset} />
+            {nodesWithPosition.length === 0 && (
+              <div className="map-overlay">
+                <div className="overlay-content">
+                  <h3>📍 No Node Locations</h3>
+                  <p>No nodes in your network are currently sharing location data.</p>
+                  <p>Nodes with GPS enabled will appear as markers on this map.</p>
+                </div>
               </div>
-            </div>
-          )}
+            )}
           </>
         ) : (
           <div className="map-placeholder">
@@ -1590,18 +1623,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             onTouchStart={handlePacketMonitorTouchStart}
             title="Drag to resize"
           />
-          <PacketMonitorPanel
-            onClose={() => setShowPacketMonitor(false)}
-            onNodeClick={handlePacketNodeClick}
-          />
+          <PacketMonitorPanel onClose={() => setShowPacketMonitor(false)} onNodeClick={handlePacketNodeClick} />
         </div>
       )}
 
       {/* Node Filter Popup */}
-      <NodeFilterPopup
-        isOpen={showNodeFilterPopup}
-        onClose={() => setShowNodeFilterPopup(false)}
-      />
+      <NodeFilterPopup isOpen={showNodeFilterPopup} onClose={() => setShowNodeFilterPopup(false)} />
     </div>
   );
 };
@@ -1611,12 +1638,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
   // Check if favorite status changed for any node
   // Build sets of favorite node numbers for comparison
-  const prevFavorites = new Set(
-    prevProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum)
-  );
-  const nextFavorites = new Set(
-    nextProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum)
-  );
+  const prevFavorites = new Set(prevProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum));
+  const nextFavorites = new Set(nextProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum));
 
   // If the sets differ in size or content, favorites changed - must re-render
   if (prevFavorites.size !== nextFavorites.size) {
@@ -1639,8 +1662,10 @@ const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
       const prev = prevProps.processedNodes[i];
       const next = nextProps.processedNodes[i];
 
-      if (prev.position?.latitude !== next.position?.latitude ||
-          prev.position?.longitude !== next.position?.longitude) {
+      if (
+        prev.position?.latitude !== next.position?.latitude ||
+        prev.position?.longitude !== next.position?.longitude
+      ) {
         hasPositionChanges = true;
       }
 
