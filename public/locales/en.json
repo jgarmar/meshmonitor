@@ -2945,8 +2945,8 @@
   "admin_commands.please_select_file_and_slot": "Please select a file and a channel slot",
   "admin_commands.invalid_import_format": "Invalid import format. Expected channel object",
   "admin_commands.configuration_imported_success": "Configuration imported successfully",
-  "admin_commands.warning_message":"Modifying these settings can break your Meshtastic node configuration.",
-  "admin_commands.warning_description":"These settings directly modify the configuration of your target Meshtastic device. Incorrect settings may cause communication issues, network problems, or require a factory reset. Only modify these settings if you understand what you are doing.",
+  "admin_commands.warning_message": "Modifying these settings can break your Meshtastic node configuration.",
+  "admin_commands.warning_description": "These settings directly modify the configuration of your target Meshtastic device. Incorrect settings may cause communication issues, network problems, or require a factory reset. Only modify these settings if you understand what you are doing.",
 
   "common.load": "Load",
   "admin_commands.load_all_configs": "Load All Config",
@@ -3201,7 +3201,19 @@
   "gpio_summary.monitor_pin": "Monitor Pin",
   "gpio_summary.serial_rx": "Serial RX",
   "gpio_summary.serial_tx": "Serial TX",
- 
+
   "nodes_private": "Private Positions",
-  "nodes_private_description": "Allows viewing private position overrides on the map, history, and telemetry."
+  "nodes_private_description": "Allows viewing private position overrides on the map, history, and telemetry.",
+
+  "map.features": "Features",
+  "map.expandControls": "Expand Controls",
+  "map.collapseControls": "Collapse Controls",
+  "map.showPaths": "Show Route Segments",
+  "map.showNeighborInfo": "Show Neighbor Info",
+  "map.showTraceroute": "Show Traceroute",
+  "map.showMqtt": "Show MQTT",
+  "map.showPositionHistory": "Show Position History",
+  "map.showAnimations": "Show Animations",
+  "map.clusterNodes": "Cluster Nodes",
+  "map.showEstimatedPositions": "Show Estimated Positions"
 }

@@ -2418,7 +2418,6 @@ body {
   font-size: 0.8rem;
 }
 
-
 /* Hide scrollbar styling for a cleaner look */
 .messages-container::-webkit-scrollbar {
   width: 6px;
@@ -4068,136 +4067,6 @@ body {
   }
 }
 
-/* Node Popup Styles */
-.node-popup {
-  min-width: 200px;
-  max-width: 280px;
-  max-height: 400px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  font-family: system-ui, -apple-system, sans-serif;
-}
-
-/* Custom scrollbar for node popup */
-.node-popup::-webkit-scrollbar {
-  width: 6px;
-}
-
-.node-popup::-webkit-scrollbar-track {
-  background: var(--ctp-surface0);
-  border-radius: 3px;
-}
-
-.node-popup::-webkit-scrollbar-thumb {
-  background: var(--ctp-surface2);
-  border-radius: 3px;
-}
-
-.node-popup::-webkit-scrollbar-thumb:hover {
-  background: var(--ctp-overlay0);
-}
-
-.node-popup-header {
-  margin-bottom: 0.75rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 2px solid var(--ctp-mauve);
-}
-
-.node-popup-title {
-  font-size: 1.1rem;
-  font-weight: 700;
-  color: var(--ctp-text);
-  margin-bottom: 0.25rem;
-  line-height: 1.3;
-  overflow-wrap: break-word;
-  word-break: break-word;
-}
-
-.node-popup-subtitle {
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: var(--ctp-mauve);
-  background: var(--ctp-surface1);
-  padding: 0.25rem 0.5rem;
-  border-radius: 4px;
-  display: inline-block;
-  margin-top: 0.25rem;
-}
-
-.node-popup-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-
-.node-popup-item {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.4rem 0.5rem;
-  background: var(--ctp-surface0);
-  border-radius: 6px;
-  font-size: 0.85rem;
-  transition: background 0.2s ease;
-}
-
-.node-popup-item:hover {
-  background: var(--ctp-surface1);
-}
-
-.node-popup-icon {
-  font-size: 1.1rem;
-  line-height: 1;
-  flex-shrink: 0;
-}
-
-.node-popup-value {
-  color: var(--ctp-text);
-  font-weight: 500;
-  overflow-wrap: break-word;
-  word-break: break-word;
-  line-height: 1.2;
-  max-width: 100%;
-}
-
-.node-popup-footer {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem;
-  background: var(--ctp-surface0);
-  border-radius: 6px;
-  font-size: 0.8rem;
-  color: var(--ctp-subtext1);
-  margin-bottom: 0.75rem;
-  justify-content: center;
-}
-
-.node-popup-btn {
-  width: 100%;
-  padding: 0.6rem 1rem;
-  background: var(--ctp-blue);
-  color: var(--ctp-base);
-  border: none;
-  border-radius: 8px;
-  font-size: 0.9rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-}
-
-.node-popup-btn:hover {
-  background: var(--ctp-sapphire);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
-}
-
-.node-popup-btn:active {
-  transform: translateY(0);
-}
-
 /* Legacy Route Popup Styles (for other popups) */
 .route-popup {
   min-width: 200px;
@@ -4293,113 +4162,6 @@ body {
 
 .snr-timeline-chart .recharts-wrapper {
   font-size: 10px;
-}
-
-/* Map Controls */
-.map-controls {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 1000;
-  background: var(--ctp-surface0);
-  padding: 0.75rem;
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-  user-select: none;
-  transition: left 0s, top 0s, right 0s;
-  /* Disable transition for position to enable smooth dragging */
-}
-
-.map-control-item {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  cursor: pointer;
-  user-select: none;
-}
-
-.map-control-item input[type='checkbox'] {
-  cursor: pointer;
-  width: 18px;
-  height: 18px;
-  accent-color: var(--ctp-mauve);
-}
-
-.map-control-item span {
-  color: var(--ctp-text);
-  font-size: 0.9rem;
-  font-weight: 500;
-}
-
-/* Map controls title */
-.map-controls-header {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 0.5rem;
-}
-
-.map-controls-title {
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: var(--ctp-mauve);
-  padding-right: 28px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  flex: 1;
-}
-
-/* Map controls collapse button */
-.map-controls-collapse-btn {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  background: var(--ctp-surface1);
-  border: none;
-  border-radius: 4px;
-  color: var(--ctp-text);
-  cursor: pointer;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.8rem;
-  transition: all 0.2s ease;
-  padding: 0;
-  line-height: 1;
-  z-index: 10;
-  /* Position relative to map-controls container, not header */
-}
-
-.map-controls-collapse-btn:hover {
-  background: var(--ctp-surface2);
-  transform: scale(1.1);
-}
-
-.map-controls-collapse-btn:active {
-  transform: scale(0.95);
-}
-
-/* Collapsed state for map controls */
-.map-controls.collapsed {
-  padding: 0.5rem;
-  min-width: 40px;
-  min-height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  top: 10px !important;
-  right: 10px !important;
-  left: auto !important;
-  /* Override dynamic positioning when collapsed */
-}
-
-/* Center the collapse button when collapsed */
-.map-controls.collapsed .map-controls-collapse-btn {
-  position: static;
-  margin: 0;
 }
 
 /* Node Pulse Animation */
@@ -4764,8 +4526,6 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
 }
-
-
 
 /* Channel Info Modal */
 .channel-info-modal {

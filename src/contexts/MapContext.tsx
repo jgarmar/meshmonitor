@@ -35,6 +35,8 @@ interface MapContextType {
   setShowAnimations: (show: boolean) => void;
   showEstimatedPositions: boolean;
   setShowEstimatedPositions: (show: boolean) => void;
+  clusteringEnabled: boolean;
+  setClusteringEnabled: (enabled: boolean) => void;
   animatedNodes: Set<string>;
   triggerNodeAnimation: (nodeId: string) => void;
   mapCenterTarget: [number, number] | null;
@@ -73,6 +75,11 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     const saved = localStorage.getItem('showEstimatedPositions');
     return saved !== null ? saved === 'true' : true; // Default to true
   });
+  const [clusteringEnabled, setClusteringEnabledState] = useState<boolean>(() => {
+    const saved = localStorage.getItem('clusteringEnabled');
+    return saved !== 'false'; // Default to true
+  });
+
   const [animatedNodes, setAnimatedNodes] = useState<Set<string>>(new Set());
   const [mapCenterTarget, setMapCenterTarget] = useState<[number, number] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number] | null>(() => {
@@ -139,38 +146,47 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     savePreferenceToServer({ showEstimatedPositions: value });
   }, []);
 
+  const setClusteringEnabled = React.useCallback((value: boolean) => {
+    setClusteringEnabledState(value);
+    localStorage.setItem('clusteringEnabled', value.toString());
+    savePreferenceToServer({ clusteringEnabled: value });
+  }, []);
+
   // Helper function to save preference to server
-  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean>) => {
-    try {
-      const baseUrl = await api.getBaseUrl();
-      const csrfToken = getCsrfToken();
-      console.log('[MapContext] Saving preference to server:', preference);
-      console.log('[MapContext] CSRF token:', csrfToken ? 'present' : 'MISSING');
-      console.log('[MapContext] Base URL:', baseUrl);
+  const savePreferenceToServer = React.useCallback(
+    async (preference: Record<string, boolean>) => {
+      try {
+        const baseUrl = await api.getBaseUrl();
+        const csrfToken = getCsrfToken();
+        console.log('[MapContext] Saving preference to server:', preference);
+        console.log('[MapContext] CSRF token:', csrfToken ? 'present' : 'MISSING');
+        console.log('[MapContext] Base URL:', baseUrl);
 
-      const headers: HeadersInit = { 'Content-Type': 'application/json' };
+        const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
-      if (csrfToken) {
-        headers['X-CSRF-Token'] = csrfToken;
+        if (csrfToken) {
+          headers['X-CSRF-Token'] = csrfToken;
+        }
+
+        const response = await fetch(`${baseUrl}/api/user/map-preferences`, {
+          method: 'POST',
+          headers,
+          credentials: 'include',
+          body: JSON.stringify(preference),
+        });
+
+        console.log('[MapContext] Save response status:', response.status);
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('[MapContext] Save failed:', errorText);
+        }
+      } catch (error) {
+        // Silently fail - localStorage will still work
+        console.error('[MapContext] Failed to save map preference to server:', error);
       }
-
-      const response = await fetch(`${baseUrl}/api/user/map-preferences`, {
-        method: 'POST',
-        headers,
-        credentials: 'include',
-        body: JSON.stringify(preference)
-      });
-
-      console.log('[MapContext] Save response status:', response.status);
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[MapContext] Save failed:', errorText);
-      }
-    } catch (error) {
-      // Silently fail - localStorage will still work
-      console.error('[MapContext] Failed to save map preference to server:', error);
-    }
-  }, [getCsrfToken]);
+    },
+    [getCsrfToken]
+  );
 
   // Load preferences from server on mount
   useEffect(() => {
@@ -178,7 +194,7 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
       try {
         const baseUrl = await api.getBaseUrl();
         const response = await fetch(`${baseUrl}/api/user/map-preferences`, {
-          credentials: 'include'
+          credentials: 'include',
         });
 
         if (response.ok) {
@@ -207,6 +223,9 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
             if (preferences.showEstimatedPositions !== undefined) {
               setShowEstimatedPositionsState(preferences.showEstimatedPositions);
             }
+            if (preferences.clusteringEnabled !== undefined) {
+              setClusteringEnabledState(preferences.clusteringEnabled);
+            }
           }
           // If preferences is null (anonymous user), initial defaults are already set
         }
@@ -232,20 +251,23 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   }, [mapZoom]);
 
   // Trigger animation for a node (lasts 1 second)
-  const triggerNodeAnimation = React.useCallback((nodeId: string) => {
-    if (!showAnimations) return;
+  const triggerNodeAnimation = React.useCallback(
+    (nodeId: string) => {
+      if (!showAnimations) return;
 
-    setAnimatedNodes(prev => new Set([...prev, nodeId]));
+      setAnimatedNodes(prev => new Set([...prev, nodeId]));
 
-    // Remove from animated nodes after 1 second
-    setTimeout(() => {
-      setAnimatedNodes(prev => {
-        const next = new Set(prev);
-        next.delete(nodeId);
-        return next;
-      });
-    }, 1000);
-  }, [showAnimations]);
+      // Remove from animated nodes after 1 second
+      setTimeout(() => {
+        setAnimatedNodes(prev => {
+          const next = new Set(prev);
+          next.delete(nodeId);
+          return next;
+        });
+      }, 1000);
+    },
+    [showAnimations]
+  );
 
   return (
     <MapContext.Provider
@@ -264,6 +286,8 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
         setShowAnimations,
         showEstimatedPositions,
         setShowEstimatedPositions,
+        clusteringEnabled,
+        setClusteringEnabled,
         animatedNodes,
         triggerNodeAnimation,
         mapCenterTarget,

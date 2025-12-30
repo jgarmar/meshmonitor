@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, Circle } from 'react-leaflet';
+import { MapContainer, TileLayer, Popup, Polyline } from 'react-leaflet';
 import type { Marker as LeafletMarker } from 'leaflet';
 import { DeviceInfo } from '../types/device';
 import { TabType } from '../types/ui';
 import { ResourceType } from '../types/permission';
-import { createNodeIcon, getHopColor } from '../utils/mapIcons';
+
 import { generateArrowMarkers } from '../utils/mapHelpers.tsx';
-import { getHardwareModelName, getRoleName, isNodeComplete } from '../utils/nodeHelpers';
+import { getRoleName, isNodeComplete } from '../utils/nodeHelpers';
 import { formatTime, formatDateTime } from '../utils/datetime';
 import { getTilesetById } from '../config/tilesets';
 import { useMapContext } from '../contexts/MapContext';
@@ -20,23 +20,19 @@ import MapLegend from './MapLegend';
 import ZoomHandler from './ZoomHandler';
 import MapResizeHandler from './MapResizeHandler';
 import MapPositionHandler from './MapPositionHandler';
-import { SpiderfierController, SpiderfierControllerRef } from './SpiderfierController';
+
 import { TilesetSelector } from './TilesetSelector';
 import { MapCenterController } from './MapCenterController';
 import PacketMonitorPanel from './PacketMonitorPanel';
-import { getPacketStats } from '../services/packetApi';
 import { NodeFilterPopup } from './NodeFilterPopup';
 import { VectorTileLayer } from './VectorTileLayer';
+import { NodeMarkersLayer } from './NodeMarkersLayer';
+import { MapControls } from './MapControls';
+import { SpiderfierController, type SpiderfierControllerRef } from './SpiderfierController';
 
 /**
  * Spiderfier initialization constants
  */
-const SPIDERFIER_INIT = {
-  /** Maximum attempts to wait for spiderfier initialization */
-  MAX_ATTEMPTS: 50,
-  /** Interval between initialization attempts (ms) - 50 attempts × 100ms = 5 seconds total */
-  RETRY_INTERVAL_MS: 100,
-} as const;
 
 interface NodesTabProps {
   processedNodes: DeviceInfo[];
@@ -88,20 +84,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // Use context hooks
   const {
     showPaths,
-    setShowPaths,
     showNeighborInfo,
-    setShowNeighborInfo,
     showRoute,
-    setShowRoute,
     showMotion,
-    setShowMotion,
     showMqttNodes,
-    setShowMqttNodes,
     showAnimations,
-    setShowAnimations,
     showEstimatedPositions,
-    setShowEstimatedPositions,
-    animatedNodes,
+
     triggerNodeAnimation,
     mapCenterTarget,
     setMapCenterTarget,
@@ -112,6 +101,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setSelectedNodeId,
     neighborInfo,
     positionHistory,
+    clusteringEnabled,
   } = useMapContext();
 
   const { currentNodeId } = useDeviceConfig();
@@ -139,7 +129,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setIsNodeListCollapsed,
   } = useUI();
 
-  const { timeFormat, dateFormat, mapTileset, setMapTileset, mapPinStyle, customTilesets } = useSettings();
+  const { timeFormat, dateFormat, mapTileset, setMapTileset, customTilesets } = useSettings();
 
   const { hasPermission } = useAuth();
 
@@ -154,16 +144,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setIsTouchDevice(checkTouch());
   }, []);
 
-  // Ref for spiderfier controller to manage overlapping markers
-  const spiderfierRef = useRef<SpiderfierControllerRef>(null);
-
-  // Packet Monitor state (desktop only)
-  const [showPacketMonitor, setShowPacketMonitor] = useState(() => {
-    // Load from localStorage
-    const saved = localStorage.getItem('showPacketMonitor');
-    return saved === 'true';
-  });
-
   // Packet Monitor resizable height (default 35% of viewport, min 150px, max 70%)
   const {
     size: packetMonitorHeight,
@@ -177,15 +157,17 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     maxHeight: Math.round(window.innerHeight * 0.7),
   });
 
-  // Track if packet logging is enabled on the server
-  const [packetLogEnabled, setPacketLogEnabled] = useState<boolean>(false);
-
-  // Track if map controls are collapsed
-  const [isMapControlsCollapsed, setIsMapControlsCollapsed] = useState(() => {
+  // Packet Monitor state
+  const [showPacketMonitor, setShowPacketMonitor] = useState(() => {
     // Load from localStorage
-    const saved = localStorage.getItem('isMapControlsCollapsed');
+    const saved = localStorage.getItem('showPacketMonitor');
     return saved === 'true';
   });
+
+  // Save packet monitor preference to localStorage
+  useEffect(() => {
+    localStorage.setItem('showPacketMonitor', showPacketMonitor.toString());
+  }, [showPacketMonitor]);
 
   // Nodes sidebar position and size state
   const [sidebarPosition, setSidebarPosition] = useState(() => {
@@ -218,20 +200,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const spiderfierRef = useRef<SpiderfierControllerRef>(null);
 
   // Resize state
   const [isResizing, setIsResizing] = useState(false);
   const [resizeStart, setResizeStart] = useState({ x: 0, y: 0, width: 0, height: 0 });
-
-  // Save packet monitor preference to localStorage
-  useEffect(() => {
-    localStorage.setItem('showPacketMonitor', showPacketMonitor.toString());
-  }, [showPacketMonitor]);
-
-  // Save map controls collapse state to localStorage
-  useEffect(() => {
-    localStorage.setItem('isMapControlsCollapsed', isMapControlsCollapsed.toString());
-  }, [isMapControlsCollapsed]);
 
   // Save sidebar position to localStorage
   useEffect(() => {
@@ -242,85 +215,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   useEffect(() => {
     localStorage.setItem('nodesSidebarSize', JSON.stringify(sidebarSize));
   }, [sidebarSize]);
-
-  // Map controls position state with localStorage persistence
-  // Position is relative to the map container (absolute positioning)
-  // We use a special value of -1 to indicate "use CSS default (right: 10px)"
-  const MAP_CONTROLS_DEFAULT_POSITION = { x: -1, y: 10 };
-
-  const [mapControlsPosition, setMapControlsPosition] = useState(() => {
-    const saved = localStorage.getItem('mapControlsPosition');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        // If x or y is invalid, use defaults
-        if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
-          // Sanity check: if position seems unreasonable, reset to default
-          // This handles migration from old viewport-based positions
-          if (parsed.x > 2000 || parsed.x < -100 || parsed.y > 2000 || parsed.y < -100) {
-            localStorage.removeItem('mapControlsPosition');
-            return MAP_CONTROLS_DEFAULT_POSITION;
-          }
-          return { x: parsed.x, y: parsed.y };
-        }
-      } catch {
-        // Ignore parse errors
-      }
-    }
-    return MAP_CONTROLS_DEFAULT_POSITION;
-  });
-
-  // Map controls drag state
-  const [isDraggingMapControls, setIsDraggingMapControls] = useState(false);
-  const [mapControlsDragStart, setMapControlsDragStart] = useState({ x: 0, y: 0 });
-  const mapControlsRef = useRef<HTMLDivElement>(null);
-
-  // Save map controls position to localStorage (only if not default)
-  useEffect(() => {
-    if (mapControlsPosition.x !== -1) {
-      localStorage.setItem('mapControlsPosition', JSON.stringify(mapControlsPosition));
-    }
-  }, [mapControlsPosition]);
-
-  // Constrain map controls position to stay within the map container on mount and window resize
-  useEffect(() => {
-    const constrainMapControlsPosition = () => {
-      // Skip constraint for default position (x = -1 means use CSS right: 10px)
-      if (mapControlsPosition.x === -1) return;
-
-      const mapContainer = document.querySelector('.map-container');
-      const controls = mapControlsRef.current;
-      if (!mapContainer || !controls) return;
-
-      const containerRect = mapContainer.getBoundingClientRect();
-      const controlsRect = controls.getBoundingClientRect();
-      const padding = 10;
-
-      // Calculate max bounds relative to container
-      const maxX = containerRect.width - controlsRect.width - padding;
-      const maxY = containerRect.height - controlsRect.height - padding;
-
-      // Check if current position is out of bounds
-      const constrainedX = Math.max(padding, Math.min(mapControlsPosition.x, maxX));
-      const constrainedY = Math.max(padding, Math.min(mapControlsPosition.y, maxY));
-
-      // Update position if it was out of bounds
-      if (constrainedX !== mapControlsPosition.x || constrainedY !== mapControlsPosition.y) {
-        setMapControlsPosition({ x: constrainedX, y: constrainedY });
-      }
-    };
-
-    // Run on mount after a short delay to ensure elements are rendered
-    const timeoutId = setTimeout(constrainMapControlsPosition, 100);
-
-    // Run on window resize
-    window.addEventListener('resize', constrainMapControlsPosition);
-
-    return () => {
-      clearTimeout(timeoutId);
-      window.removeEventListener('resize', constrainMapControlsPosition);
-    };
-  }, [mapControlsPosition]);
 
   // Check if user has permission to view packet monitor - needs at least one channel and messages permission
   const hasAnyChannelPermission = () => {
@@ -333,35 +227,48 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   };
   const canViewPacketMonitor = hasAnyChannelPermission() && hasPermission('messages', 'read');
 
-  // Fetch packet logging enabled status from server
-  useEffect(() => {
-    const fetchPacketLogStatus = async () => {
-      if (!canViewPacketMonitor) return;
-
-      try {
-        const stats = await getPacketStats();
-        setPacketLogEnabled(stats.enabled === true);
-      } catch (error) {
-        console.error('Failed to fetch packet log status:', error);
-      }
-    };
-
-    fetchPacketLogStatus();
-  }, [canViewPacketMonitor]);
-
   // Refs to access latest values without recreating listeners
   const processedNodesRef = useRef(processedNodes);
   const setSelectedNodeIdRef = useRef(setSelectedNodeId);
   const centerMapOnNodeRef = useRef(centerMapOnNode);
 
   // Stable ref callback for markers to prevent unnecessary re-renders
-  const handleMarkerRef = React.useCallback((ref: LeafletMarker | null, nodeId: string | undefined) => {
-    if (ref && nodeId) {
-      markerRefs.current.set(nodeId, ref);
-      // Add marker to spiderfier for overlap handling, passing nodeId to allow multiple markers at same position
-      spiderfierRef.current?.addMarker(ref, nodeId);
+  const handleMarkerRef = React.useCallback(
+    (ref: LeafletMarker | null, nodeId: string | undefined) => {
+      if (nodeId) {
+        if (ref) {
+          markerRefs.current.set(nodeId, ref);
+          // Only add to spiderfier if clustering is disabled
+          // MarkerClusterGroup handles its own spiderfying
+          if (!clusteringEnabled) {
+            spiderfierRef.current?.addMarker(ref, nodeId);
+          }
+        } else {
+          const oldRef = markerRefs.current.get(nodeId);
+          if (oldRef) {
+            spiderfierRef.current?.removeMarker(oldRef);
+            markerRefs.current.delete(nodeId);
+          }
+        }
+      }
+    },
+    [markerRefs, clusteringEnabled]
+  );
+
+  // Sync spiderfier markers when clustering is toggled
+  useEffect(() => {
+    if (clusteringEnabled) {
+      // Clustering enabled - clear all markers from spiderfier
+      markerRefs.current.forEach(marker => {
+        spiderfierRef.current?.removeMarker(marker);
+      });
+    } else {
+      // Clustering disabled - add all current markers to spiderfier
+      markerRefs.current.forEach((marker, nodeId) => {
+        spiderfierRef.current?.addMarker(marker, nodeId);
+      });
     }
-  }, []); // Empty deps - function never changes
+  }, [clusteringEnabled, markerRefs]);
 
   // Utility to prevent mousedown from triggering drag on form elements
   // Firefox handles select/input mousedown differently, which can trigger panel drag
@@ -568,88 +475,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     }
   }, [isResizing, handleResizeMove, handleResizeEnd]);
 
-  // Map controls drag handlers
-  const handleMapControlsDragStart = useCallback(
-    (e: React.MouseEvent) => {
-      if (isMapControlsCollapsed || isTouchDevice) return; // Disable drag on mobile
-      e.preventDefault();
-      e.stopPropagation();
-
-      // If position is default (-1), calculate actual position from element
-      let currentX = mapControlsPosition.x;
-      let currentY = mapControlsPosition.y;
-
-      if (currentX === -1) {
-        // Convert from CSS right: 10px to left-based coordinates
-        const mapContainer = document.querySelector('.map-container');
-        const controls = mapControlsRef.current;
-        if (mapContainer && controls) {
-          const containerRect = mapContainer.getBoundingClientRect();
-          const controlsRect = controls.getBoundingClientRect();
-          currentX = controlsRect.left - containerRect.left;
-          currentY = controlsRect.top - containerRect.top;
-          // Update the position to be explicit
-          setMapControlsPosition({ x: currentX, y: currentY });
-        }
-      }
-
-      setIsDraggingMapControls(true);
-      setMapControlsDragStart({
-        x: e.clientX - currentX,
-        y: e.clientY - currentY,
-      });
-    },
-    [isMapControlsCollapsed, mapControlsPosition, isTouchDevice]
-  );
-
-  const handleMapControlsDragMove = useCallback(
-    (e: MouseEvent) => {
-      if (!isDraggingMapControls) return;
-
-      const mapContainer = document.querySelector('.map-container');
-      if (!mapContainer) return;
-
-      const rect = mapContainer.getBoundingClientRect();
-      const controls = mapControlsRef.current;
-      if (!controls) return;
-
-      const controlsRect = controls.getBoundingClientRect();
-      const maxX = rect.width - controlsRect.width - 10;
-      const maxY = rect.height - controlsRect.height - 10;
-
-      const newX = Math.max(10, Math.min(maxX, e.clientX - mapControlsDragStart.x - rect.left));
-      const newY = Math.max(10, Math.min(maxY, e.clientY - mapControlsDragStart.y - rect.top));
-
-      setMapControlsPosition({ x: newX, y: newY });
-    },
-    [isDraggingMapControls, mapControlsDragStart]
-  );
-
-  const handleMapControlsDragEnd = useCallback(() => {
-    setIsDraggingMapControls(false);
-  }, []);
-
-  // Global mouse event listeners for map controls drag
-  useEffect(() => {
-    if (isDraggingMapControls) {
-      document.addEventListener('mousemove', handleMapControlsDragMove);
-      document.addEventListener('mouseup', handleMapControlsDragEnd);
-      document.body.style.cursor = 'grabbing';
-      document.body.style.userSelect = 'none';
-
-      return () => {
-        document.removeEventListener('mousemove', handleMapControlsDragMove);
-        document.removeEventListener('mouseup', handleMapControlsDragEnd);
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-      };
-    }
-  }, [isDraggingMapControls, handleMapControlsDragMove, handleMapControlsDragEnd]);
-
-  const handleCollapseMapControls = useCallback(() => {
-    setIsMapControlsCollapsed(!isMapControlsCollapsed);
-  }, [isMapControlsCollapsed, setIsMapControlsCollapsed]);
-
   // Update refs when values change
   useEffect(() => {
     processedNodesRef.current = processedNodes;
@@ -657,63 +482,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     centerMapOnNodeRef.current = centerMapOnNode;
   });
 
-  // Track if listeners have been set up
-  const listenersSetupRef = useRef(false);
-
   // Set up spiderfier event listeners ONCE when component mounts
+  // Spiderfier listeners are no longer needed as MarkerClusterGroup handles it
   useEffect(() => {
-    // Wait for spiderfier to be ready
-    const checkAndSetup = () => {
-      if (listenersSetupRef.current) {
-        return true; // Already set up
-      }
-
-      if (!spiderfierRef.current) {
-        return false;
-      }
-
-      const clickHandler = (marker: any) => {
-        // Find the node data from the marker
-        const nodeEntry = Array.from(markerRefs.current.entries()).find(([_, ref]) => ref === marker);
-        if (nodeEntry) {
-          const nodeId = nodeEntry[0];
-          setSelectedNodeIdRef.current(nodeId);
-          // Find the node to center on it
-          const node = processedNodesRef.current.find(n => n.user?.id === nodeId);
-          if (node) {
-            centerMapOnNodeRef.current(node);
-          }
-        }
-      };
-
-      const spiderfyHandler = (_markers: any[]) => {
-        // Markers fanned out
-      };
-
-      const unspiderfyHandler = (_markers: any[]) => {
-        // Markers collapsed
-      };
-
-      // Add listeners only once
-      spiderfierRef.current.addListener('click', clickHandler);
-      spiderfierRef.current.addListener('spiderfy', spiderfyHandler);
-      spiderfierRef.current.addListener('unspiderfy', unspiderfyHandler);
-      listenersSetupRef.current = true;
-
-      return true;
-    };
-
-    // Keep retrying until spiderfier is ready
-    let attempts = 0;
-    const intervalId = setInterval(() => {
-      attempts++;
-      if (checkAndSetup() || attempts >= SPIDERFIER_INIT.MAX_ATTEMPTS) {
-        clearInterval(intervalId);
-      }
-    }, SPIDERFIER_INIT.RETRY_INTERVAL_MS);
-
-    return () => clearInterval(intervalId);
-  }, []); // Empty array - run only once on mount
+    // Legacy spiderfier cleanup
+    return () => {};
+  }, []);
 
   // Track previous nodes to detect updates and trigger animations
   const prevNodesRef = useRef<Map<string, number>>(new Map());
@@ -827,13 +601,16 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Memoize node positions to prevent React-Leaflet from resetting marker positions
   // Creating new [lat, lng] arrays causes React-Leaflet to move markers, destroying spiderfier state
+  const nodePositionsKey = nodesWithPosition
+    .map(n => `${n.nodeNum}-${n.position!.latitude}-${n.position!.longitude}`)
+    .join(',');
   const nodePositions = React.useMemo(() => {
     const posMap = new Map<number, [number, number]>();
     nodesWithPosition.forEach(node => {
       posMap.set(node.nodeNum, [node.position!.latitude, node.position!.longitude]);
     });
     return posMap;
-  }, [nodesWithPosition.map(n => `${n.nodeNum}-${n.position!.latitude}-${n.position!.longitude}`).join(',')]);
+  }, [nodePositionsKey, nodesWithPosition]);
 
   // Calculate center point of all nodes for initial map view
   // Use saved map center from localStorage if available, otherwise calculate from nodes
@@ -1186,96 +963,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       >
         {shouldShowData() ? (
           <>
-            <div
-              ref={mapControlsRef}
-              className={`map-controls ${isMapControlsCollapsed ? 'collapsed' : ''}`}
-              style={
-                isTouchDevice
-                  ? undefined
-                  : // If collapsed, don't apply any position styles (use CSS defaults)
-                  // If position is default (-1), don't apply left (CSS will use right: 10px)
-                  isMapControlsCollapsed
-                  ? undefined
-                  : {
-                      left: mapControlsPosition.x === -1 ? undefined : `${mapControlsPosition.x}px`,
-                      top: `${mapControlsPosition.y}px`,
-                      right: mapControlsPosition.x === -1 ? undefined : 'auto',
-                    }
-              }
-            >
-              <button
-                className="map-controls-collapse-btn"
-                onClick={handleCollapseMapControls}
-                title={isMapControlsCollapsed ? 'Expand controls' : 'Collapse controls'}
-                onMouseDown={e => e.stopPropagation()}
-              >
-                {isMapControlsCollapsed ? '▼' : '▲'}
-              </button>
-              <div
-                className="map-controls-header"
-                style={{
-                  cursor:
-                    isMapControlsCollapsed || isTouchDevice ? 'default' : isDraggingMapControls ? 'grabbing' : 'grab',
-                }}
-                onMouseDown={handleMapControlsDragStart}
-              >
-                {!isMapControlsCollapsed && <div className="map-controls-title">Features</div>}
-              </div>
-              {!isMapControlsCollapsed && (
-                <>
-                  <label className="map-control-item">
-                    <input type="checkbox" checked={showPaths} onChange={e => setShowPaths(e.target.checked)} />
-                    <span>Show Route Segments</span>
-                  </label>
-                  <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showNeighborInfo}
-                      onChange={e => setShowNeighborInfo(e.target.checked)}
-                    />
-                    <span>Show Neighbor Info</span>
-                  </label>
-                  <label className="map-control-item">
-                    <input type="checkbox" checked={showRoute} onChange={e => setShowRoute(e.target.checked)} />
-                    <span>Show Traceroute</span>
-                  </label>
-                  <label className="map-control-item">
-                    <input type="checkbox" checked={showMqttNodes} onChange={e => setShowMqttNodes(e.target.checked)} />
-                    <span>Show MQTT</span>
-                  </label>
-                  <label className="map-control-item">
-                    <input type="checkbox" checked={showMotion} onChange={e => setShowMotion(e.target.checked)} />
-                    <span>Show Position History</span>
-                  </label>
-                  <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showAnimations}
-                      onChange={e => setShowAnimations(e.target.checked)}
-                    />
-                    <span>Show Animations</span>
-                  </label>
-                  <label className="map-control-item">
-                    <input
-                      type="checkbox"
-                      checked={showEstimatedPositions}
-                      onChange={e => setShowEstimatedPositions(e.target.checked)}
-                    />
-                    <span>Show Estimated Positions</span>
-                  </label>
-                  {canViewPacketMonitor && packetLogEnabled && (
-                    <label className="map-control-item packet-monitor-toggle">
-                      <input
-                        type="checkbox"
-                        checked={showPacketMonitor}
-                        onChange={e => setShowPacketMonitor(e.target.checked)}
-                      />
-                      <span>Show Packet Monitor</span>
-                    </label>
-                  )}
-                </>
-              )}
-            </div>
+            <MapControls
+              isTouchDevice={isTouchDevice}
+              showPacketMonitor={showPacketMonitor}
+              setShowPacketMonitor={setShowPacketMonitor}
+            />
             <MapContainer center={getMapCenter()} zoom={mapZoom} style={{ height: '100%', width: '100%' }}>
               <MapCenterController centerTarget={mapCenterTarget} onCenterComplete={handleCenterComplete} />
               {getTilesetById(activeTileset, customTilesets).isVector ? (
@@ -1296,194 +988,21 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <MapResizeHandler trigger={showPacketMonitor} />
               <SpiderfierController ref={spiderfierRef} zoomLevel={mapZoom} />
               <MapLegend />
-              {nodesWithPosition
-                .filter(
+
+              <NodeMarkersLayer
+                nodes={nodesWithPosition.filter(
                   node =>
                     (showMqttNodes || !node.viaMqtt) &&
                     (showIncompleteNodes || isNodeComplete(node)) &&
                     (showEstimatedPositions || !node.user?.id || !nodesWithEstimatedPosition.has(node.user.id))
-                )
-                .map(node => {
-                  const roleNum =
-                    typeof node.user?.role === 'string'
-                      ? parseInt(node.user.role, 10)
-                      : typeof node.user?.role === 'number'
-                      ? node.user.role
-                      : 0;
-                  const isRouter = roleNum === 2;
-                  const isSelected = selectedNodeId === node.user?.id;
-
-                  // Get hop count for this node
-                  // Local node always gets 0 hops (green), otherwise use hopsAway from protobuf
-                  const isLocalNode = node.user?.id === currentNodeId;
-                  const hops = isLocalNode ? 0 : node.hopsAway ?? 999;
-                  const showLabel = mapZoom >= 13; // Show labels when zoomed in
-
-                  const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
-
-                  const markerIcon = createNodeIcon({
-                    hops: hops, // 0 (local) = green, 999 (no hops_away data) = grey
-                    isSelected,
-                    isRouter,
-                    shortName: node.user?.shortName,
-                    showLabel: showLabel || shouldAnimate, // Show label when animating OR zoomed in
-                    animate: shouldAnimate,
-                    pinStyle: mapPinStyle,
-                  });
-
-                  // Use memoized position to prevent React-Leaflet from resetting marker position
-                  const position = nodePositions.get(node.nodeNum)!;
-
-                  return (
-                    <Marker
-                      key={node.nodeNum}
-                      position={position}
-                      icon={markerIcon}
-                      zIndexOffset={shouldAnimate ? 10000 : 0}
-                      ref={ref => handleMarkerRef(ref, node.user?.id)}
-                    >
-                      {!isTouchDevice && (
-                        <Tooltip direction="top" offset={[0, -20]} opacity={0.9} interactive>
-                          <div style={{ textAlign: 'center' }}>
-                            <div style={{ fontWeight: 'bold' }}>
-                              {node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}
-                            </div>
-                            {node.hopsAway !== undefined && (
-                              <div style={{ fontSize: '0.85em', opacity: 0.8 }}>
-                                {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
-                              </div>
-                            )}
-                          </div>
-                        </Tooltip>
-                      )}
-                      <Popup autoPan={false}>
-                        <div className="node-popup">
-                          <div className="node-popup-header">
-                            <div className="node-popup-title">{node.user?.longName || `Node ${node.nodeNum}`}</div>
-                            {node.user?.shortName && <div className="node-popup-subtitle">{node.user.shortName}</div>}
-                          </div>
-
-                          <div className="node-popup-grid">
-                            {node.user?.id && (
-                              <div className="node-popup-item">
-                                <span className="node-popup-icon">🆔</span>
-                                <span className="node-popup-value">{node.user.id}</span>
-                              </div>
-                            )}
-
-                            {node.user?.role !== undefined &&
-                              (() => {
-                                const roleNum =
-                                  typeof node.user.role === 'string' ? parseInt(node.user.role, 10) : node.user.role;
-                                const roleName = getRoleName(roleNum);
-                                return roleName ? (
-                                  <div className="node-popup-item">
-                                    <span className="node-popup-icon">👤</span>
-                                    <span className="node-popup-value">{roleName}</span>
-                                  </div>
-                                ) : null;
-                              })()}
-
-                            {node.user?.hwModel !== undefined &&
-                              (() => {
-                                const hwModelName = getHardwareModelName(node.user.hwModel);
-                                return hwModelName ? (
-                                  <div className="node-popup-item">
-                                    <span className="node-popup-icon">🖥️</span>
-                                    <span className="node-popup-value">{hwModelName}</span>
-                                  </div>
-                                ) : null;
-                              })()}
-
-                            {node.snr != null && (
-                              <div className="node-popup-item">
-                                <span className="node-popup-icon">📶</span>
-                                <span className="node-popup-value">{node.snr.toFixed(1)} dB</span>
-                              </div>
-                            )}
-
-                            {node.hopsAway != null && (
-                              <div className="node-popup-item">
-                                <span className="node-popup-icon">🔗</span>
-                                <span className="node-popup-value">
-                                  {node.hopsAway} hop{node.hopsAway !== 1 ? 's' : ''}
-                                </span>
-                              </div>
-                            )}
-
-                            {node.position?.altitude != null && (
-                              <div className="node-popup-item">
-                                <span className="node-popup-icon">⛰️</span>
-                                <span className="node-popup-value">{node.position.altitude}m</span>
-                              </div>
-                            )}
-
-                            {node.deviceMetrics?.batteryLevel !== undefined &&
-                              node.deviceMetrics.batteryLevel !== null && (
-                                <div className="node-popup-item">
-                                  <span className="node-popup-icon">
-                                    {node.deviceMetrics.batteryLevel === 101 ? '🔌' : '🔋'}
-                                  </span>
-                                  <span className="node-popup-value">
-                                    {node.deviceMetrics.batteryLevel === 101
-                                      ? 'Plugged In'
-                                      : `${node.deviceMetrics.batteryLevel}%`}
-                                  </span>
-                                </div>
-                              )}
-                          </div>
-
-                          {node.lastHeard && (
-                            <div className="node-popup-footer">
-                              <span className="node-popup-icon">🕐</span>
-                              {formatDateTime(new Date(node.lastHeard * 1000), timeFormat, dateFormat)}
-                            </div>
-                          )}
-
-                          {node.user?.id && hasPermission('messages', 'read') && (
-                            <button className="node-popup-btn" onClick={handlePopupDMClick(node)}>
-                              💬 Direct Message
-                            </button>
-                          )}
-                        </div>
-                      </Popup>
-                    </Marker>
-                  );
-                })}
-
-              {/* Draw uncertainty circles for estimated positions */}
-              {showEstimatedPositions &&
-                nodesWithPosition
-                  .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id))
-                  .map(node => {
-                    // Calculate radius based on precision bits (higher precision = smaller circle)
-                    // Meshtastic uses precision_bits to reduce coordinate precision
-                    // Each precision bit reduces precision by ~1 bit, roughly doubling the uncertainty
-                    // We'll use a base radius and scale it
-                    const baseRadiusMeters = 500; // Base uncertainty radius
-                    const radiusMeters = baseRadiusMeters; // Can be adjusted based on precision_bits if available
-
-                    // Get hop color for the circle (same as marker)
-                    const isLocalNode = node.user?.id === currentNodeId;
-                    const hops = isLocalNode ? 0 : node.hopsAway ?? 999;
-                    const color = getHopColor(hops);
-
-                    return (
-                      <Circle
-                        key={`estimated-${node.nodeNum}`}
-                        center={[node.position!.latitude, node.position!.longitude]}
-                        radius={radiusMeters}
-                        pathOptions={{
-                          color: color,
-                          fillColor: color,
-                          fillOpacity: 0.1,
-                          opacity: 0.4,
-                          weight: 2,
-                          dashArray: '5, 5',
-                        }}
-                      />
-                    );
-                  })}
+                )}
+                nodesWithEstimatedPosition={nodesWithEstimatedPosition}
+                nodePositions={nodePositions}
+                isTouchDevice={isTouchDevice}
+                onNodeClick={node => handleNodeClick(node)()}
+                onMarkerRef={handleMarkerRef}
+                onPopupDMClick={node => handlePopupDMClick(node)()}
+              />
 
               {/* Draw traceroute paths (independent layer) */}
               <TraceroutePathsLayer paths={traceroutePathsElements} enabled={showPaths} />

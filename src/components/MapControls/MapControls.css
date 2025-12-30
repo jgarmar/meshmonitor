@@ -1,0 +1,147 @@
+/* Map Controls */
+.map-controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 1000;
+  background: var(--ctp-surface0);
+  padding: 0.75rem;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  user-select: none;
+  transition: left 0s, top 0s, right 0s;
+  /* Disable transition for position to enable smooth dragging */
+}
+
+.map-control-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0.25rem;
+}
+
+.map-control-item:last-child {
+  margin-bottom: 0;
+}
+
+.map-control-item input[type='checkbox'] {
+  cursor: pointer;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--ctp-mauve);
+}
+
+.map-control-item span {
+  color: var(--ctp-text);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+/* Map controls title */
+.map-controls-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.map-controls-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ctp-mauve);
+  padding-right: 28px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  flex: 1;
+}
+
+/* Map controls collapse button */
+.map-controls-collapse-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: var(--ctp-surface1);
+  border: none;
+  border-radius: 4px;
+  color: var(--ctp-text);
+  cursor: pointer;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  transition: all 0.2s ease;
+  padding: 0;
+  line-height: 1;
+  z-index: 10;
+  /* Position relative to map-controls container, not header */
+}
+
+.map-controls-collapse-btn:hover {
+  background: var(--ctp-surface2);
+  transform: scale(1.1);
+}
+
+.map-controls-collapse-btn:active {
+  transform: scale(0.95);
+}
+
+/* Collapsed state for map controls */
+.map-controls.collapsed {
+  padding: 0.5rem;
+  min-width: 40px;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  top: 10px !important;
+  right: 10px !important;
+  left: auto !important;
+  /* Override dynamic positioning when collapsed */
+}
+
+/* Center the collapse button when collapsed */
+.map-controls.collapsed .map-controls-collapse-btn {
+  position: static;
+  margin: 0;
+}
+
+/* Packet Monitor Toggle specific style */
+.packet-monitor-toggle {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--ctp-surface2);
+}
+
+/* Cluster Icon Fixes */
+.marker-cluster div {
+  color: #333 !important; /* Force dark text for visibility */
+  font-weight: bold;
+  font-family: sans-serif;
+}
+
+/* Ensure background colors are visible if they were missing or overridden */
+.marker-cluster-small {
+  background-color: rgba(181, 226, 140, 0.6);
+}
+.marker-cluster-small div {
+  background-color: rgba(110, 204, 39, 0.6);
+}
+
+.marker-cluster-medium {
+  background-color: rgba(241, 211, 87, 0.6);
+}
+.marker-cluster-medium div {
+  background-color: rgba(240, 194, 12, 0.6);
+}
+
+.marker-cluster-large {
+  background-color: rgba(253, 156, 115, 0.6);
+}
+.marker-cluster-large div {
+  background-color: rgba(241, 128, 23, 0.6);
+}
