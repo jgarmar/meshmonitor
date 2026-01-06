@@ -7,10 +7,11 @@ import { TabType } from '../types/ui';
 import { ResourceType } from '../types/permission';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
 import { generateArrowMarkers } from '../utils/mapHelpers.tsx';
-import { getHardwareModelName, getRoleName, isNodeComplete } from '../utils/nodeHelpers';
-import { formatTime, formatDateTime } from '../utils/datetime';
+import { getHardwareModelName, getRoleName, isNodeComplete, parseNodeId, TRACEROUTE_DISPLAY_HOURS } from '../utils/nodeHelpers';
+import { formatTime, formatDateTime, formatRelativeTime } from '../utils/datetime';
 import { getDistanceToNode } from '../utils/distance';
 import { getTilesetById } from '../config/tilesets';
+import { formatTracerouteRoute } from '../utils/traceroute';
 import { useMapContext } from '../contexts/MapContext';
 import { useTelemetryNodes, useDeviceConfig, useNodes } from '../hooks/useServerData';
 import { useUI } from '../contexts/UIContext';
@@ -59,6 +60,34 @@ const isToday = (date: Date): boolean => {
   return date.getDate() === today.getDate() &&
     date.getMonth() === today.getMonth() &&
     date.getFullYear() === today.getFullYear();
+};
+
+// Helper function to calculate node opacity based on last heard time
+const calculateNodeOpacity = (
+  lastHeard: number | undefined,
+  enabled: boolean,
+  startHours: number,
+  minOpacity: number,
+  maxNodeAgeHours: number
+): number => {
+  if (!enabled || !lastHeard) return 1;
+
+  const now = Date.now();
+  const lastHeardMs = lastHeard * 1000;
+  const ageHours = (now - lastHeardMs) / (1000 * 60 * 60);
+
+  // No dimming if node was heard within the start threshold
+  if (ageHours <= startHours) return 1;
+
+  // Calculate opacity linearly from 1 at startHours to minOpacity at maxNodeAgeHours
+  const dimmingRange = maxNodeAgeHours - startHours;
+  if (dimmingRange <= 0) return 1;
+
+  const ageInDimmingRange = ageHours - startHours;
+  const dimmingProgress = Math.min(1, ageInDimmingRange / dimmingRange);
+
+  // Linear interpolation from 1 to minOpacity
+  return 1 - (dimmingProgress * (1 - minOpacity));
 };
 
 // Memoized distance display component to avoid recalculating on every render
@@ -126,6 +155,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setShowAnimations,
     showEstimatedPositions,
     setShowEstimatedPositions,
+    showAccuracyCircles,
+    setShowAccuracyCircles,
     animatedNodes,
     triggerNodeAnimation,
     mapCenterTarget,
@@ -137,6 +168,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setSelectedNodeId,
     neighborInfo,
     positionHistory,
+    traceroutes,
   } = useMapContext();
 
   const { currentNodeId } = useDeviceConfig();
@@ -173,6 +205,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     mapPinStyle,
     customTilesets,
     distanceUnit,
+    nodeDimmingEnabled,
+    nodeDimmingStartHours,
+    nodeDimmingMinOpacity,
+    maxNodeAgeHours,
   } = useSettings();
 
   const { hasPermission } = useAuth();
@@ -1281,6 +1317,14 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     />
                     <span>Show Estimated Positions</span>
                   </label>
+                  <label className="map-control-item">
+                    <input
+                      type="checkbox"
+                      checked={showAccuracyCircles}
+                      onChange={(e) => setShowAccuracyCircles(e.target.checked)}
+                    />
+                    <span>Show Accuracy Circles</span>
+                  </label>
                   {canViewPacketMonitor && packetLogEnabled && (
                     <label className="map-control-item packet-monitor-toggle">
                       <input
@@ -1351,11 +1395,21 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 // Use memoized position to prevent React-Leaflet from resetting marker position
                 const position = nodePositions.get(node.nodeNum)!;
 
+                // Calculate opacity based on last heard time
+                const markerOpacity = calculateNodeOpacity(
+                  node.lastHeard,
+                  nodeDimmingEnabled,
+                  nodeDimmingStartHours,
+                  nodeDimmingMinOpacity,
+                  maxNodeAgeHours
+                );
+
                 return (
               <Marker
                 key={node.nodeNum}
                 position={position}
                 icon={markerIcon}
+                opacity={markerOpacity}
                 zIndexOffset={shouldAnimate ? 10000 : 0}
                 ref={(ref) => handleMarkerRef(ref, node.user?.id)}
               >
@@ -1451,6 +1505,77 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       </div>
                     )}
 
+                    {/* Traceroute Section */}
+                    {(() => {
+                      if (!currentNodeId || !node.user?.id || currentNodeId === node.user.id) return null;
+
+                      // Get current node number from ID
+                      const currentNodeNum = parseNodeId(currentNodeId);
+                      if (currentNodeNum === null) return null;
+
+                      // Use shared constant for traceroute visibility window
+                      const cutoff = Date.now() - TRACEROUTE_DISPLAY_HOURS * 60 * 60 * 1000;
+
+                      // Find the most recent traceroute between these two nodes
+                      const recentTraceroute = traceroutes
+                        .filter(tr => {
+                          const isRelevant =
+                            (tr.fromNodeNum === currentNodeNum && tr.toNodeNum === node.nodeNum) ||
+                            (tr.fromNodeNum === node.nodeNum && tr.toNodeNum === currentNodeNum);
+                          return isRelevant && tr.timestamp >= cutoff;
+                        })
+                        .sort((a, b) => b.timestamp - a.timestamp)[0];
+
+                      if (!recentTraceroute) return null;
+
+                      return (
+                        <div className="node-popup-traceroute">
+                          <div className="traceroute-header">
+                            <strong>{t('node_popup.last_traceroute')}</strong>
+                            <span className="traceroute-age">
+                              ({formatRelativeTime(recentTraceroute.timestamp)})
+                            </span>
+                          </div>
+                          {recentTraceroute.route && recentTraceroute.route !== 'null' ? (
+                            <>
+                              <div className="traceroute-path">
+                                <span className="traceroute-label">{t('node_popup.forward_path')}:</span>
+                                <span className="traceroute-route">
+                                  {formatTracerouteRoute(
+                                    recentTraceroute.route,
+                                    recentTraceroute.snrTowards,
+                                    recentTraceroute.fromNodeNum,
+                                    recentTraceroute.toNodeNum,
+                                    nodes,
+                                    distanceUnit
+                                  )}
+                                </span>
+                              </div>
+                              {recentTraceroute.routeBack && recentTraceroute.routeBack !== 'null' && (
+                                <div className="traceroute-path">
+                                  <span className="traceroute-label">{t('node_popup.return_path')}:</span>
+                                  <span className="traceroute-route">
+                                    {formatTracerouteRoute(
+                                      recentTraceroute.routeBack,
+                                      recentTraceroute.snrBack,
+                                      recentTraceroute.toNodeNum,
+                                      recentTraceroute.fromNodeNum,
+                                      nodes,
+                                      distanceUnit
+                                    )}
+                                  </span>
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <div className="traceroute-failed">
+                              {t('node_popup.traceroute_failed')}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
                     {node.user?.id && hasPermission('messages', 'read') && (
                       <button
                         className="node-popup-btn"
@@ -1493,6 +1618,39 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                         opacity: 0.4,
                         weight: 2,
                         dashArray: '5, 5'
+                      }}
+                    />
+                  );
+                })}
+
+              {/* Draw position accuracy circles for all nodes with precision data */}
+              {showAccuracyCircles && nodesWithPosition
+                .filter(node => node.positionPrecisionBits !== undefined && node.positionPrecisionBits !== null && node.positionPrecisionBits > 0 && node.positionPrecisionBits < 32)
+                .map(node => {
+                  // Convert precision_bits to radius in meters
+                  // precision_bits indicates how many bits of lat/lon are valid
+                  // Earth's circumference is ~40,075,000 meters
+                  // At N precision bits, accuracy is Earth's circumference / 2^N
+                  // Radius is half of that accuracy diameter
+                  const earthCircumference = 40_075_000; // meters
+                  const radiusMeters = earthCircumference / Math.pow(2, node.positionPrecisionBits!) / 2;
+
+                  // Get hop color for the circle (same as marker)
+                  const isLocalNode = node.user?.id === currentNodeId;
+                  const hops = isLocalNode ? 0 : (node.hopsAway ?? 999);
+                  const color = getHopColor(hops);
+
+                  return (
+                    <Circle
+                      key={`accuracy-${node.nodeNum}`}
+                      center={[node.position!.latitude, node.position!.longitude]}
+                      radius={radiusMeters}
+                      pathOptions={{
+                        color: color,
+                        fillColor: color,
+                        fillOpacity: 0.08,
+                        opacity: 0.5,
+                        weight: 1,
                       }}
                     />
                   );

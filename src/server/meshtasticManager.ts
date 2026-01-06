@@ -15,6 +15,7 @@ import { dataEventEmitter } from './services/dataEventEmitter.js';
 import { messageQueueService } from './messageQueueService.js';
 import { normalizeTriggerPatterns } from '../utils/autoResponderUtils.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName } from './constants/meshtastic.js';
 import { createRequire } from 'module';
 import * as cron from 'node-cron';
 import fs from 'fs';
@@ -58,6 +59,8 @@ export interface DeviceInfo {
   snr?: number;
   rssi?: number;
   mobile?: number; // Database field: 0 = not mobile, 1 = mobile (moved >100m)
+  // Position precision fields
+  positionGpsAccuracy?: number; // GPS accuracy in meters
   // Position override fields
   positionOverrideEnabled?: number;
   latitudeOverride?: number;
@@ -79,6 +82,35 @@ export interface MeshMessage {
   timestamp: Date;
   rxSnr?: number;
   rxRssi?: number;
+}
+
+/**
+ * Determines if a packet should be excluded from the packet log.
+ * Internal packets (ADMIN_APP and ROUTING_APP) to/from the local node are excluded
+ * since they are management traffic, not actual mesh traffic.
+ *
+ * @param fromNum - Source node number
+ * @param toNum - Destination node number (null for broadcast)
+ * @param portnum - Port number indicating packet type
+ * @param localNodeNum - The local node's number (null if not connected)
+ * @returns true if the packet should be excluded from logging
+ */
+export function shouldExcludeFromPacketLog(
+  fromNum: number,
+  toNum: number | null,
+  portnum: number,
+  localNodeNum: number | null
+): boolean {
+  // If we don't know the local node, can't determine if it's local traffic
+  if (!localNodeNum) return false;
+
+  // Check if packet is to/from the local node
+  const isLocalPacket = fromNum === localNodeNum || toNum === localNodeNum;
+
+  // Check if it's an internal portnum (ROUTING_APP or ADMIN_APP)
+  const isInternalPortnum = portnum === PortNum.ROUTING_APP || portnum === PortNum.ADMIN_APP;
+
+  return isLocalPacket && isInternalPortnum;
 }
 
 type TextMessage = {
@@ -2025,6 +2057,12 @@ class MeshtasticManager {
         const portnum = meshPacket.decoded?.portnum ?? 0;
         const portnumName = meshtasticProtobufService.getPortNumName(portnum);
 
+        // Skip logging for local internal packets (ADMIN_APP and ROUTING_APP)
+        // These are management packets between MeshMonitor and the local node, not actual mesh traffic
+        if (shouldExcludeFromPacketLog(fromNum, toNum, portnum, this.localNodeInfo?.nodeNum ?? null)) {
+          // Skip logging - these are internal management packets
+        } else {
+
         // Generate payload preview and store decoded payload
         let payloadPreview = null;
         let decodedPayload: any = null;
@@ -2034,10 +2072,10 @@ class MeshtasticManager {
           try {
             decodedPayload = meshtasticProtobufService.processPayload(portnum, meshPacket.decoded.payload);
             const processedPayload = decodedPayload;
-            if (portnum === 1 && typeof processedPayload === 'string') {
+            if (portnum === PortNum.TEXT_MESSAGE_APP && typeof processedPayload === 'string') {
               // TEXT_MESSAGE - show first 100 chars
               payloadPreview = processedPayload.substring(0, 100);
-            } else if (portnum === 3) {
+            } else if (portnum === PortNum.POSITION_APP) {
               // POSITION - show coordinates (if available)
               const pos = processedPayload as any;
               if (pos.latitudeI !== undefined || pos.longitudeI !== undefined || pos.latitude_i !== undefined || pos.longitude_i !== undefined) {
@@ -2049,7 +2087,7 @@ class MeshtasticManager {
               } else {
                 payloadPreview = '[Position update]';
               }
-            } else if (portnum === 4) {
+            } else if (portnum === PortNum.NODEINFO_APP) {
               // NODEINFO - show node name (if available)
               const nodeInfo = processedPayload as any;
               const longName = nodeInfo.longName || nodeInfo.long_name;
@@ -2059,7 +2097,7 @@ class MeshtasticManager {
               } else {
                 payloadPreview = '[NodeInfo update]';
               }
-            } else if (portnum === 67) {
+            } else if (portnum === PortNum.TELEMETRY_APP) {
               // TELEMETRY - show telemetry type
               const telemetry = processedPayload as any;
               let telemetryType = 'Unknown';
@@ -2079,14 +2117,14 @@ class MeshtasticManager {
                 telemetryType = 'Host';
               }
               payloadPreview = `[Telemetry: ${telemetryType}]`;
-            } else if (portnum === 34) {
+            } else if (portnum === PortNum.PAXCOUNTER_APP) {
               // PAXCOUNTER - show WiFi and BLE counts
               const pax = processedPayload as any;
               payloadPreview = `[Paxcounter: WiFi=${pax.wifi || 0}, BLE=${pax.ble || 0}]`;
-            } else if (portnum === 70) {
+            } else if (portnum === PortNum.TRACEROUTE_APP) {
               // TRACEROUTE
               payloadPreview = '[Traceroute]';
-            } else if (portnum === 71) {
+            } else if (portnum === PortNum.NEIGHBORINFO_APP) {
               // NEIGHBORINFO
               payloadPreview = '[NeighborInfo]';
             } else {
@@ -2143,8 +2181,9 @@ class MeshtasticManager {
           priority: meshPacket.priority ?? undefined,
           payload_preview: payloadPreview ?? undefined,
           metadata: JSON.stringify(metadata),
-          direction: 'rx'
+          direction: fromNum === this.localNodeInfo?.nodeNum ? 'tx' : 'rx'
         });
+        } // end else (not internal packet)
       }
     } catch (error) {
       logger.error('❌ Failed to log packet:', error);
@@ -2197,31 +2236,31 @@ class MeshtasticManager {
         const processedPayload = meshtasticProtobufService.processPayload(normalizedPortNum, payload);
 
         switch (normalizedPortNum) {
-          case 1: // TEXT_MESSAGE_APP
+          case PortNum.TEXT_MESSAGE_APP:
             await this.processTextMessageProtobuf(meshPacket, processedPayload as string, context);
             break;
-          case 3: // POSITION_APP
+          case PortNum.POSITION_APP:
             await this.processPositionMessageProtobuf(meshPacket, processedPayload as any);
             break;
-          case 4: // NODEINFO_APP
+          case PortNum.NODEINFO_APP:
             await this.processNodeInfoMessageProtobuf(meshPacket, processedPayload as any);
             break;
-          case 34: // PAXCOUNTER_APP
+          case PortNum.PAXCOUNTER_APP:
             await this.processPaxcounterMessageProtobuf(meshPacket, processedPayload as any);
             break;
-          case 67: // TELEMETRY_APP
+          case PortNum.TELEMETRY_APP:
             await this.processTelemetryMessageProtobuf(meshPacket, processedPayload as any);
             break;
-          case 5: // ROUTING_APP
+          case PortNum.ROUTING_APP:
             await this.processRoutingErrorMessage(meshPacket, processedPayload as any);
             break;
-          case 6: // ADMIN_APP
+          case PortNum.ADMIN_APP:
             await this.processAdminMessage(processedPayload as Uint8Array, meshPacket);
             break;
-          case 71: // NEIGHBORINFO_APP
+          case PortNum.NEIGHBORINFO_APP:
             await this.processNeighborInfoProtobuf(meshPacket, processedPayload as any);
             break;
-          case 70: // TRACEROUTE_APP
+          case PortNum.TRACEROUTE_APP:
             await this.processTracerouteMessage(meshPacket, processedPayload as any);
             break;
           default:
@@ -2321,7 +2360,7 @@ class MeshtasticManager {
           toNodeId: toNodeId,
           text: messageText,
           channel: channelIndex,
-          portnum: 1, // TEXT_MESSAGE_APP
+          portnum: PortNum.TEXT_MESSAGE_APP,
           timestamp: meshPacket.rxTime ? Number(meshPacket.rxTime) * 1000 : Date.now(),
           rxTime: meshPacket.rxTime ? Number(meshPacket.rxTime) * 1000 : Date.now(),
           hopStart: hopStart,
@@ -2419,7 +2458,16 @@ class MeshtasticManager {
 
         // Extract position precision metadata
         const channelIndex = meshPacket.channel !== undefined ? meshPacket.channel : 0;
-        const precisionBits = position.precisionBits ?? position.precision_bits ?? undefined;
+        // Use precision_bits from packet if available, otherwise fall back to channel's positionPrecision
+        // Also fall back if precisionBits is 0 (which means no precision was set)
+        let precisionBits = position.precisionBits ?? position.precision_bits ?? undefined;
+        if (precisionBits === undefined || precisionBits === 0) {
+          const channel = databaseService.getChannelById(channelIndex);
+          if (channel && channel.positionPrecision !== undefined && channel.positionPrecision !== null && channel.positionPrecision > 0) {
+            precisionBits = channel.positionPrecision;
+            logger.debug(`🗺️ Using channel ${channelIndex} positionPrecision (${precisionBits}) for position from ${nodeId}`);
+          }
+        }
         const gpsAccuracy = position.gpsAccuracy ?? position.gps_accuracy ?? undefined;
         const hdop = position.HDOP ?? position.hdop ?? undefined;
 
@@ -2515,6 +2563,16 @@ class MeshtasticManager {
             databaseService.insertTelemetry({
               nodeId, nodeNum: fromNum, telemetryType: 'altitude',
               timestamp, value: position.altitude, unit: 'm', createdAt: now, packetTimestamp,
+              channel: channelIndex
+            });
+          }
+
+          // Store satellites in view for GPS accuracy tracking
+          const satsInView = position.satsInView ?? position.sats_in_view;
+          if (satsInView !== undefined && satsInView > 0) {
+            databaseService.insertTelemetry({
+              nodeId, nodeNum: fromNum, telemetryType: 'sats_in_view',
+              timestamp, value: satsInView, unit: 'sats', createdAt: now, packetTimestamp,
               channel: channelIndex
             });
           }
@@ -3279,7 +3337,7 @@ class MeshtasticManager {
         toNodeId: toNodeId,
         text: routeText,
         channel: channelIndex,
-        portnum: 70, // TRACEROUTE_APP
+        portnum: PortNum.TRACEROUTE_APP,
         timestamp: timestamp,
         rxTime: timestamp,
         createdAt: Date.now()
@@ -3404,27 +3462,7 @@ class MeshtasticManager {
       // Use decoded.requestId which contains the ID of the original message that was ACK'd/failed
       const requestId = meshPacket.decoded?.requestId;
 
-      const errorReasonNames: Record<number, string> = {
-        0: 'NONE',
-        1: 'NO_ROUTE',
-        2: 'GOT_NAK',
-        3: 'TIMEOUT',
-        4: 'NO_INTERFACE',
-        5: 'MAX_RETRANSMIT',
-        6: 'NO_CHANNEL',
-        7: 'TOO_LARGE',
-        8: 'NO_RESPONSE',
-        9: 'DUTY_CYCLE_LIMIT',
-        32: 'BAD_REQUEST',
-        33: 'NOT_AUTHORIZED',
-        34: 'PKI_FAILED',
-        35: 'PKI_UNKNOWN_PUBKEY',
-        36: 'ADMIN_BAD_SESSION_KEY',
-        37: 'ADMIN_PUBLIC_KEY_UNAUTHORIZED',
-        38: 'RATE_LIMIT_EXCEEDED'
-      };
-
-      const errorName = errorReasonNames[errorReason] || `UNKNOWN(${errorReason})`;
+      const errorName = getRoutingErrorName(errorReason);
 
       // Handle successful ACKs (error_reason = 0 means success)
       if (errorReason === 0 && requestId) {
@@ -3481,13 +3519,13 @@ class MeshtasticManager {
       });
 
       // Detect PKI/encryption errors and flag the target node
-      if (errorReason === 34 || errorReason === 35) {
-        // PKI_FAILED (34) or PKI_UNKNOWN_PUBKEY (35) - indicates key mismatch
+      if (isPkiError(errorReason)) {
+        // PKI_FAILED or PKI_UNKNOWN_PUBKEY - indicates key mismatch
         const originalMessage = requestId ? databaseService.getMessageByRequestId(requestId) : null;
         if (originalMessage && originalMessage.toNodeNum) {
           const targetNodeNum = originalMessage.toNodeNum;
           const targetNodeId = originalMessage.toNodeId;
-          const errorDescription = errorReason === 34
+          const errorDescription = errorReason === RoutingError.PKI_FAILED
             ? 'PKI encryption failed - possible key mismatch. Use "Exchange Node Info" or purge node data to refresh keys.'
             : 'Remote node missing public key - possible key mismatch. Use "Exchange Node Info" or purge node data to refresh keys.';
 
@@ -3846,7 +3884,7 @@ class MeshtasticManager {
       }
 
       // Add position information if available
-      let positionTelemetryData: { timestamp: number; latitude: number; longitude: number; altitude?: number } | null = null;
+      let positionTelemetryData: { timestamp: number; latitude: number; longitude: number; altitude?: number; precisionBits?: number; channel?: number } | null = null;
       if (nodeInfo.position && (nodeInfo.position.latitudeI || nodeInfo.position.longitudeI)) {
         const coords = meshtasticProtobufService.convertCoordinates(
           nodeInfo.position.latitudeI,
@@ -3859,13 +3897,38 @@ class MeshtasticManager {
           nodeData.longitude = coords.longitude;
           nodeData.altitude = nodeInfo.position.altitude;
 
+          // Extract position precision if available in NodeInfo
+          // NodeInfo.position may have precisionBits from the original Position packet
+          // Note: precisionBits=0 means "no precision data" and should trigger channel fallback
+          let precisionBits = nodeInfo.position.precisionBits ?? nodeInfo.position.precision_bits ?? undefined;
+          const channelIndex = nodeInfo.channel !== undefined ? nodeInfo.channel : 0;
+
+          // Fall back to channel's positionPrecision if not in position data
+          // Also fall back if precisionBits is 0 (which means no precision was set)
+          if (precisionBits === undefined || precisionBits === 0) {
+            const channel = databaseService.getChannelById(channelIndex);
+            if (channel && channel.positionPrecision !== undefined && channel.positionPrecision !== null && channel.positionPrecision > 0) {
+              precisionBits = channel.positionPrecision;
+              logger.debug(`🗺️ NodeInfo for ${nodeId}: using channel ${channelIndex} positionPrecision (${precisionBits}) as fallback`);
+            }
+          }
+
+          // Save position precision metadata
+          if (precisionBits !== undefined) {
+            nodeData.positionPrecisionBits = precisionBits;
+            nodeData.positionChannel = channelIndex;
+            nodeData.positionTimestamp = Date.now();
+          }
+
           // Store position telemetry data to be inserted after node is created
           const timestamp = nodeInfo.position.time ? Number(nodeInfo.position.time) * 1000 : Date.now();
           positionTelemetryData = {
             timestamp,
             latitude: coords.latitude,
             longitude: coords.longitude,
-            altitude: nodeInfo.position.altitude
+            altitude: nodeInfo.position.altitude,
+            precisionBits,
+            channel: channelIndex
           };
         } else {
           logger.warn(`⚠️ Invalid position coordinates for node ${nodeId}: lat=${coords.latitude}, lon=${coords.longitude}. Skipping position save.`);
@@ -3917,16 +3980,19 @@ class MeshtasticManager {
         const now = Date.now();
         databaseService.insertTelemetry({
           nodeId, nodeNum: Number(nodeInfo.num), telemetryType: 'latitude',
-          timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.latitude, unit: '°', createdAt: now
+          timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.latitude, unit: '°', createdAt: now,
+          channel: positionTelemetryData.channel, precisionBits: positionTelemetryData.precisionBits
         });
         databaseService.insertTelemetry({
           nodeId, nodeNum: Number(nodeInfo.num), telemetryType: 'longitude',
-          timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.longitude, unit: '°', createdAt: now
+          timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.longitude, unit: '°', createdAt: now,
+          channel: positionTelemetryData.channel, precisionBits: positionTelemetryData.precisionBits
         });
         if (positionTelemetryData.altitude !== undefined && positionTelemetryData.altitude !== null) {
           databaseService.insertTelemetry({
             nodeId, nodeNum: Number(nodeInfo.num), telemetryType: 'altitude',
-            timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.altitude, unit: 'm', createdAt: now
+            timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.altitude, unit: 'm', createdAt: now,
+            channel: positionTelemetryData.channel, precisionBits: positionTelemetryData.precisionBits
           });
         }
 
@@ -5380,7 +5446,7 @@ class MeshtasticManager {
           text: text,
           // Use channel -1 for direct messages, otherwise use the actual channel
           channel: destination ? -1 : channel,
-          portnum: 1, // TEXT_MESSAGE_APP
+          portnum: PortNum.TEXT_MESSAGE_APP,
           timestamp: Date.now(),
           rxTime: Date.now(),
           hopStart: undefined,
@@ -8604,6 +8670,14 @@ class MeshtasticManager {
           longitude: node.longitude,
           altitude: node.altitude
         };
+      }
+
+      // Add position precision fields for accuracy circles
+      if (node.positionPrecisionBits !== null && node.positionPrecisionBits !== undefined) {
+        deviceInfo.positionPrecisionBits = node.positionPrecisionBits;
+      }
+      if (node.positionGpsAccuracy !== null && node.positionGpsAccuracy !== undefined) {
+        deviceInfo.positionGpsAccuracy = node.positionGpsAccuracy;
       }
 
       // Add position override fields
