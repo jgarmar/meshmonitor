@@ -2568,6 +2568,36 @@ apiRouter.post('/nodeinfo/request', requirePermission('messages', 'write'), asyn
   }
 });
 
+// NeighborInfo request endpoint (request neighbor info from remote node)
+apiRouter.post('/neighborinfo/request', requirePermission('traceroute', 'write'), async (req, res) => {
+  try {
+    const { destination } = req.body;
+    if (!destination) {
+      return res.status(400).json({ error: 'Destination node number is required' });
+    }
+
+    const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
+
+    // Look up the node to get its channel
+    const node = databaseService.getNode(destinationNum);
+    const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
+
+    const { packetId, requestId } = await meshtasticManager.sendNeighborInfoRequest(destinationNum, channel);
+
+    logger.info(`🏠 NeighborInfo request sent to ${destinationNum.toString(16)} on channel ${channel}, packetId=${packetId}, requestId=${requestId}`);
+
+    res.json({
+      success: true,
+      message: `NeighborInfo request sent to ${destinationNum.toString(16)} on channel ${channel}`,
+      packetId,
+      requestId
+    });
+  } catch (error) {
+    logger.error('Error sending neighborinfo request:', error);
+    res.status(500).json({ error: 'Failed to send neighborinfo request' });
+  }
+});
+
 // Get recent traceroutes (last 24 hours)
 apiRouter.get('/traceroutes/recent', (req, res) => {
   try {
@@ -5212,6 +5242,7 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
         const configTypeMap: { [key: string]: { type: number; isModule: boolean } } = {
           'device': { type: 0, isModule: false },  // DEVICE_CONFIG
           'position': { type: 1, isModule: false }, // POSITION_CONFIG
+          'network': { type: 3, isModule: false },  // NETWORK_CONFIG
           'lora': { type: 5, isModule: false },      // LORA_CONFIG
           'bluetooth': { type: 6, isModule: false }, // BLUETOOTH_CONFIG
           'security': { type: 7, isModule: false },  // SECURITY_CONFIG
@@ -5386,13 +5417,27 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
           case 'security':
             if (finalConfig.deviceConfig?.security) {
               // Convert admin keys from Uint8Array to base64 strings for UI
-              const adminKeys = finalConfig.deviceConfig.security.adminKey || [];
+              const localAdminKeys = finalConfig.deviceConfig.security.adminKey || [];
               config = {
-                adminKeys: adminKeys.map((key: Uint8Array) => {
+                adminKeys: localAdminKeys.map((key: any) => {
                   if (key instanceof Uint8Array || Buffer.isBuffer(key)) {
                     return Buffer.from(key).toString('base64');
                   }
-                  return key;
+                  // Handle JSON-serialized Buffer objects (e.g., { type: 'Buffer', data: [...] })
+                  if (key && typeof key === 'object' && key.type === 'Buffer' && Array.isArray(key.data)) {
+                    return Buffer.from(key.data).toString('base64');
+                  }
+                  // Handle array of bytes
+                  if (Array.isArray(key)) {
+                    return Buffer.from(key).toString('base64');
+                  }
+                  // Already a string (base64)
+                  if (typeof key === 'string') {
+                    return key;
+                  }
+                  // Fallback - try to convert
+                  logger.warn('Unknown admin key format:', typeof key, key);
+                  return String(key);
                 }),
                 isManaged: finalConfig.deviceConfig.security.isManaged,
                 serialEnabled: finalConfig.deviceConfig.security.serialEnabled,
@@ -5569,13 +5614,27 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
             break;
           case 'security':
             // Convert admin keys from Uint8Array to base64 strings for UI
-            const adminKeys = remoteConfig.adminKey || [];
+            const remoteAdminKeys = remoteConfig.adminKey || [];
             config = {
-              adminKeys: adminKeys.map((key: any) => {
+              adminKeys: remoteAdminKeys.map((key: any) => {
                 if (key instanceof Uint8Array || Buffer.isBuffer(key)) {
                   return Buffer.from(key).toString('base64');
                 }
-                return key;
+                // Handle JSON-serialized Buffer objects (e.g., { type: 'Buffer', data: [...] })
+                if (key && typeof key === 'object' && key.type === 'Buffer' && Array.isArray(key.data)) {
+                  return Buffer.from(key.data).toString('base64');
+                }
+                // Handle array of bytes
+                if (Array.isArray(key)) {
+                  return Buffer.from(key).toString('base64');
+                }
+                // Already a string (base64)
+                if (typeof key === 'string') {
+                  return key;
+                }
+                // Fallback - try to convert
+                logger.warn('Unknown admin key format:', typeof key, key);
+                return String(key);
               }),
               isManaged: remoteConfig.isManaged,
               serialEnabled: remoteConfig.serialEnabled,
@@ -6183,6 +6242,12 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
           return res.status(400).json({ error: 'config is required for setBluetoothConfig' });
         }
         adminMessage = protobufService.createSetDeviceConfigMessageGeneric('bluetooth', params.config, sessionPasskey || undefined);
+        break;
+      case 'setNetworkConfig':
+        if (!params.config) {
+          return res.status(400).json({ error: 'config is required for setNetworkConfig' });
+        }
+        adminMessage = protobufService.createSetNetworkConfigMessage(params.config, sessionPasskey || undefined);
         break;
       case 'setNeighborInfoConfig':
         if (!params.config) {

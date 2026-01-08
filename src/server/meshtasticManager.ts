@@ -473,6 +473,11 @@ class MeshtasticManager {
     this.localNodeInfo = null;
     // Clear favorites support cache on disconnect
     this.favoritesSupportCache = null;
+    // Clear init config cache - will be repopulated on reconnect
+    // This ensures virtual node clients get fresh data if a different node reconnects
+    this.initConfigCache = [];
+    this.configCaptureComplete = false;
+    logger.debug('📸 Cleared init config cache on disconnect');
 
     // Notify server event service of disconnection
     // Skip notification if this is a user-initiated disconnect (already notified in userDisconnect())
@@ -1680,6 +1685,21 @@ class MeshtasticManager {
     const nodeNum = Number(myNodeInfo.myNodeNum);
     const nodeId = `!${myNodeInfo.myNodeNum.toString(16).padStart(8, '0')}`;
 
+    // Check for node ID mismatch with previously stored values
+    const previousNodeNum = databaseService.getSetting('localNodeNum');
+    const previousNodeId = databaseService.getSetting('localNodeId');
+    if (previousNodeNum && previousNodeId) {
+      const prevNum = parseInt(previousNodeNum);
+      if (prevNum !== nodeNum) {
+        logger.warn(`⚠️ NODE ID CHANGE DETECTED: Physical node changed from ${previousNodeId} (${prevNum}) to ${nodeId} (${nodeNum})`);
+        logger.warn(`⚠️ This can happen if: (1) The physical node was factory reset, (2) A different physical node was connected, or (3) The node's ID was reconfigured`);
+        logger.warn(`⚠️ Virtual node clients may briefly show the old node ID until they reconnect`);
+        // Clear the init config cache to force fresh data for virtual node clients
+        this.initConfigCache = [];
+        logger.info(`📸 Cleared init config cache due to node ID change`);
+      }
+    }
+
     // Save local node info to settings for persistence
     databaseService.setSetting('localNodeNum', nodeNum.toString());
     databaseService.setSetting('localNodeId', nodeId);
@@ -2220,6 +2240,16 @@ class MeshtasticManager {
         nodeData.rssi = meshPacket.rxRssi;
       }
       databaseService.upsertNode(nodeData);
+
+      // Track message hops (hopStart - hopLimit) for "All messages" hop calculation mode
+      const hopStart = meshPacket.hopStart ?? meshPacket.hop_start;
+      const hopLimit = meshPacket.hopLimit ?? meshPacket.hop_limit;
+      if (hopStart !== undefined && hopStart !== null &&
+          hopLimit !== undefined && hopLimit !== null &&
+          hopStart >= hopLimit) {
+        const messageHops = hopStart - hopLimit;
+        databaseService.updateNodeMessageHops(fromNum, messageHops);
+      }
     }
 
     // Process decoded payload if present
@@ -5661,6 +5691,59 @@ class MeshtasticManager {
   }
 
   /**
+   * Request neighbor info from a remote node
+   * The target node must have NeighborInfo module enabled (broadcast interval can be 0)
+   * Firmware rate-limits responses to one every 3 minutes
+   */
+  async sendNeighborInfoRequest(destination: number, channel: number = 0): Promise<{ packetId: number; requestId: number }> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+
+    try {
+      const { data: neighborInfoRequestData, packetId, requestId } = meshtasticProtobufService.createNeighborInfoRequestMessage(
+        destination,
+        channel
+      );
+
+      logger.info(`🏠 NeighborInfo request packet created: ${neighborInfoRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}`);
+
+      await this.transport.send(neighborInfoRequestData);
+
+      // Broadcast to virtual node clients (including packet monitor)
+      const virtualNodeServer = (global as any).virtualNodeServer;
+      if (virtualNodeServer) {
+        try {
+          await virtualNodeServer.broadcastToClients(neighborInfoRequestData);
+          logger.debug(`📡 Broadcasted outgoing NeighborInfo request to virtual node clients (${neighborInfoRequestData.length} bytes)`);
+        } catch (error) {
+          logger.error('Virtual node: Failed to broadcast outgoing NeighborInfo request:', error);
+        }
+      }
+
+      logger.info(`📤 NeighborInfo request sent from ${this.localNodeInfo.nodeId} to !${destination.toString(16).padStart(8, '0')}`);
+
+      // Log outgoing NeighborInfo request to packet monitor
+      this.logOutgoingPacket(
+        71, // NEIGHBORINFO_APP
+        destination,
+        channel,
+        `NeighborInfo request to !${destination.toString(16).padStart(8, '0')}`,
+        { destination, packetId, requestId }
+      );
+
+      return { packetId, requestId };
+    } catch (error) {
+      logger.error('Error sending NeighborInfo request:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Broadcast NodeInfo to all nodes on a specific channel
    * Uses the broadcast address (0xFFFFFFFF) to send to all nodes
    * wantAck is set to false to reduce mesh traffic
@@ -7902,10 +7985,13 @@ class MeshtasticManager {
             // Map device config types to their keys
             const deviceConfigMap: { [key: number]: string } = {
               0: 'device',
-              1: 'position',  // POSITION_CONFIG (was incorrectly 6)
-              5: 'lora',
-              6: 'bluetooth',  // BLUETOOTH_CONFIG (for completeness)
-              7: 'security'  // SECURITY_CONFIG
+              1: 'position',  // POSITION_CONFIG
+              2: 'power',     // POWER_CONFIG
+              3: 'network',   // NETWORK_CONFIG
+              4: 'display',   // DISPLAY_CONFIG
+              5: 'lora',      // LORA_CONFIG
+              6: 'bluetooth', // BLUETOOTH_CONFIG
+              7: 'security'   // SECURITY_CONFIG
             };
             const configKey = deviceConfigMap[configType];
             if (configKey && nodeConfig.deviceConfig?.[configKey]) {
@@ -8625,6 +8711,11 @@ class MeshtasticManager {
       // Add hopsAway if it exists
       if (node.hopsAway !== null && node.hopsAway !== undefined) {
         deviceInfo.hopsAway = node.hopsAway;
+      }
+
+      // Add lastMessageHops if it exists (for "All messages" hop calculation mode)
+      if (node.lastMessageHops !== null && node.lastMessageHops !== undefined) {
+        deviceInfo.lastMessageHops = node.lastMessageHops;
       }
 
       // Add viaMqtt if it exists

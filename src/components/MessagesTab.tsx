@@ -23,7 +23,10 @@ import { formatTracerouteRoute } from '../utils/traceroute';
 import { getUtf8ByteLength, formatByteCount, isEmoji } from '../utils/text';
 import { getDistanceToNode } from '../utils/distance';
 import { renderMessageWithLinks } from '../utils/linkRenderer';
-import { isNodeComplete, isInfrastructureNode, hasValidPosition } from '../utils/nodeHelpers';
+import { isNodeComplete, isInfrastructureNode, hasValidPosition, parseNodeId } from '../utils/nodeHelpers';
+import { getEffectiveHops } from '../utils/nodeHops';
+import { useMapContext } from '../contexts/MapContext';
+import { useSettings } from '../contexts/SettingsContext';
 import HopCountDisplay from './HopCountDisplay';
 import LinkPreview from './LinkPreview';
 import NodeDetailsBlock from './NodeDetailsBlock';
@@ -136,6 +139,7 @@ export interface MessagesTabProps {
   tracerouteLoading: string | null;
   positionLoading: string | null;
   nodeInfoLoading: string | null;
+  neighborInfoLoading: string | null;
 
   // Settings
   timeFormat: TimeFormat;
@@ -154,6 +158,7 @@ export interface MessagesTabProps {
   handleTraceroute: (nodeId: string) => Promise<void>;
   handleExchangePosition: (nodeId: string) => Promise<void>;
   handleExchangeNodeInfo: (nodeId: string) => Promise<void>;
+  handleRequestNeighborInfo: (nodeId: string) => Promise<void>;
   handleDeleteMessage: (message: MeshMessage) => Promise<void>;
   handleSenderClick: (nodeId: string, event: React.MouseEvent) => void;
   handleSendTapback: (emoji: string, message: MeshMessage) => void;
@@ -210,6 +215,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   tracerouteLoading,
   positionLoading,
   nodeInfoLoading,
+  neighborInfoLoading,
   timeFormat,
   dateFormat,
   temperatureUnit,
@@ -222,6 +228,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   handleTraceroute,
   handleExchangePosition,
   handleExchangeNodeInfo,
+  handleRequestNeighborInfo,
   handleDeleteMessage,
   handleSenderClick,
   handleSendTapback,
@@ -237,6 +244,11 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   dmMessagesContainerRef,
 }) => {
   const { t } = useTranslation();
+
+  // Get settings and context for effective hops calculation
+  const { nodeHopsCalculation } = useSettings();
+  const { traceroutes } = useMapContext();
+  const currentNodeNum = currentNodeId ? parseNodeId(currentNodeId) : null;
 
   // Local state for actions menu
   const [showActionsMenu, setShowActionsMenu] = useState(false);
@@ -377,8 +389,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
 
   // Sort by hops (ascending, 0 first, unknown last)
   const sortByHops = (a: NodeWithMessages, b: NodeWithMessages): number => {
-    const aHops = a.hopsAway ?? 999;
-    const bHops = b.hopsAway ?? 999;
+    const aHops = getEffectiveHops(a, nodeHopsCalculation, traceroutes, currentNodeNum);
+    const bHops = getEffectiveHops(b, nodeHopsCalculation, traceroutes, currentNodeNum);
     return aHops - bHops;
   };
 
@@ -615,11 +627,14 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                             📡 {node.rssi}dBm
                           </span>
                         )}
-                        {node.hopsAway != null && (
-                          <span className="stat" title={t('nodes.hops_away')}>
-                            🔗 {node.hopsAway} {t('nodes.hop', { count: node.hopsAway })}
-                          </span>
-                        )}
+                        {(node.hopsAway != null || node.lastMessageHops != null) && (() => {
+                          const effectiveHops = getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
+                          return effectiveHops < 999 ? (
+                            <span className="stat" title={t('nodes.hops_away')}>
+                              🔗 {effectiveHops} {t('nodes.hop', { count: effectiveHops })}
+                            </span>
+                          ) : null;
+                        })()}
                         <DistanceDisplay
                           homeNode={homeNode}
                           targetNode={node}
@@ -1283,6 +1298,28 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                   }}
                 >
                   {positionLoading === selectedDMNode ? <span className="spinner"></span> : '📍'} {t('messages.exchange_position')}
+                </button>
+              )}
+
+              {/* Request Neighbor Info */}
+              {hasPermission('traceroute', 'write') && (
+                <button
+                  onClick={() => handleRequestNeighborInfo(selectedDMNode)}
+                  disabled={connectionStatus !== 'connected' || neighborInfoLoading === selectedDMNode}
+                  style={{
+                    flex: '1 1 auto',
+                    minWidth: '120px',
+                    padding: '0.5rem 1rem',
+                    backgroundColor: 'var(--ctp-blue)',
+                    color: 'var(--ctp-base)',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: connectionStatus !== 'connected' || neighborInfoLoading === selectedDMNode ? 'not-allowed' : 'pointer',
+                    opacity: connectionStatus !== 'connected' || neighborInfoLoading === selectedDMNode ? 0.5 : 1,
+                    fontSize: '0.9rem'
+                  }}
+                >
+                  {neighborInfoLoading === selectedDMNode ? <span className="spinner"></span> : '🏠'} {t('messages.request_neighbor_info')}
                 </button>
               )}
             </div>
