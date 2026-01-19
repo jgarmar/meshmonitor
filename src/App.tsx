@@ -251,6 +251,7 @@ function App() {
     solarMonitoringAzimuth,
     solarMonitoringDeclination,
     enableAudioNotifications,
+    tapbackEmojis,
     setMaxNodeAgeHours,
     setInactiveNodeThresholdHours,
     setInactiveNodeCheckIntervalMinutes,
@@ -3869,6 +3870,7 @@ function App() {
         message={emojiPickerMessage}
         onSelectEmoji={handleSendTapback}
         onClose={() => setEmojiPickerMessage(null)}
+        customEmojis={tapbackEmojis}
       />
 
       {showTracerouteHistoryModal && selectedDMNode && (
@@ -4104,6 +4106,7 @@ function App() {
             nodes={nodes}
             channels={channels}
             messages={messages}
+            channelMessages={channelMessages}
             currentNodeId={currentNodeId}
             temperatureUnit={temperatureUnit}
             telemetryHours={telemetryVisualizationHours}

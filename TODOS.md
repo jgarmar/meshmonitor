@@ -1,6 +1,119 @@
 # TODO List
 
+## Future Work (from v3.0 PR Review)
+
+### Database Performance & Configuration
+
+- [ ] **Connection pool configuration** - Make pool size configurable via environment variables (default 10 may be too low for high-traffic deployments) - `src/db/drivers/postgres.ts:43`, `src/db/drivers/mysql.ts:48`
+- [ ] **Large migration batching** - Add batch processing for large tables (e.g., 1000 rows at a time) to prevent memory issues - `src/cli/migrate-db.ts:579`
+- [ ] **Database index strategy** - Document and add indexes for commonly queried columns (nodeNum, messageId, etc.) for PostgreSQL/MySQL performance
+
+### Error Handling & Recovery
+
+- [ ] **Database driver reconnection** - Implement reconnection logic for transient failures (current pool error handlers only log) - `src/db/drivers/postgres.ts:74`, `src/db/drivers/mysql.ts:82`
+- [ ] **Migration rollback mechanism** - Add transaction support or backup verification before migration to handle partial failures - `src/cli/migrate-db.ts`
+
+### Schema & Type Safety
+
+- [x] **Boolean type consistency** - Fixed `positionOverrideEnabled` and `positionOverrideIsPrivate` to use proper boolean types across all schemas (SQLite mode:'boolean', PostgreSQL pgBoolean, MySQL myBoolean). Added migration 047 to convert existing INTEGER columns to BOOLEAN.
+- [x] **BIGINT coercion type guards** - Fixed `normalizeBigInts` to preserve prototype chains for Date objects and other special types using `Object.getPrototypeOf()` and `Object.create()`.
+- [x] **Dynamic sequence names** - Replaced hardcoded sequence list with dynamic discovery using `pg_get_serial_sequence()` to find all sequences owned by table columns.
+
+### Security
+
+- [ ] **CLI credential handling** - Support environment variable or config file input for database credentials (command line args visible in process lists) - `src/cli/migrate-db.ts:314`
+
+### Testing
+
+- [ ] **Integration tests** - Add integration tests for actual PostgreSQL/MySQL connections
+- [ ] **Migration error scenarios** - Add comprehensive error scenario testing for migration tool
+- [ ] **Performance testing** - Add performance testing for large dataset scenarios
+- [ ] **Database benchmarking** - Create performance benchmarking for different database backends
+
+---
+
 ## Current Sprint
+
+### v3.0.0 "MultiDatabase" Release
+
+**Completed:**
+- [x] Version bump: Update package.json, Chart.yaml, tauri.conf.json to 3.0.0
+- [x] Run npm install to regenerate package-lock.json
+- [x] Add auto-dismiss timer (5 seconds) to upgrade banner in AppBanners.tsx
+- [x] Update FAQ last modified date to 2026-01-19
+- [x] Write comprehensive RELEASE_NOTES.md for 3.0.0 with ~50 PRs documented
+- [x] Create test-db-migration.sh script for PostgreSQL/MySQL migration testing
+- [x] Integrate migration tests into system-tests.sh
+
+**Summary:**
+v3.0.0 introduces multi-database support (PostgreSQL, MySQL in addition to SQLite), customizable tapback reactions, script metadata for enhanced UI, and numerous bug fixes. The upgrade banner now auto-dismisses after 5 seconds.
+
+---
+
+### Script Metadata Enhancement (#1490)
+
+**Completed:**
+- [x] Add script metadata parsing to /api/scripts endpoint
+  - Parse `mm_meta:` blocks from script files
+  - Extract name, emoji, and language fields
+  - Auto-detect language from file extension as fallback
+- [x] Update TimerTriggersSection dropdown with enhanced display
+  - Show "emoji | name | filename | language" format
+- [x] Add Timer Name autofill on script selection
+  - Autofill Timer Name from script metadata when selecting a script
+  - Only autofill if user hasn't manually edited the name
+- [x] Update ScriptManagement list with enhanced display
+- [x] Update TriggerItem component with enhanced script display
+- [x] Add mm_meta blocks to all example scripts
+  - weather.py, battery-status.py, distance.py, lorem.py, api-query.py, PirateWeather.py
+  - lorem.sh, info.sh
+- [x] Update documentation
+  - Added Script Metadata section to developers/auto-responder-scripting.md
+  - Updated API Reference with new response format
+  - Added mm_meta section to user-scripts.md submission guidelines
+
+---
+
+### Auto Traceroute Settings Column Mismatch Fix
+
+**Completed:**
+- [x] Identified column name mismatch causing 500 error on `/api/settings/traceroute-nodes`
+  - SQLite migration 015 created `auto_traceroute_nodes` table with `addedAt` column
+  - Drizzle schema and PostgreSQL/MySQL used `createdAt` column
+  - Caused async repo queries to fail for SQLite
+- [x] Added migration 048 to rename `addedAt` to `createdAt` in SQLite
+- [x] Updated sync methods in `database.ts` to use `createdAt` instead of `addedAt`
+- [x] Build successful
+
+**Summary:**
+Fixed a bug where Auto Traceroute settings page returned 500 error because of a column name mismatch between the SQLite migration (`addedAt`) and the Drizzle schema (`createdAt`). This prevented the UI from loading initial settings, so the "Save Changes" button never became enabled.
+
+---
+
+### PostgreSQL Read Tracking Fix
+
+**Completed:**
+- [x] Add mark-as-read methods to NotificationsRepository (markChannelMessagesAsRead, markDMMessagesAsRead, markAllDMMessagesAsRead, markMessagesAsReadByIds)
+- [x] Update database.ts to call async repo methods for PostgreSQL/MySQL instead of returning 0
+- [x] Build and deploy to Docker container
+
+**Summary:**
+Fixed a bug where unread message indicators wouldn't clear when viewing channels/DMs on PostgreSQL databases. The mark-as-read functions were returning 0 immediately for PostgreSQL/MySQL with "not yet implemented" comments. Added proper implementations using raw SQL for efficient INSERT...SELECT operations with ON CONFLICT DO NOTHING.
+
+---
+
+### Server Start Notification Timing Fix
+
+**Completed:**
+- [x] Identified timing bug: server start notification sent before PostgreSQL database fully initialized
+- [x] Added `await databaseService.waitForReady()` before sending server start notification
+- [x] Wrapped notification code in async IIFE with error handling
+- [x] Build and deploy to Docker container
+
+**Summary:**
+Fixed a bug where server start notifications (via Apprise/Pushover) weren't being sent to PostgreSQL users. The notification was being sent before the database was fully initialized, so the query for users with `notifyOnServerEvents` enabled returned 0 results. Now the notification waits for the database to be ready.
+
+---
 
 ### Remote Admin LoRa Config Missing txEnabled Fields (#1328)
 

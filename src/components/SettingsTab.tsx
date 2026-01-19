@@ -18,6 +18,7 @@ import { type Theme, type NodeHopsCalculation, useSettings } from '../contexts/S
 import { useUI } from '../contexts/UIContext';
 import { LanguageSelector } from './LanguageSelector';
 import SectionNav from './SectionNav';
+import TapbackEmojiSettings from './TapbackEmojiSettings';
 
 type DistanceUnit = 'km' | 'mi';
 type TimeFormat = '12' | '24';
@@ -170,6 +171,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [isDocker, setIsDocker] = useState<boolean | null>(null);
   const [isRestarting, setIsRestarting] = useState(false);
+  const [databaseType, setDatabaseType] = useState<'sqlite' | 'postgres' | 'mysql' | null>(null);
   const { showToast } = useToast();
 
   // Fetch system status to determine if running in Docker
@@ -188,6 +190,24 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       }
     };
     fetchSystemStatus();
+  }, [baseUrl]);
+
+  // Fetch database type from health endpoint (public, no auth required)
+  useEffect(() => {
+    const fetchDatabaseType = async () => {
+      try {
+        const response = await fetch(`${baseUrl}/api/health`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.databaseType) {
+            setDatabaseType(data.databaseType);
+          }
+        }
+      } catch (error) {
+        logger.error('Failed to fetch database type:', error);
+      }
+    };
+    fetchDatabaseType();
   }, [baseUrl]);
 
   // Fetch packet monitor and other server-stored settings
@@ -652,10 +672,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         { id: 'settings-language', label: t('settings.language') },
         { id: 'settings-node-display', label: t('settings.node_display') },
         { id: 'settings-display-prefs', label: t('settings.display_prefs') },
+        { id: 'settings-tapback-emojis', label: t('settings.tapback_emojis', 'Tapback Emojis') },
         { id: 'settings-packet-monitor', label: t('settings.packet_monitor') },
         { id: 'settings-solar', label: t('settings.solar_monitoring') },
         { id: 'settings-backup', label: t('settings.system_backup', 'System Backup') },
-        { id: 'settings-maintenance', label: t('maintenance.title', 'Database Maintenance') },
+        // Only show Database Maintenance for SQLite - it uses SQLite-specific features like VACUUM
+        ...(databaseType === 'sqlite' ? [{ id: 'settings-maintenance', label: t('maintenance.title', 'Database Maintenance') }] : []),
         { id: 'settings-management', label: t('settings.settings_management') },
         { id: 'settings-danger', label: t('settings.danger_zone') },
       ]} />
@@ -978,6 +1000,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         <div className="settings-section">
           <CustomThemeManagement />
         </div>
+
+        <TapbackEmojiSettings />
 
         <div className="settings-section">
           <h3>{t('settings.reset_ui_positions')}</h3>

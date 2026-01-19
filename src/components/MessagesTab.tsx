@@ -257,6 +257,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   const [relayModalOpen, setRelayModalOpen] = useState(false);
   const [selectedRelayNode, setSelectedRelayNode] = useState<number | null>(null);
   const [selectedRxTime, setSelectedRxTime] = useState<Date | undefined>(undefined);
+  const [selectedMessageRssi, setSelectedMessageRssi] = useState<number | undefined>(undefined);
+  const [directNeighborStats, setDirectNeighborStats] = useState<Record<number, { avgRssi: number; packetCount: number; lastHeard: number }>>({});
 
   // Resizable send section (only on desktop)
   const {
@@ -278,14 +280,19 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   }, []);
 
   // Map nodes to the format expected by RelayNodeModal
-  const mappedNodes = nodes.map(node => ({
-    nodeNum: node.nodeNum,
-    nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
-    longName: node.user?.longName || `Node ${node.nodeNum}`,
-    shortName: node.user?.shortName || node.nodeNum.toString(16).substring(0, 4),
-    hopsAway: node.hopsAway,
-    role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
-  }));
+  const mappedNodes = nodes.map(node => {
+    const stats = directNeighborStats[node.nodeNum];
+    return {
+      nodeNum: node.nodeNum,
+      nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
+      longName: node.user?.longName || `Node ${node.nodeNum}`,
+      shortName: node.user?.shortName || node.nodeNum.toString(16).substring(0, 4),
+      hopsAway: node.hopsAway,
+      role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
+      avgDirectRssi: stats?.avgRssi,
+      heardDirectly: stats !== undefined,
+    };
+  });
 
   // Refs
   const dmMessageInputRef = useRef<HTMLInputElement>(null);
@@ -329,10 +336,27 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
 
   // Handle relay node click - opens modal to show potential relay nodes
   const handleRelayClick = useCallback(
-    (msg: MeshMessage) => {
+    async (msg: MeshMessage) => {
       if (msg.relayNode !== undefined && msg.relayNode !== null) {
         setSelectedRelayNode(msg.relayNode);
         setSelectedRxTime(msg.timestamp);
+        setSelectedMessageRssi(msg.rxRssi ?? undefined);
+
+        // Fetch direct neighbor stats
+        try {
+          const response = await fetch('/meshmonitor/api/direct-neighbors?hours=24', {
+            credentials: 'include'
+          });
+          if (response.ok) {
+            const data = await response.json();
+            if (data.success) {
+              setDirectNeighborStats(data.data);
+            }
+          }
+        } catch (error) {
+          console.error('Failed to fetch direct neighbor stats:', error);
+        }
+
         setRelayModalOpen(true);
       }
     },
@@ -1163,7 +1187,9 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                     // Check if traceroute failed (both directions have no valid data)
                     const forwardFailed = !recentTrace.route || recentTrace.route === 'null';
                     const returnFailed = !recentTrace.routeBack || recentTrace.routeBack === 'null';
-                    const isFailed = forwardFailed && returnFailed;
+                    const noData = forwardFailed && returnFailed;
+                    const isPending = noData && age < 1; // Less than 1 minute old
+                    const isFailed = noData && !isPending;
 
                     return (
                       <div className="traceroute-info" style={{ marginTop: '1rem' }}>
@@ -1191,6 +1217,15 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                         </div>
                         <div className="traceroute-age">
                           {t('messages.last_traced', { time: ageStr })}
+                          {isPending && (
+                            <span className="traceroute-pending-badge" style={{
+                              marginLeft: '0.5rem',
+                              color: 'var(--ctp-yellow)',
+                              fontWeight: 'bold'
+                            }}>
+                              ({t('messages.traceroute_pending', 'Pending')})
+                            </span>
+                          )}
                           {isFailed && (
                             <span className="traceroute-failed-badge" style={{
                               marginLeft: '0.5rem',
@@ -1384,6 +1419,10 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                             {selectedNode.keySecurityIssueDetails}
                           </div>
                         )}
+                        {/* Fallback: show raw details if no specific flag is set but details exist */}
+                        {!selectedNode.keyIsLowEntropy && !selectedNode.duplicateKeyDetected && !selectedNode.keyMismatchDetected && selectedNode.keySecurityIssueDetails && (
+                          <div>{selectedNode.keySecurityIssueDetails}</div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1417,6 +1456,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           relayNode={selectedRelayNode}
           rxTime={selectedRxTime}
           nodes={mappedNodes}
+          messageRssi={selectedMessageRssi}
           onNodeClick={(nodeId) => {
             setRelayModalOpen(false);
             setSelectedRelayNode(null);

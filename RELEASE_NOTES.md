@@ -1,92 +1,46 @@
-# Release Notes - v2.16.1
+# Release Notes - v3.0.1 Hotfix
 
 ## Overview
-This is a minor feature release that improves the emoji reaction picker with a modal UI to prevent accidental sends and expands the available emoji selection.
 
-For detailed release notes, see [RELEASE_NOTES_v2.16.1.md](./RELEASE_NOTES_v2.16.1.md)
-
-## Quick Summary
-- Improved emoji picker with modal UI (#500, #503)
-- Expanded from 7 to 24 emojis
-- Mobile-optimized to prevent accidental sends
-- Two-step selection process for better UX
+MeshMonitor 3.0.1 is a hotfix release addressing several bugs reported after the v3.0.0 "MultiDatabase" release.
 
 ---
 
-# Previous Release - v1.4.0
+## Bug Fixes
 
-## Overview
-This release included major dependency updates to modernize the codebase and improve compatibility with current Node.js versions.
+### Desktop Application
+- [#1509](https://github.com/Yeraze/meshmonitor/pull/1509) - **Fix Windows desktop app startup crash** - Include missing `db` directory in Tauri bundle, fixing "Cannot find module 'dist/db/drivers/sqlite.js'" error (Fixes [#1508](https://github.com/Yeraze/meshmonitor/issues/1508))
 
-## Major Updates
+### User Interface
+- [#1507](https://github.com/Yeraze/meshmonitor/pull/1507) - **Fix Audit Logs "Invalid Date" display** - Correctly handle timestamp format in audit log entries (Fixes [#1505](https://github.com/Yeraze/meshmonitor/issues/1505))
+- [#1507](https://github.com/Yeraze/meshmonitor/pull/1507) - **Hide Database Maintenance section for PostgreSQL/MySQL** - The maintenance feature is SQLite-specific; now correctly hidden for other database backends
+- [#1507](https://github.com/Yeraze/meshmonitor/pull/1507) - **Fix SQLite notification preferences save error** - Correct Drizzle schema column names to match actual SQLite table structure
+- [#1512](https://github.com/Yeraze/meshmonitor/pull/1512) - **Fix accuracy circles showing for hidden nodes** - Apply same filters (hide incomplete nodes, hide MQTT nodes) to accuracy and uncertainty circles (Fixes [#1411](https://github.com/Yeraze/meshmonitor/issues/1411))
 
-### Node.js 22 Support (#35)
-- Upgraded from Node 20 to Node 22 (Active LTS)
-- Updated Docker base images to use Node 22 Alpine
-- Updated CI/CD pipelines to test on Node 20.x and 22.x
-- Removed Node 18.x from test matrix (EOL April 2025)
+### Enhancements
+- [#1511](https://github.com/Yeraze/meshmonitor/pull/1511) - **Increase font size for hop count and message time** - Improved readability in Channels panel (Fixes [#1433](https://github.com/Yeraze/meshmonitor/issues/1433))
 
-### ESLint 9 Migration (#36)
-- Migrated from ESLint 8 to ESLint 9
-- Converted from legacy .eslintrc.cjs to flat config format (eslint.config.mjs)
-- Upgraded TypeScript ESLint to v8 for ESLint 9 compatibility
-- Updated eslint-plugin-react-hooks to v5.2.0
-- Added @eslint/compat for plugin compatibility
+---
 
-### React 19 & react-leaflet v5 (#38)
-- Upgraded React and react-dom from 18.3.1 to 19.0.0
-- Upgraded react-leaflet from 4.2.1 to 5.0.0
-- Updated @types/react and @types/react-dom to v19.0.0
-- Combined upgrade to resolve peer dependency requirements
+## Upgrade Instructions
 
-### jsdom v27 Upgrade (#37)
-- Upgraded jsdom from v24 to v27
-- Fixed server tests to be compatible with jsdom v27
-- Removed dynamic require() calls in tests
-- Added proper TypeScript types to mock functions
+### Docker
+```bash
+docker pull ghcr.io/yeraze/meshmonitor:3.0.1
+docker compose down && docker compose up -d
+```
 
-## Other Dependency Updates
-- **better-sqlite3**: Upgraded to v12.4.1 (required for Node 22+ support)
-- **@types/node**: Updated to v24.5.2
-- **tsx**: Upgraded to v4.20.6
-- **@testing-library/react**: Updated to v16.3.0
-- Various other @types packages updated to latest versions
+### Helm
+```bash
+helm repo update
+helm upgrade meshmonitor meshmonitor/meshmonitor --version 3.0.1
+```
 
-## Breaking Changes
-⚠️ **Node.js Version Requirements**
-- Node 18 is no longer officially supported (though may still work)
-- Minimum recommended version: Node 20.x
-- Officially tested on: Node 20.x and 22.x
+### Desktop
+Download the latest installer from the [Releases page](https://github.com/Yeraze/meshmonitor/releases/tag/v3.0.1).
 
-⚠️ **React 19**
-- React 19 may introduce breaking changes
-- Review the [React 19 migration guide](https://react.dev/blog/2024/12/05/react-19) for potential impacts
+---
 
-⚠️ **ESLint Configuration**
-- ESLint configuration now uses flat config format
-- If you have custom ESLint rules, you'll need to migrate them to the new format
+## Previous Release
 
-## Testing & Quality
-- ✅ All 76 tests passing
-- ✅ TypeScript compilation successful
-- ✅ ESLint configured and passing
-- ✅ Docker builds updated and tested
-- ✅ CI/CD pipelines updated and passing
-
-## Migration Notes
-If you're upgrading from a previous version:
-
-1. **Update Node.js**: Ensure you're running Node 20.x or 22.x
-2. **Clean install dependencies**: Run `rm -rf node_modules package-lock.json && npm install`
-3. **Update ESLint config**: If you have custom ESLint rules, migrate them to the flat config format
-4. **Test thoroughly**: Review React 19 changes and test your UI components
-
-## Contributors
-- Dependabot for initial PRs
-- Claude Code for dependency coordination and testing
-
-## Full Changelog
-- #35: feat: upgrade to Node.js 22 and update CI/CD pipelines
-- #36: feat: upgrade to ESLint 9 with flat config migration
-- #37: fix: resolve server test failures after jsdom v27 upgrade
-- #38: feat: upgrade to React 19 and react-leaflet v5
+For the full v3.0.0 "MultiDatabase" release notes including multi-database support, see the [v3.0.0 Release](https://github.com/Yeraze/meshmonitor/releases/tag/v3.0.0).

@@ -76,7 +76,38 @@ vi.mock('../../../services/database.js', () => {
           return true;
         })
       },
+      // Async methods for PostgreSQL/MySQL support
+      validateApiTokenAsync: vi.fn(async (token: string) => {
+        if (token === VALID_TEST_TOKEN) {
+          return { id: TEST_USER_ID, username: 'test-api-user', isActive: true, isAdmin: false };
+        }
+        return null;
+      }),
+      findUserByIdAsync: vi.fn(async (id: number) => {
+        if (id === TEST_USER_ID) {
+          return { id: TEST_USER_ID, username: 'test-api-user', isActive: true, isAdmin: false };
+        }
+        return null;
+      }),
+      checkPermissionAsync: vi.fn(async (userId: number, resource: string, action: string) => {
+        // Grant all permissions for test user by default
+        return true;
+      }),
+      updateApiTokenLastUsedAsync: vi.fn(async () => {}),
+      getUserPermissionSetAsync: vi.fn(async () => ({
+        nodes: { read: true, write: false },
+        messages: { read: true, write: true },
+        channel_0: { read: true, write: true },
+        channel_1: { read: true, write: true },
+        channel_2: { read: true, write: true },
+        channel_3: { read: true, write: true },
+        channel_4: { read: true, write: true },
+        channel_5: { read: true, write: true },
+        channel_6: { read: true, write: true },
+        channel_7: { read: true, write: true }
+      })),
       auditLog: vi.fn(),
+      auditLogAsync: vi.fn(async () => {}),
       getSetting: vi.fn((key: string) => {
         if (key === 'localNodeNum') return '2715451348';
         if (key === 'localNodeId') return '!a1b2c3d4';
@@ -85,11 +116,30 @@ vi.mock('../../../services/database.js', () => {
       // Nodes methods
       getAllNodes: vi.fn(() => testNodes),
       getActiveNodes: vi.fn(() => testNodes.slice(0, 2)),
+      // Channels methods
+      getAllChannels: vi.fn(() => [
+        { id: 0, name: 'Primary', role: 1 },
+        { id: 1, name: 'Secondary', role: 2 }
+      ]),
+      getChannelById: vi.fn((id: number) => {
+        if (id === 0) return { id: 0, name: 'Primary', role: 1 };
+        if (id === 1) return { id: 1, name: 'Secondary', role: 2 };
+        return null;
+      }),
+      getAllChannelsAsync: vi.fn(async () => [
+        { id: 0, name: 'Primary', role: 1 },
+        { id: 1, name: 'Secondary', role: 2 }
+      ]),
+      getChannelByIdAsync: vi.fn(async (id: number) => {
+        if (id === 0) return { id: 0, name: 'Primary', role: 1 };
+        if (id === 1) return { id: 1, name: 'Secondary', role: 2 };
+        return null;
+      }),
       // Messages methods
       getMessages: vi.fn(() => testMessages),
       getMessagesByChannel: vi.fn(() => testMessages),
       getMessagesAfterTimestamp: vi.fn(() => testMessages),
-      // Telemetry methods
+      // Telemetry methods (sync - legacy)
       getTelemetryByNode: vi.fn(() => testTelemetry),
       getTelemetryCountByNode: vi.fn(() => testTelemetry.length),
       getTelemetryByType: vi.fn(() => testTelemetry),
@@ -101,6 +151,13 @@ vi.mock('../../../services/database.js', () => {
         }
         return null;
       }),
+      // Telemetry methods (async)
+      getTelemetryByNodeAsync: vi.fn(async () => testTelemetry),
+      getTelemetryCountByNodeAsync: vi.fn(async () => testTelemetry.length),
+      getTelemetryByTypeAsync: vi.fn(async () => testTelemetry),
+      getTelemetryCountAsync: vi.fn(async () => testTelemetry.length),
+      // Nodes async method
+      getAllNodesAsync: vi.fn(async () => testNodes),
       // Traceroutes methods
       getAllTraceroutes: vi.fn(() => testTraceroutes)
     }
@@ -687,10 +744,10 @@ describe('POST /api/v1/messages', () => {
 
 describe('POST /api/v1/messages - Permission Tests', () => {
   it('should reject channel message without channel permission', async () => {
-    // Override permissionModel.check to deny channel_0:write
+    // Override checkPermissionAsync to deny channel_0:write
     const databaseService = await import('../../../services/database.js');
-    vi.mocked(databaseService.default.permissionModel.check).mockImplementation(
-      (userId: number, resource: string, action: string) => {
+    vi.mocked(databaseService.default.checkPermissionAsync).mockImplementation(
+      async (userId: number, resource: string, action: string) => {
         if (resource === 'channel_0' && action === 'write') return false;
         return true;
       }
@@ -713,10 +770,10 @@ describe('POST /api/v1/messages - Permission Tests', () => {
   });
 
   it('should reject direct message without messages permission', async () => {
-    // Override permissionModel.check to deny messages:write
+    // Override checkPermissionAsync to deny messages:write
     const databaseService = await import('../../../services/database.js');
-    vi.mocked(databaseService.default.permissionModel.check).mockImplementation(
-      (userId: number, resource: string, action: string) => {
+    vi.mocked(databaseService.default.checkPermissionAsync).mockImplementation(
+      async (userId: number, resource: string, action: string) => {
         if (resource === 'messages' && action === 'write') return false;
         return true;
       }

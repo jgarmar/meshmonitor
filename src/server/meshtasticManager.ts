@@ -62,7 +62,7 @@ export interface DeviceInfo {
   // Position precision fields
   positionGpsAccuracy?: number; // GPS accuracy in meters
   // Position override fields
-  positionOverrideEnabled?: number;
+  positionOverrideEnabled?: boolean;
   latitudeOverride?: number;
   longitudeOverride?: number;
   altitudeOverride?: number;
@@ -133,8 +133,11 @@ type TextMessage = {
   viaMqtt: boolean; // Capture whether message was received via MQTT bridge
   rxSnr?: number; // SNR of received packet
   rxRssi?: number; // RSSI of received packet
-  wantAck?: number; // Expect ACK for Virtual Node messages
+  wantAck?: boolean; // Expect ACK for Virtual Node messages
   deliveryState?: string; // Track delivery for Virtual Node messages
+  ackFailed?: boolean; // Whether ACK failed
+  routingErrorReceived?: boolean; // Whether a routing error was received
+  ackFromNode?: number; // Node that sent the ACK
   createdAt: number;
 };
 
@@ -218,8 +221,11 @@ class MeshtasticManager {
         // Channel message - send to channel, no specific destination
         return await this.sendTextMessage(text, channel, undefined, replyId);
       } else {
-        // DM - send to specific node (channel 0)
-        return await this.sendTextMessage(text, 0, destination, replyId);
+        // DM - use the channel we last heard the target node on
+        const targetNode = databaseService.getNode(destination);
+        const dmChannel = (targetNode?.channel !== undefined && targetNode?.channel !== null) ? targetNode.channel : 0;
+        logger.debug(`📨 Queue DM to ${destination} - Using channel: ${dmChannel}`);
+        return await this.sendTextMessage(text, dmChannel, destination, replyId);
       }
     });
 
@@ -231,7 +237,7 @@ class MeshtasticManager {
    * Check if estimated position recalculation is needed and perform it.
    * This is triggered by migration 038 which deletes old estimates and sets a flag.
    */
-  private checkAndRecalculatePositions(): void {
+  private async checkAndRecalculatePositions(): Promise<void> {
     try {
       const recalculateFlag = databaseService.getSetting('recalculate_estimated_positions');
       if (recalculateFlag !== 'pending') {
@@ -266,7 +272,7 @@ class MeshtasticManager {
           }
 
           // Process the traceroute for position estimation
-          this.estimateIntermediatePositions(fullRoute, traceroute.timestamp, snrArray);
+          await this.estimateIntermediatePositions(fullRoute, traceroute.timestamp, snrArray);
           processedCount++;
         } catch (err) {
           logger.debug(`Skipping traceroute ${traceroute.id} due to error: ${err}`);
@@ -634,14 +640,15 @@ class MeshtasticManager {
     this.tracerouteInterval = setInterval(async () => {
       if (this.isConnected && this.localNodeInfo) {
         try {
-          const targetNode = databaseService.getNodeNeedingTraceroute(this.localNodeInfo.nodeNum);
+          // Use async version which supports PostgreSQL/MySQL
+          const targetNode = await databaseService.getNodeNeedingTracerouteAsync(this.localNodeInfo.nodeNum);
           if (targetNode) {
             const channel = targetNode.channel ?? 0; // Use node's channel, default to 0
             const targetName = targetNode.longName || targetNode.nodeId;
             logger.info(`🗺️ Auto-traceroute: Sending traceroute to ${targetName} (${targetNode.nodeId}) on channel ${channel}`);
 
             // Log the auto-traceroute attempt to database
-            databaseService.logAutoTracerouteAttempt(targetNode.nodeNum, targetName);
+            await databaseService.logAutoTracerouteAttemptAsync(targetNode.nodeNum, targetName);
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
 
             await this.sendTraceroute(targetNode.nodeNum, channel);
@@ -2402,7 +2409,7 @@ class MeshtasticManager {
           rxSnr: meshPacket.rxSnr ?? (meshPacket as any).rx_snr, // SNR of received packet
           rxRssi: meshPacket.rxRssi ?? (meshPacket as any).rx_rssi, // RSSI of received packet
           requestId: context?.virtualNodeRequestId, // For Virtual Node messages, preserve packet ID for ACK matching
-          wantAck: context?.virtualNodeRequestId ? 1 : undefined, // Expect ACK for Virtual Node messages
+          wantAck: context?.virtualNodeRequestId ? true : undefined, // Expect ACK for Virtual Node messages
           deliveryState: context?.virtualNodeRequestId ? 'pending' : undefined, // Track delivery for Virtual Node messages
           createdAt: Date.now()
         };
@@ -3407,7 +3414,7 @@ class MeshtasticManager {
 
       // If this was an auto-traceroute, mark it as successful in the log
       if (this.pendingAutoTraceroutes.has(fromNum)) {
-        databaseService.updateAutoTracerouteResultByNode(fromNum, true);
+        await databaseService.updateAutoTracerouteResultByNodeAsync(fromNum, true);
         this.pendingAutoTraceroutes.delete(fromNum);
         logger.debug(`🗺️ Auto-traceroute to ${fromNodeId} marked as successful`);
       }
@@ -3466,12 +3473,12 @@ class MeshtasticManager {
 
         // Estimate positions for intermediate nodes without GPS
         // Process forward route (responder -> requester) with SNR weighting
-        this.estimateIntermediatePositions(fullRoute, timestamp, snrTowards);
+        await this.estimateIntermediatePositions(fullRoute, timestamp, snrTowards);
 
         // Process return route if it exists (requester -> responder) with SNR weighting
         if (routeBack.length > 0) {
           const fullReturnRoute = [toNum, ...routeBack, fromNum];
-          this.estimateIntermediatePositions(fullReturnRoute, timestamp, snrBack);
+          await this.estimateIntermediatePositions(fullReturnRoute, timestamp, snrBack);
         }
       } catch (error) {
         logger.error('❌ Error calculating route segment distances:', error);
@@ -3497,7 +3504,7 @@ class MeshtasticManager {
       // Handle successful ACKs (error_reason = 0 means success)
       if (errorReason === 0 && requestId) {
         // Look up the original message to check if this ACK is from the intended recipient
-        const originalMessage = databaseService.getMessageByRequestId(requestId);
+        const originalMessage = await databaseService.getMessageByRequestIdAsync(requestId);
 
         if (originalMessage) {
           const targetNodeId = originalMessage.toNodeId;
@@ -3548,13 +3555,24 @@ class MeshtasticManager {
         route: routing.route || []
       });
 
+      // Look up the original message once for all error handling
+      const originalMessage = requestId ? await databaseService.getMessageByRequestIdAsync(requestId) : null;
+      if (!originalMessage) {
+        // No original message found - this is likely an external routing packet we didn't send
+        logger.debug(`⚠️  Routing error for unknown requestId ${requestId} (not our message)`);
+        return;
+      }
+
+      const targetNodeId = originalMessage.toNodeId;
+      const localNodeId = databaseService.getSetting('localNodeId');
+      const isDM = originalMessage.channel === -1;
+
       // Detect PKI/encryption errors and flag the target node
-      if (isPkiError(errorReason)) {
+      // Only flag if the error is from our local radio (we couldn't encrypt to target)
+      if (isPkiError(errorReason) && fromNodeId === localNodeId) {
         // PKI_FAILED or PKI_UNKNOWN_PUBKEY - indicates key mismatch
-        const originalMessage = requestId ? databaseService.getMessageByRequestId(requestId) : null;
-        if (originalMessage && originalMessage.toNodeNum) {
+        if (originalMessage.toNodeNum) {
           const targetNodeNum = originalMessage.toNodeNum;
-          const targetNodeId = originalMessage.toNodeId;
           const errorDescription = errorReason === RoutingError.PKI_FAILED
             ? 'PKI encryption failed - possible key mismatch. Use "Exchange Node Info" or purge node data to refresh keys.'
             : 'Remote node missing public key - possible key mismatch. Use "Exchange Node Info" or purge node data to refresh keys.';
@@ -3574,15 +3592,21 @@ class MeshtasticManager {
         }
       }
 
-      // Update message in database to mark delivery as failed
-      if (requestId) {
-        logger.info(`❌ Marking message ${requestId} as failed due to routing error: ${errorName}`);
-        databaseService.updateMessageDeliveryState(requestId, 'failed');
-        // Emit WebSocket event for real-time delivery failure update
-        dataEventEmitter.emitRoutingUpdate({ requestId, status: 'nak', errorReason: errorName });
-        // Notify message queue service of failure
-        messageQueueService.handleFailure(requestId, errorName);
+      // For DMs, only mark as failed if the routing error comes from the target node
+      // Intermediate nodes may report errors (e.g., NO_CHANNEL) but the message might have
+      // reached the target via a different route
+      if (isDM && fromNodeId !== targetNodeId) {
+        logger.debug(`⚠️  Ignoring routing error from intermediate node ${fromNodeId} for DM to ${targetNodeId}`);
+        return;
       }
+
+      // Update message in database to mark delivery as failed
+      logger.info(`❌ Marking message ${requestId} as failed due to routing error from ${isDM ? 'target' : 'mesh'}: ${errorName}`);
+      databaseService.updateMessageDeliveryState(requestId, 'failed');
+      // Emit WebSocket event for real-time delivery failure update
+      dataEventEmitter.emitRoutingUpdate({ requestId, status: 'nak', errorReason: errorName });
+      // Notify message queue service of failure
+      messageQueueService.handleFailure(requestId, errorName);
     } catch (error) {
       logger.error('❌ Error processing routing error message:', error);
     }
@@ -3607,7 +3631,7 @@ class MeshtasticManager {
    * @param timestamp - Timestamp for the telemetry record
    * @param snrArray - Optional array of SNR values (raw, divide by 4 to get dB) for each hop
    */
-  private estimateIntermediatePositions(routePath: number[], timestamp: number, snrArray?: number[]): void {
+  private async estimateIntermediatePositions(routePath: number[], timestamp: number, snrArray?: number[]): Promise<void> {
     // Time decay constant: half-life of 24 hours (in milliseconds)
     // After 24 hours, an old estimate has half the weight of a new one
     const HALF_LIFE_MS = 24 * 60 * 60 * 1000;
@@ -3688,7 +3712,7 @@ class MeshtasticManager {
         }
 
         // Get previous estimates for time-weighted averaging
-        const previousEstimates = databaseService.getRecentEstimatedPositions(nodeNum, 10);
+        const previousEstimates = await databaseService.getRecentEstimatedPositionsAsync(nodeNum, 10);
         const now = Date.now();
 
         let finalLat: number;
@@ -5433,6 +5457,7 @@ class MeshtasticManager {
 
     try {
       // Use the new protobuf service to create a proper text message
+      // Note: PKI encryption is handled automatically by the firmware if it has the recipient's public key
       const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji);
 
       await this.transport.send(textMessageData);
@@ -5484,7 +5509,7 @@ class MeshtasticManager {
           replyId: replyId || undefined,
           emoji: emoji || undefined,
           requestId: messageId, // Save requestId for routing error matching
-          wantAck: 1, // Request acknowledgment for this message
+          wantAck: true, // Request acknowledgment for this message
           deliveryState: 'pending', // Initial delivery state
           createdAt: Date.now()
         };
@@ -6882,6 +6907,9 @@ class MeshtasticManager {
         logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already welcomed at ${new Date(node.welcomedAt).toISOString()}`);
         return;
       }
+
+      // Log diagnostic info for nodes being considered for welcome
+      logger.info(`👋 Auto-welcome check for ${nodeId}: welcomedAt=${node.welcomedAt} (${typeof node.welcomedAt}), longName=${node.longName}, createdAt=${node.createdAt ? new Date(node.createdAt).toISOString() : 'null'}`);
 
       // Check all conditions BEFORE acquiring the lock
       // This allows subsequent calls to re-evaluate conditions if they change
@@ -8799,7 +8827,7 @@ class MeshtasticManager {
 
       // Add position override fields
       if (node.positionOverrideEnabled !== null && node.positionOverrideEnabled !== undefined) {
-        deviceInfo.positionOverrideEnabled = node.positionOverrideEnabled;
+        deviceInfo.positionOverrideEnabled = Boolean(node.positionOverrideEnabled);
       }
       if (node.latitudeOverride !== null && node.latitudeOverride !== undefined) {
         deviceInfo.latitudeOverride = node.latitudeOverride;

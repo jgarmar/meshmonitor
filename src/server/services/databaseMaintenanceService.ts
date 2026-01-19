@@ -33,6 +33,7 @@ export interface MaintenanceStatus {
   lastRunTime: number | null;
   lastRunStats: MaintenanceStats | null;
   nextScheduledRun: string | null;
+  databaseType: 'sqlite' | 'postgres' | 'mysql';
   settings: {
     messageRetentionDays: number;
     tracerouteRetentionDays: number;
@@ -277,6 +278,7 @@ class DatabaseMaintenanceService {
       lastRunTime: this.lastRunTime,
       lastRunStats: this.lastRunStats,
       nextScheduledRun,
+      databaseType: databaseService.drizzleDbType,
       settings: {
         messageRetentionDays: parseInt(databaseService.getSetting('messageRetentionDays') || '30', 10),
         tracerouteRetentionDays: parseInt(databaseService.getSetting('tracerouteRetentionDays') || '30', 10),
@@ -291,6 +293,13 @@ class DatabaseMaintenanceService {
    */
   getDatabaseSize(): number {
     return databaseService.getDatabaseSize();
+  }
+
+  /**
+   * Get the current database size in bytes - async version for PostgreSQL/MySQL
+   */
+  async getDatabaseSizeAsync(): Promise<number> {
+    return databaseService.getDatabaseSizeAsync();
   }
 
   /**
