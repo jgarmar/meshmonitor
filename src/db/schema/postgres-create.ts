@@ -245,6 +245,10 @@ export const POSTGRES_SCHEMA_SQL = `
     "prefixWithNodeName" BOOLEAN DEFAULT false,
     "appriseEnabled" BOOLEAN DEFAULT true,
     "appriseUrls" TEXT,
+    "enabledChannels" TEXT,
+    "monitoredNodes" TEXT,
+    whitelist TEXT,
+    blacklist TEXT,
     "notifyOnMqtt" BOOLEAN DEFAULT true,
     "createdAt" BIGINT NOT NULL,
     "updatedAt" BIGINT NOT NULL
@@ -273,7 +277,9 @@ export const POSTGRES_SCHEMA_SQL = `
     payload_preview TEXT,
     metadata TEXT,
     direction TEXT,
-    created_at BIGINT
+    created_at BIGINT,
+    decrypted_by TEXT,
+    decrypted_channel_id INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS backup_history (
@@ -290,14 +296,20 @@ export const POSTGRES_SCHEMA_SQL = `
   );
 
   CREATE TABLE IF NOT EXISTS upgrade_history (
-    id SERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     "fromVersion" TEXT NOT NULL,
     "toVersion" TEXT NOT NULL,
-    "upgradeType" TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    "startedAt" BIGINT NOT NULL,
+    "deploymentMethod" TEXT NOT NULL,
+    status TEXT NOT NULL,
+    progress INTEGER DEFAULT 0,
+    "currentStep" TEXT,
+    logs TEXT,
+    "backupPath" TEXT,
+    "startedAt" BIGINT,
     "completedAt" BIGINT,
-    error TEXT
+    "initiatedBy" TEXT,
+    "errorMessage" TEXT,
+    "rollbackAvailable" BOOLEAN
   );
 
   CREATE TABLE IF NOT EXISTS custom_themes (
@@ -360,8 +372,34 @@ export const POSTGRES_SCHEMA_SQL = `
     created_at BIGINT
   );
 
+  CREATE TABLE IF NOT EXISTS channel_database (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    psk TEXT NOT NULL,
+    "pskLength" INTEGER NOT NULL,
+    description TEXT,
+    "isEnabled" BOOLEAN NOT NULL DEFAULT true,
+    "decryptedPacketCount" INTEGER NOT NULL DEFAULT 0,
+    "lastDecryptedAt" BIGINT,
+    "createdBy" INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    "createdAt" BIGINT NOT NULL,
+    "updatedAt" BIGINT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS channel_database_permissions (
+    id SERIAL PRIMARY KEY,
+    "userId" INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    "channelDatabaseId" INTEGER NOT NULL REFERENCES channel_database(id) ON DELETE CASCADE,
+    "canRead" BOOLEAN NOT NULL DEFAULT false,
+    "grantedBy" INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    "grantedAt" BIGINT NOT NULL,
+    UNIQUE("userId", "channelDatabaseId")
+  );
+
   CREATE INDEX IF NOT EXISTS idx_auto_traceroute_timestamp ON auto_traceroute_log(timestamp DESC);
   CREATE INDEX IF NOT EXISTS idx_auto_key_repair_log_timestamp ON auto_key_repair_log(timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_channel_database_enabled ON channel_database("isEnabled");
+  CREATE INDEX IF NOT EXISTS idx_channel_database_permissions_user ON channel_database_permissions("userId");
 
   CREATE INDEX IF NOT EXISTS idx_nodes_nodeid ON nodes("nodeId");
   CREATE INDEX IF NOT EXISTS idx_nodes_lastheard ON nodes("lastHeard");
@@ -405,4 +443,6 @@ export const POSTGRES_TABLE_NAMES = [
   'auto_traceroute_log',
   'auto_key_repair_state',
   'auto_key_repair_log',
+  'channel_database',
+  'channel_database_permissions',
 ];

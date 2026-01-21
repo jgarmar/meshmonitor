@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { PacketLog, PacketFilters } from '../types/packet';
 import { clearPackets, exportPackets } from '../services/packetApi';
+import apiService from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { useSettings } from '../contexts/SettingsContext';
 import { useDeviceConfig, useNodes } from '../hooks/useServerData';
@@ -157,15 +158,8 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
 
     const fetchNeighborStats = async () => {
       try {
-        const response = await fetch('/meshmonitor/api/direct-neighbors?hours=24', {
-          credentials: 'include'
-        });
-        if (response.ok) {
-          const data = await response.json();
-          if (data.success) {
-            setDirectNeighborStats(data.data);
-          }
-        }
+        const stats = await apiService.getDirectNeighborStats(24);
+        setDirectNeighborStats(stats);
       } catch (error) {
         console.error('Failed to fetch direct neighbor stats:', error);
       }
@@ -218,15 +212,8 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
 
     // Fetch direct neighbor stats (refresh to ensure up-to-date data)
     try {
-      const response = await fetch('/meshmonitor/api/direct-neighbors?hours=24', {
-        credentials: 'include'
-      });
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setDirectNeighborStats(data.data);
-        }
-      }
+      const stats = await apiService.getDirectNeighborStats(24);
+      setDirectNeighborStats(stats);
     } catch (error) {
       console.error('Failed to fetch direct neighbor stats:', error);
     }
@@ -360,19 +347,26 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     }
 
     // Fall back to matching just the lowest byte
+    // A relay MUST be a direct neighbor, so filter to only plausible candidates
     const byteMatches = relayCapableNodes.filter(node => (node.nodeNum & 0xFF) === relayNode);
-    if (byteMatches.length === 1) {
-      return byteMatches[0].user?.shortName || `!${byteMatches[0].nodeNum.toString(16).padStart(8, '0')}`;
+
+    // Filter to only direct neighbors or nodes within 1 hop - a relay must be directly connected
+    const plausibleRelays = byteMatches.filter(node =>
+      directNeighborStats[node.nodeNum] !== undefined || (node.hopsAway !== undefined && node.hopsAway <= 1)
+    );
+
+    if (plausibleRelays.length === 1) {
+      return plausibleRelays[0].user?.shortName || `!${plausibleRelays[0].nodeNum.toString(16).padStart(8, '0')}`;
     }
-    if (byteMatches.length > 1) {
-      // Multiple matches - pick the one with closest RSSI
-      const closest = findClosestByRssi(byteMatches);
+    if (plausibleRelays.length > 1) {
+      // Multiple plausible matches - pick the one with closest RSSI
+      const closest = findClosestByRssi(plausibleRelays);
       if (closest) {
         return closest.user?.shortName || `!${closest.nodeNum.toString(16).padStart(8, '0')}`;
       }
     }
 
-    // No matches found - return hex byte as fallback
+    // No plausible matches found - return hex byte as fallback
     return `0x${relayNode.toString(16).padStart(2, '0').toUpperCase()}`;
   };
 
@@ -743,7 +737,35 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                             {packet.encrypted ? (
                               <span className="encrypted-indicator">🔒 {t('packet_monitor.encrypted')}</span>
                             ) : (
-                              <span className="content-preview">{packet.payload_preview || t('packet_monitor.no_preview')}</span>
+                              <span className="content-preview">
+                                {packet.decrypted_by === 'server' && (
+                                  <span
+                                    className="decryption-indicator server"
+                                    title={t('packet_monitor.decrypted_by_server')}
+                                    style={{
+                                      marginRight: '0.25rem',
+                                      color: 'var(--ctp-blue)',
+                                      cursor: 'help'
+                                    }}
+                                  >
+                                    🔑
+                                  </span>
+                                )}
+                                {packet.decrypted_by === 'node' && (
+                                  <span
+                                    className="decryption-indicator node"
+                                    title={t('packet_monitor.decrypted_by_node')}
+                                    style={{
+                                      marginRight: '0.25rem',
+                                      color: 'var(--ctp-green)',
+                                      cursor: 'help'
+                                    }}
+                                  >
+                                    🔓
+                                  </span>
+                                )}
+                                {packet.payload_preview || t('packet_monitor.no_preview')}
+                              </span>
                             )}
                           </td>
                         </tr>
@@ -794,6 +816,8 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                     portnum: selectedPacket.portnum,
                     portnum_name: selectedPacket.portnum_name,
                     encrypted: selectedPacket.encrypted,
+                    decrypted_by: selectedPacket.decrypted_by,
+                    decrypted_channel_id: selectedPacket.decrypted_channel_id,
                     snr: selectedPacket.snr,
                     rssi: selectedPacket.rssi,
                     hop_limit: selectedPacket.hop_limit,

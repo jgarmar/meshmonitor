@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, Circle } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, Circle, useMap } from 'react-leaflet';
 import type { Marker as LeafletMarker } from 'leaflet';
 import { DeviceInfo } from '../types/device';
 import { TabType } from '../types/ui';
 import { ResourceType } from '../types/permission';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
 import { generateArrowMarkers } from '../utils/mapHelpers.tsx';
-import { getHardwareModelName, getRoleName, isNodeComplete, parseNodeId, TRACEROUTE_DISPLAY_HOURS } from '../utils/nodeHelpers';
+import { getEffectivePosition, getHardwareModelName, getRoleName, hasValidEffectivePosition, isNodeComplete, parseNodeId, TRACEROUTE_DISPLAY_HOURS } from '../utils/nodeHelpers';
 import { formatTime, formatDateTime, formatRelativeTime } from '../utils/datetime';
 import { getDistanceToNode } from '../utils/distance';
 import { getTilesetById } from '../config/tilesets';
@@ -53,6 +53,10 @@ interface NodesTabProps {
   selectedNodeTraceroute: React.ReactNode;
   /** Set of visible node numbers for filtering neighbor info segments (Issue #1149) */
   visibleNodeNums?: Set<number>;
+  /** Set of node numbers involved in the selected traceroute (for filtering map markers) */
+  tracerouteNodeNums?: Set<number> | null;
+  /** Bounding box of the selected traceroute for zoom-to-fit */
+  tracerouteBounds?: [[number, number], [number, number]] | null;
 }
 
 // Helper function to check if a date is today
@@ -127,6 +131,42 @@ const SelectedTracerouteLayer = React.memo<{ traceroute: React.ReactNode; enable
   }
 );
 
+/**
+ * Controller component that zooms the map to fit the traceroute bounds
+ * Must be placed inside MapContainer to access the map instance
+ */
+const TracerouteBoundsController: React.FC<{
+  bounds: [[number, number], [number, number]] | null | undefined;
+}> = ({ bounds }) => {
+  const map = useMap();
+  const prevBoundsRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!bounds) {
+      prevBoundsRef.current = null;
+      return;
+    }
+
+    // Create a string key for the bounds to detect changes
+    const boundsKey = JSON.stringify(bounds);
+
+    // Only zoom if bounds actually changed (prevents re-zoom on every render)
+    if (boundsKey !== prevBoundsRef.current) {
+      prevBoundsRef.current = boundsKey;
+
+      // Use fitBounds to zoom to show the entire traceroute
+      map.fitBounds(bounds, {
+        padding: [50, 50], // Add padding around the bounds
+        animate: true,
+        duration: 0.5,
+        maxZoom: 15, // Don't zoom in too close for short routes
+      });
+    }
+  }, [bounds, map]);
+
+  return null;
+};
+
 const NodesTabComponent: React.FC<NodesTabProps> = ({
   processedNodes,
   shouldShowData,
@@ -138,6 +178,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   traceroutePathsElements,
   selectedNodeTraceroute,
   visibleNodeNums,
+  tracerouteNodeNums,
+  tracerouteBounds,
 }) => {
   const { t } = useTranslation();
   // Use context hooks
@@ -432,6 +474,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const processedNodesRef = useRef(processedNodes);
   const setSelectedNodeIdRef = useRef(setSelectedNodeId);
   const centerMapOnNodeRef = useRef(centerMapOnNode);
+  const showRouteRef = useRef(showRoute);
 
   // Stable ref callback for markers to prevent unnecessary re-renders
   const handleMarkerRef = React.useCallback((ref: LeafletMarker | null, nodeId: string | undefined) => {
@@ -450,7 +493,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const handleNodeClick = useCallback((node: DeviceInfo) => {
     return () => {
       setSelectedNodeId(node.user?.id || null);
-      centerMapOnNode(node);
+      // When showRoute is enabled, let TracerouteBoundsController handle the zoom
+      // to fit the entire traceroute path instead of just centering on the node
+      if (!showRoute) {
+        centerMapOnNode(node);
+      }
       // Auto-collapse node list on mobile when a node with position is clicked
       if (window.innerWidth <= 768) {
         const hasPosition = node.position &&
@@ -461,7 +508,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         }
       }
     };
-  }, [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed]);
+  }, [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed, showRoute]);
 
   const handleFavoriteClick = useCallback((node: DeviceInfo) => {
     return (e: React.MouseEvent) => toggleFavorite(node, e);
@@ -706,6 +753,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     processedNodesRef.current = processedNodes;
     setSelectedNodeIdRef.current = setSelectedNodeId;
     centerMapOnNodeRef.current = centerMapOnNode;
+    showRouteRef.current = showRoute;
   });
 
   // Track if listeners have been set up
@@ -729,10 +777,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         if (nodeEntry) {
           const nodeId = nodeEntry[0];
           setSelectedNodeIdRef.current(nodeId);
-          // Find the node to center on it
-          const node = processedNodesRef.current.find(n => n.user?.id === nodeId);
-          if (node) {
-            centerMapOnNodeRef.current(node);
+          // When showRoute is enabled, let TracerouteBoundsController handle the zoom
+          // Otherwise, center on the clicked node
+          if (!showRouteRef.current) {
+            const node = processedNodesRef.current.find(n => n.user?.id === nodeId);
+            if (node) {
+              centerMapOnNodeRef.current(node);
+            }
           }
         }
       };
@@ -868,22 +919,25 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     });
   }, [sortField, sortDirection, nodeHopsCalculation, traceroutes, currentNodeNum]);
 
-  // Calculate nodes with position
-  const nodesWithPosition = processedNodes.filter(node =>
-    node.position &&
-    node.position.latitude != null &&
-    node.position.longitude != null
-  );
+  // Calculate nodes with position - uses effective position (respects position overrides, Issue #1526)
+  const nodesWithPosition = processedNodes.filter(node => hasValidEffectivePosition(node));
 
   // Memoize node positions to prevent React-Leaflet from resetting marker positions
   // Creating new [lat, lng] arrays causes React-Leaflet to move markers, destroying spiderfier state
+  // Uses getEffectivePosition to respect position overrides (Issue #1526)
   const nodePositions = React.useMemo(() => {
     const posMap = new Map<number, [number, number]>();
     nodesWithPosition.forEach(node => {
-      posMap.set(node.nodeNum, [node.position!.latitude, node.position!.longitude]);
+      const effectivePos = getEffectivePosition(node);
+      if (effectivePos.latitude != null && effectivePos.longitude != null) {
+        posMap.set(node.nodeNum, [effectivePos.latitude, effectivePos.longitude]);
+      }
     });
     return posMap;
-  }, [nodesWithPosition.map(n => `${n.nodeNum}-${n.position!.latitude}-${n.position!.longitude}`).join(',')]);
+  }, [nodesWithPosition.map(n => {
+    const pos = getEffectivePosition(n);
+    return `${n.nodeNum}-${pos.latitude}-${pos.longitude}`;
+  }).join(',')]);
 
   // Calculate center point of all nodes for initial map view
   // Use saved map center from localStorage if available, otherwise calculate from nodes
@@ -899,16 +953,26 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     }
 
     // Prioritize the locally connected node's position for first-time visitors
+    // Uses effective position to respect position overrides (Issue #1526)
     if (currentNodeId) {
       const localNode = nodesWithPosition.find(node => node.user?.id === currentNodeId);
-      if (localNode && localNode.position) {
-        return [localNode.position.latitude, localNode.position.longitude];
+      if (localNode) {
+        const effectivePos = getEffectivePosition(localNode);
+        if (effectivePos.latitude != null && effectivePos.longitude != null) {
+          return [effectivePos.latitude, effectivePos.longitude];
+        }
       }
     }
 
-    // Fall back to average position of all nodes
-    const avgLat = nodesWithPosition.reduce((sum, node) => sum + node.position!.latitude, 0) / nodesWithPosition.length;
-    const avgLng = nodesWithPosition.reduce((sum, node) => sum + node.position!.longitude, 0) / nodesWithPosition.length;
+    // Fall back to average position of all nodes (using effective positions)
+    const avgLat = nodesWithPosition.reduce((sum, node) => {
+      const pos = getEffectivePosition(node);
+      return sum + (pos.latitude ?? 0);
+    }, 0) / nodesWithPosition.length;
+    const avgLng = nodesWithPosition.reduce((sum, node) => {
+      const pos = getEffectivePosition(node);
+      return sum + (pos.longitude ?? 0);
+    }, 0) / nodesWithPosition.length;
     return [avgLat, avgLng];
   };
 
@@ -1293,6 +1357,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     />
                     <span>Show Traceroute</span>
                   </label>
+                  {tracerouteNodeNums && (
+                    <button
+                      className="dismiss-traceroute-btn"
+                      onClick={() => setSelectedNodeId(null)}
+                      title="Clear the active traceroute and show all nodes"
+                    >
+                      Dismiss Traceroute
+                    </button>
+                  )}
                   <label className="map-control-item">
                     <input
                       type="checkbox"
@@ -1355,6 +1428,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 centerTarget={mapCenterTarget}
                 onCenterComplete={handleCenterComplete}
               />
+              <TracerouteBoundsController bounds={tracerouteBounds} />
               {getTilesetById(activeTileset, customTilesets).isVector ? (
                 <VectorTileLayer
                   url={getTilesetById(activeTileset, customTilesets).url}
@@ -1374,7 +1448,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <SpiderfierController ref={spiderfierRef} zoomLevel={mapZoom} />
               <MapLegend />
               {nodesWithPosition
-                .filter(node => (showMqttNodes || !node.viaMqtt) && (showIncompleteNodes || isNodeComplete(node)) && (showEstimatedPositions || !node.user?.id || !nodesWithEstimatedPosition.has(node.user.id)))
+                .filter(node => {
+                  // Apply standard filters
+                  if (!showMqttNodes && node.viaMqtt) return false;
+                  if (!showIncompleteNodes && !isNodeComplete(node)) return false;
+                  if (!showEstimatedPositions && node.user?.id && nodesWithEstimatedPosition.has(node.user.id)) return false;
+                  // When traceroute is active, only show nodes involved in the traceroute
+                  if (tracerouteNodeNums && !tracerouteNodeNums.has(node.nodeNum)) return false;
+                  return true;
+                })
                 .map(node => {
                 const roleNum = typeof node.user?.role === 'string'
                   ? parseInt(node.user.role, 10)
@@ -1639,7 +1721,17 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
               {/* Draw position accuracy circles for all nodes with precision data */}
               {showAccuracyCircles && nodesWithPosition
-                .filter(node => node.positionPrecisionBits !== undefined && node.positionPrecisionBits !== null && node.positionPrecisionBits > 0 && node.positionPrecisionBits < 32 && (showMqttNodes || !node.viaMqtt) && (showIncompleteNodes || isNodeComplete(node)))
+                .filter(node => {
+                  // Check precision data exists
+                  if (node.positionPrecisionBits === undefined || node.positionPrecisionBits === null) return false;
+                  if (node.positionPrecisionBits <= 0 || node.positionPrecisionBits >= 32) return false;
+                  // Apply standard filters
+                  if (!showMqttNodes && node.viaMqtt) return false;
+                  if (!showIncompleteNodes && !isNodeComplete(node)) return false;
+                  // When traceroute is active, only show circles for nodes in the traceroute
+                  if (tracerouteNodeNums && !tracerouteNodeNums.has(node.nodeNum)) return false;
+                  return true;
+                })
                 .map(node => {
                   // Convert precision_bits to radius in meters
                   // precision_bits indicates how many bits of lat/lon are valid
@@ -1893,6 +1985,17 @@ const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
   // If traceroute reference changed (different selected node), must re-render
   // This handles the case where both old and new traceroutes are non-null but different
   if (prevProps.selectedNodeTraceroute !== nextProps.selectedNodeTraceroute) {
+    return false; // Allow re-render
+  }
+
+  // If tracerouteNodeNums changed (active traceroute filtering), must re-render
+  // This handles when a node is selected/deselected for traceroute display
+  if (prevProps.tracerouteNodeNums !== nextProps.tracerouteNodeNums) {
+    return false; // Allow re-render
+  }
+
+  // If tracerouteBounds changed (for zoom-to-fit), must re-render
+  if (JSON.stringify(prevProps.tracerouteBounds) !== JSON.stringify(nextProps.tracerouteBounds)) {
     return false; // Allow re-render
   }
 

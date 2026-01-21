@@ -44,10 +44,10 @@ import { DeviceInfo, Channel } from './types/device';
 import { MeshMessage } from './types/message';
 import { SortField, SortDirection, NodeFilters } from './types/ui';
 import { ResourceType } from './types/permission';
-import api from './services/api';
+import api, { type ChannelDatabaseEntry } from './services/api';
 import { logger } from './utils/logger';
 // generateArrowMarkers moved to useTraceroutePaths hook
-import { isNodeComplete } from './utils/nodeHelpers';
+import { isNodeComplete, getEffectivePosition } from './utils/nodeHelpers';
 import Sidebar from './components/Sidebar';
 import { SettingsProvider, useSettings } from './contexts/SettingsContext';
 import { MapProvider, useMapContext } from './contexts/MapContext';
@@ -345,6 +345,7 @@ function App() {
   const [themeColors, setThemeColors] = useState({
     mauve: '#cba6f7', // Default to Mocha theme colors
     red: '#f38ba8',
+    blue: '#89b4fa', // For forward traceroute path
     overlay0: '#6c7086', // For MQTT segments (muted gray)
   });
 
@@ -353,12 +354,33 @@ function App() {
     const rootStyle = getComputedStyle(document.documentElement);
     const mauve = rootStyle.getPropertyValue('--ctp-mauve').trim();
     const red = rootStyle.getPropertyValue('--ctp-red').trim();
+    const blue = rootStyle.getPropertyValue('--ctp-blue').trim();
     const overlay0 = rootStyle.getPropertyValue('--ctp-overlay0').trim();
 
-    if (mauve && red && overlay0) {
-      setThemeColors({ mauve, red, overlay0 });
+    if (mauve && red && blue && overlay0) {
+      setThemeColors({ mauve, red, blue, overlay0 });
     }
   }, [theme]);
+
+  // Channel Database entries for displaying names of server-decrypted channels
+  const [channelDatabaseEntries, setChannelDatabaseEntries] = useState<ChannelDatabaseEntry[]>([]);
+
+  // Fetch Channel Database entries when authenticated
+  useEffect(() => {
+    const fetchChannelDatabaseEntries = async () => {
+      if (!authStatus?.authenticated) return;
+      try {
+        const response = await api.getChannelDatabaseEntries();
+        if (response.success && response.data) {
+          setChannelDatabaseEntries(response.data);
+        }
+      } catch (err) {
+        // Channel database might not be accessible to all users, fail silently
+        logger.debug('Failed to fetch channel database entries:', err);
+      }
+    };
+    fetchChannelDatabaseEntries();
+  }, [authStatus?.authenticated]);
 
   // Messaging context
   const {
@@ -483,6 +505,33 @@ function App() {
     showIncompleteNodes,
     setShowIncompleteNodes,
   } = useUI();
+
+  // Check tab permissions and redirect if unauthorized
+  // This prevents users from accessing protected tabs via direct URL navigation
+  useEffect(() => {
+    const isAdmin = authStatus?.user?.isAdmin || false;
+    const isAuthenticated = authStatus?.authenticated || false;
+
+    // Define permission requirements for each protected tab
+    const tabPermissions: Record<string, () => boolean> = {
+      settings: () => hasPermission('settings', 'read'),
+      automation: () => hasPermission('automation', 'read'),
+      configuration: () => hasPermission('configuration', 'read'),
+      notifications: () => isAuthenticated,
+      users: () => isAdmin,
+      admin: () => isAdmin,
+      audit: () => hasPermission('audit', 'read'),
+      security: () => hasPermission('security', 'read'),
+    };
+
+    // Check if current tab requires permission
+    const permissionCheck = tabPermissions[activeTab];
+    if (permissionCheck && !permissionCheck()) {
+      // User doesn't have permission - redirect to nodes tab
+      logger.info(`[Auth] Redirecting from '${activeTab}' tab - insufficient permissions`);
+      setActiveTab('nodes');
+    }
+  }, [activeTab, authStatus, hasPermission, setActiveTab]);
 
   // Helper function to safely parse node IDs to node numbers
   const parseNodeId = useCallback((nodeId: string): number => {
@@ -3729,24 +3778,31 @@ function App() {
 
   // Create stable digests of nodes and traceroutes that only change when relevant data changes
   // This prevents unnecessary recalculation of traceroutePathsElements
+  // Uses getEffectivePosition to respect position overrides (Issue #1526)
   const nodesPositionDigest = useMemo(() => {
-    return nodes.map(n => ({
-      nodeNum: n.nodeNum,
-      position: n.position
-        ? {
-            latitude: n.position.latitude,
-            longitude: n.position.longitude,
-          }
-        : undefined,
-      user: n.user
-        ? {
-            longName: n.user.longName,
-            shortName: n.user.shortName,
-            id: n.user.id,
-          }
-        : undefined,
-    }));
-  }, [nodes.map(n => `${n.nodeNum}-${n.position?.latitude}-${n.position?.longitude}`).join(',')]);
+    return nodes.map(n => {
+      const effectivePos = getEffectivePosition(n);
+      return {
+        nodeNum: n.nodeNum,
+        position: effectivePos.latitude != null && effectivePos.longitude != null
+          ? {
+              latitude: effectivePos.latitude,
+              longitude: effectivePos.longitude,
+            }
+          : undefined,
+        user: n.user
+          ? {
+              longName: n.user.longName,
+              shortName: n.user.shortName,
+              id: n.user.id,
+            }
+          : undefined,
+      };
+    });
+  }, [nodes.map(n => {
+    const pos = getEffectivePosition(n);
+    return `${n.nodeNum}-${pos.latitude}-${pos.longitude}`;
+  }).join(',')]);
 
   const traceroutesDigest = useMemo(() => {
     return traceroutes.map(tr => ({
@@ -3800,7 +3856,7 @@ function App() {
     return new Set(visibleNodes.map(n => n.nodeNum));
   }, [processedNodes, showMqttNodes, showIncompleteNodes, showEstimatedPositions, nodesWithEstimatedPosition]);
 
-  const { traceroutePathsElements, selectedNodeTraceroute } = useTraceroutePaths({
+  const { traceroutePathsElements, selectedNodeTraceroute, tracerouteNodeNums, tracerouteBounds } = useTraceroutePaths({
     showPaths,
     showRoute,
     selectedNodeId,
@@ -3985,11 +4041,14 @@ function App() {
             traceroutePathsElements={traceroutePathsElements}
             selectedNodeTraceroute={selectedNodeTraceroute}
             visibleNodeNums={visibleNodeNums}
+            tracerouteNodeNums={tracerouteNodeNums}
+            tracerouteBounds={tracerouteBounds}
           />
         )}
         {activeTab === 'channels' && (
           <ChannelsTab
             channels={channels}
+            channelDatabaseEntries={channelDatabaseEntries}
             channelMessages={channelMessages}
             messages={messages}
             currentNodeId={currentNodeId}
