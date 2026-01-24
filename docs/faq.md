@@ -614,6 +614,76 @@ Nodes may also display role badges:
 
 ---
 
+### The map is blank for anonymous (not logged in) users
+
+**Problem:** When accessing MeshMonitor without logging in, the map appears empty even though logged-in users can see nodes.
+
+**Cause:** Node visibility in MeshMonitor is controlled by **channel permissions**. Each node is associated with the channel it was last heard on, and users (including anonymous users) can only see nodes on channels they have the appropriate permissions for. By default, anonymous users have no channel permissions.
+
+**Solution:** Configure channel permissions for the anonymous user:
+
+1. **Login as admin**
+
+2. **Navigate to User Management:**
+   - Go to **Settings > Users**
+   - Or click your username in the top right corner and select "Settings"
+
+3. **Find the anonymous user:**
+   - Look for the user named **"anonymous"** in the user list
+   - Click on it to edit permissions
+
+4. **Grant channel permissions:**
+   - In the permissions section, find the channel permissions (e.g., `channel_0`, `channel_1`, etc.)
+   - Enable **View Map** permission for each channel you want anonymous users to see on the map
+   - Optionally enable **Read** permission if you also want them to see messages
+   - Click **Save**
+
+See [Understanding Channel Permissions](#understanding-channel-permissions) below for more details on the permission types.
+
+---
+
+### Understanding Channel Permissions
+
+As of **v3.1.0**, MeshMonitor uses a **tri-state permission system** for channels, giving administrators fine-grained control over what users can see and do:
+
+| Permission | Description |
+|------------|-------------|
+| **View Map** | User can see node positions on the map for nodes heard on this channel |
+| **Read** | User can read messages from this channel (in the Messages tab) |
+| **Write** | User can send messages to this channel (implies Read access) |
+
+**How permissions work:**
+
+- Each node is associated with the channel it was last heard on
+- **View Map** controls whether nodes appear on the map - this is the most common permission needed for public dashboards
+- **Read** controls access to the Messages tab for that channel
+- **Write** allows sending messages and automatically includes Read access
+
+**Example configurations:**
+
+| Use Case | View Map | Read | Write |
+|----------|----------|------|-------|
+| Public map-only dashboard | ✅ | ❌ | ❌ |
+| Read-only access (map + messages) | ✅ | ✅ | ❌ |
+| Full access | ✅ | ✅ | ✅ |
+| Hidden channel (logged-in users only) | ❌ | ❌ | ❌ |
+
+**Configuring the Anonymous user:**
+
+The **anonymous** user controls what unauthenticated visitors can see. Common setups:
+
+- **Public dashboard:** Enable `View Map` on `channel_0` (primary channel) for anonymous
+- **Private network:** Leave all permissions disabled - visitors must log in
+- **Selective exposure:** Enable `View Map` only on specific public channels
+
+**Important notes:**
+
+- Changes take effect immediately - no restart required
+- API token users follow the same permission filtering based on their associated user account
+- The V1 API respects these permissions for all node and message queries
+
+---
+
 ### How do I send messages to a specific channel?
 
 1. **Go to Messages tab**

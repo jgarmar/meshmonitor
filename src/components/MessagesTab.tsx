@@ -21,7 +21,7 @@ import {
 } from '../utils/datetime';
 import { formatTracerouteRoute } from '../utils/traceroute';
 import { getUtf8ByteLength, formatByteCount, isEmoji } from '../utils/text';
-import { getDistanceToNode } from '../utils/distance';
+import { calculateDistance, formatDistance, getDistanceToNode } from '../utils/distance';
 import { renderMessageWithLinks } from '../utils/linkRenderer';
 import { isNodeComplete, isInfrastructureNode, hasValidPosition, parseNodeId } from '../utils/nodeHelpers';
 import { getEffectiveHops } from '../utils/nodeHops';
@@ -31,10 +31,15 @@ import HopCountDisplay from './HopCountDisplay';
 import LinkPreview from './LinkPreview';
 import NodeDetailsBlock from './NodeDetailsBlock';
 import TelemetryGraphs from './TelemetryGraphs';
+import SmartHopsGraphs from './SmartHopsGraphs';
+import LinkQualityGraph from './LinkQualityGraph';
 import { NodeFilterPopup } from './NodeFilterPopup';
 import { MessageStatusIndicator } from './MessageStatusIndicator';
 import RelayNodeModal from './RelayNodeModal';
+import TelemetryRequestModal, { TelemetryType } from './TelemetryRequestModal';
+import { useToast } from './ToastContainer';
 import apiService from '../services/api';
+import { useCsrfFetch } from '../hooks/useCsrfFetch';
 
 // Types for node with message metadata
 interface NodeWithMessages extends DeviceInfo {
@@ -141,6 +146,7 @@ export interface MessagesTabProps {
   positionLoading: string | null;
   nodeInfoLoading: string | null;
   neighborInfoLoading: string | null;
+  telemetryRequestLoading: string | null;
 
   // Settings
   timeFormat: TimeFormat;
@@ -160,6 +166,7 @@ export interface MessagesTabProps {
   handleExchangePosition: (nodeId: string) => Promise<void>;
   handleExchangeNodeInfo: (nodeId: string) => Promise<void>;
   handleRequestNeighborInfo: (nodeId: string) => Promise<void>;
+  handleRequestTelemetry: (nodeId: string, telemetryType: 'device' | 'environment' | 'airQuality' | 'power') => Promise<void>;
   handleDeleteMessage: (message: MeshMessage) => Promise<void>;
   handleSenderClick: (nodeId: string, event: React.MouseEvent) => void;
   handleSendTapback: (emoji: string, message: MeshMessage) => void;
@@ -217,6 +224,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   positionLoading,
   nodeInfoLoading,
   neighborInfoLoading,
+  telemetryRequestLoading,
   timeFormat,
   dateFormat,
   temperatureUnit,
@@ -230,6 +238,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   handleExchangePosition,
   handleExchangeNodeInfo,
   handleRequestNeighborInfo,
+  handleRequestTelemetry,
   handleDeleteMessage,
   handleSenderClick,
   handleSendTapback,
@@ -248,7 +257,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
 
   // Get settings and context for effective hops calculation
   const { nodeHopsCalculation } = useSettings();
-  const { traceroutes } = useMapContext();
+  const { traceroutes, neighborInfo, setNeighborInfo } = useMapContext();
   const currentNodeNum = currentNodeId ? parseNodeId(currentNodeId) : null;
 
   // Local state for actions menu
@@ -260,6 +269,17 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   const [selectedRxTime, setSelectedRxTime] = useState<Date | undefined>(undefined);
   const [selectedMessageRssi, setSelectedMessageRssi] = useState<number | undefined>(undefined);
   const [directNeighborStats, setDirectNeighborStats] = useState<Record<number, { avgRssi: number; packetCount: number; lastHeard: number }>>({});
+
+  // Telemetry request modal state
+  const [showTelemetryRequestModal, setShowTelemetryRequestModal] = useState(false);
+
+  // Admin scan state
+  const [adminScanLoading, setAdminScanLoading] = useState<string | null>(null);
+  const { showToast } = useToast();
+  const csrfFetch = useCsrfFetch();
+
+  // Purge neighbors state
+  const [purgingNeighbors, setPurgingNeighbors] = useState(false);
 
   // Resizable send section (only on desktop)
   const {
@@ -355,6 +375,43 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
       }
     },
     []
+  );
+
+  // Handle scan for remote admin
+  const handleScanForAdmin = useCallback(
+    async (nodeId: string) => {
+      const node = nodes.find(n => n.user?.id === nodeId);
+      if (!node) return;
+
+      setAdminScanLoading(nodeId);
+      try {
+        const response = await csrfFetch(`${baseUrl}/api/nodes/${node.nodeNum}/scan-remote-admin`, {
+          method: 'POST',
+        });
+
+        if (!response.ok) {
+          if (response.status === 403) {
+            showToast(t('messages.scan_admin_permission_denied'), 'error');
+            return;
+          }
+          throw new Error(`Server returned ${response.status}`);
+        }
+
+        const result = await response.json();
+        if (result.hasRemoteAdmin) {
+          const firmware = result.metadata?.firmwareVersion || t('common.unknown');
+          showToast(t('messages.scan_admin_success', { firmware }), 'success');
+        } else {
+          showToast(t('messages.scan_admin_no_access'), 'warning');
+        }
+      } catch (error) {
+        console.error('Failed to scan for admin:', error);
+        showToast(t('messages.scan_admin_failed'), 'error');
+      } finally {
+        setAdminScanLoading(null);
+      }
+    },
+    [nodes, baseUrl, csrfFetch, showToast, t]
   );
 
   // Permission check
@@ -832,7 +889,33 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                               🔑 {t('messages.exchange_user_info')}
                               {nodeInfoLoading === selectedDMNode && <span className="spinner"></span>}
                             </button>
+                            <button
+                              className="actions-menu-item"
+                              onClick={() => {
+                                setShowTelemetryRequestModal(true);
+                                setShowActionsMenu(false);
+                              }}
+                              disabled={connectionStatus !== 'connected' || telemetryRequestLoading === selectedDMNode}
+                            >
+                              📊 {t('messages.request_telemetry')}
+                              {telemetryRequestLoading === selectedDMNode && <span className="spinner"></span>}
+                            </button>
                           </>
+                        )}
+
+                        {/* Admin Scan */}
+                        {hasPermission('settings', 'write') && (
+                          <button
+                            className="actions-menu-item"
+                            onClick={() => {
+                              handleScanForAdmin(selectedDMNode);
+                              setShowActionsMenu(false);
+                            }}
+                            disabled={connectionStatus !== 'connected' || adminScanLoading === selectedDMNode}
+                          >
+                            🔍 {t('messages.scan_for_admin')}
+                            {adminScanLoading === selectedDMNode && <span className="spinner"></span>}
+                          </button>
                         )}
 
                         {/* Node Management */}
@@ -1063,8 +1146,24 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                 </button>
                               </div>
                             )}
-                            <div className="message-text" style={{ whiteSpace: 'pre-line' }}>
-                              {renderMessageWithLinks(msg.text)}
+                            <div className="message-text-row">
+                              <div className="message-text" style={{ whiteSpace: 'pre-line' }}>
+                                {renderMessageWithLinks(msg.text)}
+                              </div>
+                              <div className="message-meta">
+                                <span className="message-time">
+                                  {formatMessageTime(currentDate, timeFormat, dateFormat)}
+                                  <HopCountDisplay
+                                    hopStart={msg.hopStart}
+                                    hopLimit={msg.hopLimit}
+                                    rxSnr={msg.rxSnr}
+                                    rxRssi={msg.rxRssi}
+                                    relayNode={msg.relayNode}
+                                    viaMqtt={msg.viaMqtt}
+                                    onClick={() => handleRelayClick(msg)}
+                                  />
+                                </span>
+                              </div>
                             </div>
                             <LinkPreview text={msg.text} />
                             {reactions.length > 0 && (
@@ -1081,20 +1180,6 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                 ))}
                               </div>
                             )}
-                            <div className="message-meta">
-                              <span className="message-time">
-                                {formatMessageTime(currentDate, timeFormat, dateFormat)}
-                                <HopCountDisplay
-                                  hopStart={msg.hopStart}
-                                  hopLimit={msg.hopLimit}
-                                  rxSnr={msg.rxSnr}
-                                  rxRssi={msg.rxRssi}
-                                  relayNode={msg.relayNode}
-                                  viaMqtt={msg.viaMqtt}
-                                  onClick={() => handleRelayClick(msg)}
-                                />
-                              </span>
-                            </div>
                           </div>
                         </div>
                         {isMine && <div className="message-status"><MessageStatusIndicator message={msg} /></div>}
@@ -1235,6 +1320,101 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                   }
                   return null;
                 })()}
+
+            {/* Neighbor Info Display */}
+            {(() => {
+              if (!selectedDMNode || !neighborInfo) return null;
+              const nodeNumStr = selectedDMNode.replace('!', '');
+              const nodeNum = parseInt(nodeNumStr, 16);
+              const nodeNeighbors = neighborInfo.filter(ni => ni.nodeNum === nodeNum);
+              if (nodeNeighbors.length === 0) return null;
+
+              // Get most recent timestamp
+              const mostRecent = Math.max(...nodeNeighbors.map(n => n.timestamp));
+              const age = Math.floor((Date.now() - mostRecent) / (1000 * 60));
+              const ageStr = age < 60 ? `${age}m ago` : `${Math.floor(age / 60)}h ago`;
+
+              const handlePurgeNeighbors = async () => {
+                if (!selectedDMNode || purgingNeighbors) return;
+
+                // Confirm before purging
+                const confirmed = window.confirm(t('messages.confirm_purge_neighbors', 'Are you sure you want to delete all neighbor info for this node?'));
+                if (!confirmed) return;
+
+                setPurgingNeighbors(true);
+                try {
+                  await apiService.purgeNeighborInfo(selectedDMNode);
+                  // Immediately update UI by filtering out purged neighbors
+                  setNeighborInfo(neighborInfo.filter(n => n.nodeNum !== nodeNum));
+                  showToast(t('messages.neighbor_info_purged', 'Neighbor info purged successfully'), 'success');
+                } catch (error) {
+                  console.error('Failed to purge neighbor info:', error);
+                  showToast(t('messages.neighbor_info_purge_failed', 'Failed to purge neighbor info'), 'error');
+                } finally {
+                  setPurgingNeighbors(false);
+                }
+              };
+
+              return (
+                <div className="neighbor-info-section" style={{ marginTop: '1rem' }}>
+                  <div className="neighbor-info-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <strong>{t('messages.neighbor_info_title', 'Neighbor Info')}</strong>
+                      <span className="neighbor-info-age" style={{ marginLeft: '0.5rem', fontSize: '0.85em', color: 'var(--ctp-subtext0)' }}>
+                        ({ageStr})
+                      </span>
+                    </div>
+                    <button
+                      onClick={handlePurgeNeighbors}
+                      className="purge-neighbors-btn"
+                      disabled={purgingNeighbors}
+                      style={{
+                        padding: '0.25rem 0.5rem',
+                        fontSize: '0.8em',
+                        backgroundColor: 'var(--ctp-surface0)',
+                        color: 'var(--ctp-text)',
+                        border: '1px solid var(--ctp-surface1)',
+                        borderRadius: '4px',
+                        cursor: purgingNeighbors ? 'not-allowed' : 'pointer',
+                        opacity: purgingNeighbors ? 0.6 : 1,
+                      }}
+                      title={t('messages.purge_neighbors_tooltip', 'Delete neighbor info for this node')}
+                    >
+                      {purgingNeighbors ? <span className="spinner"></span> : t('messages.purge_neighbors', 'Purge')}
+                    </button>
+                  </div>
+                  <div className="neighbor-info-list" style={{ marginTop: '0.5rem' }}>
+                    {nodeNeighbors.map((neighbor, idx) => {
+                      // Calculate distance if both positions available
+                      let distanceStr = '';
+                      if (neighbor.nodeLatitude != null && neighbor.nodeLongitude != null &&
+                          neighbor.neighborLatitude != null && neighbor.neighborLongitude != null) {
+                        const distKm = calculateDistance(
+                          neighbor.nodeLatitude, neighbor.nodeLongitude,
+                          neighbor.neighborLatitude, neighbor.neighborLongitude
+                        );
+                        distanceStr = formatDistance(distKm, distanceUnit);
+                      }
+
+                      return (
+                        <div key={idx} className="neighbor-info-item" style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          padding: '0.25rem 0',
+                          borderBottom: idx < nodeNeighbors.length - 1 ? '1px solid var(--ctp-surface0)' : 'none'
+                        }}>
+                          <span>{neighbor.neighborName || neighbor.neighborNodeId || `!${neighbor.neighborNodeNum.toString(16)}`}</span>
+                          <span style={{ color: 'var(--ctp-subtext0)' }}>
+                            {neighbor.snr != null && `SNR: ${neighbor.snr.toFixed(1)} dB`}
+                            {distanceStr && ` | ${distanceStr}`}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Quick Action Buttons */}
             <div className="dm-action-buttons" style={{
@@ -1429,6 +1609,16 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                 telemetryHours={telemetryVisualizationHours}
                 baseUrl={baseUrl}
               />
+              <SmartHopsGraphs
+                nodeId={selectedDMNode}
+                telemetryHours={telemetryVisualizationHours}
+                baseUrl={baseUrl}
+              />
+              <LinkQualityGraph
+                nodeId={selectedDMNode}
+                telemetryHours={telemetryVisualizationHours}
+                baseUrl={baseUrl}
+              />
             </div>
             {/* End of dm-send-section */}
           </div>
@@ -1456,6 +1646,20 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
             setSelectedRelayNode(null);
             handleSenderClick(nodeId, { stopPropagation: () => {} } as React.MouseEvent);
           }}
+        />
+      )}
+
+      {/* Telemetry request modal */}
+      {showTelemetryRequestModal && selectedDMNode && (
+        <TelemetryRequestModal
+          isOpen={showTelemetryRequestModal}
+          onClose={() => setShowTelemetryRequestModal(false)}
+          onRequest={(telemetryType: TelemetryType) => {
+            handleRequestTelemetry(selectedDMNode, telemetryType);
+            setShowTelemetryRequestModal(false);
+          }}
+          loading={telemetryRequestLoading === selectedDMNode}
+          nodeName={selectedNode?.user?.longName || selectedNode?.user?.shortName || selectedDMNode}
         />
       )}
     </div>

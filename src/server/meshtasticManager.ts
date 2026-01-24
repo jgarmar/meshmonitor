@@ -40,6 +40,33 @@ export interface ProcessingContext {
 // Re-export for consumers who import from meshtasticManager
 export { CHANNEL_DB_OFFSET } from './constants/meshtastic.js';
 
+/**
+ * Link Quality scoring constants.
+ * Link Quality is a 0-10 score tracking the reliability of message routing to a node.
+ */
+export const LINK_QUALITY = {
+  /** Maximum quality score */
+  MAX: 10,
+  /** Minimum quality score (0 = dead link) */
+  MIN: 0,
+  /** Base value for initial calculation (LQ = BASE - hops) */
+  INITIAL_BASE: 8,
+  /** Default quality when hop count is unknown */
+  DEFAULT_QUALITY: 5,
+  /** Default hop count when unknown */
+  DEFAULT_HOPS: 3,
+  /** Bonus for stable/improved message delivery */
+  STABLE_MESSAGE_BONUS: 1,
+  /** Penalty for degraded routing (hops increased by 2+) */
+  DEGRADED_PATH_PENALTY: -1,
+  /** Penalty for failed traceroute */
+  TRACEROUTE_FAIL_PENALTY: -2,
+  /** Penalty for PKI/encryption error */
+  PKI_ERROR_PENALTY: -5,
+  /** Traceroute timeout in milliseconds (5 minutes) */
+  TRACEROUTE_TIMEOUT_MS: 5 * 60 * 1000,
+} as const;
+
 export interface DeviceInfo {
   nodeNum: number;
   user?: {
@@ -173,6 +200,11 @@ class MeshtasticManager {
   private announceCronJob: cron.ScheduledTask | null = null;
   private timerCronJobs: Map<string, cron.ScheduledTask> = new Map();
   private pendingAutoTraceroutes: Set<number> = new Set(); // Track auto-traceroute targets for logging
+  private pendingTracerouteTimestamps: Map<number, number> = new Map(); // Track when traceroutes were initiated for timeout detection
+  private nodeLinkQuality: Map<number, { quality: number; lastHops: number }> = new Map(); // Track link quality per node
+  private remoteAdminScannerInterval: NodeJS.Timeout | null = null;
+  private remoteAdminScannerIntervalMinutes: number = 0; // 0 = disabled
+  private pendingRemoteAdminScans: Set<number> = new Set(); // Track nodes being scanned
   private keyRepairInterval: NodeJS.Timeout | null = null;
   private keyRepairEnabled: boolean = false;
   private keyRepairIntervalMinutes: number = 5;  // Default 5 minutes
@@ -208,6 +240,8 @@ class MeshtasticManager {
   private remoteNodeChannels: Map<number, Map<number, any>> = new Map();
   // Per-node owner storage for remote nodes
   private remoteNodeOwners: Map<number, any> = new Map();
+  // Per-node device metadata storage for remote nodes
+  private remoteNodeDeviceMetadata: Map<number, any> = new Map();
   private favoritesSupportCache: boolean | null = null;  // Cache firmware support check result
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
 
@@ -450,6 +484,9 @@ class MeshtasticManager {
         // Start automatic traceroute scheduler
         this.startTracerouteScheduler();
 
+        // Start remote admin discovery scanner
+        this.startRemoteAdminScanner();
+
         // Start automatic LocalStats collection
         this.startLocalStatsScheduler();
 
@@ -621,6 +658,11 @@ class MeshtasticManager {
       this.tracerouteInterval = null;
     }
 
+    if (this.remoteAdminScannerInterval) {
+      clearInterval(this.remoteAdminScannerInterval);
+      this.remoteAdminScannerInterval = null;
+    }
+
     // Stop LocalStats collection
     this.stopLocalStatsScheduler();
 
@@ -663,8 +705,12 @@ class MeshtasticManager {
             // Log the auto-traceroute attempt to database
             await databaseService.logAutoTracerouteAttemptAsync(targetNode.nodeNum, targetName);
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
+            this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
             await this.sendTraceroute(targetNode.nodeNum, channel);
+
+            // Check for timed-out traceroutes (> 5 minutes old)
+            this.checkTracerouteTimeouts();
           } else {
             logger.info('🗺️ Auto-traceroute: No nodes available for traceroute');
           }
@@ -691,6 +737,129 @@ class MeshtasticManager {
 
     if (this.isConnected) {
       this.startTracerouteScheduler();
+    }
+  }
+
+  /**
+   * Set the remote admin scanner interval
+   * @param minutes Interval in minutes (0 = disabled, 1-60)
+   */
+  setRemoteAdminScannerInterval(minutes: number): void {
+    if (minutes < 0 || minutes > 60) {
+      throw new Error('Remote admin scanner interval must be between 0 and 60 minutes (0 = disabled)');
+    }
+    this.remoteAdminScannerIntervalMinutes = minutes;
+
+    if (minutes === 0) {
+      logger.debug('🔑 Remote admin scanner set to 0 (disabled)');
+    } else {
+      logger.debug(`🔑 Remote admin scanner interval updated to ${minutes} minutes`);
+    }
+
+    if (this.isConnected) {
+      this.startRemoteAdminScanner();
+    }
+  }
+
+  /**
+   * Start the remote admin scanner scheduler
+   * Periodically checks nodes for remote admin capability
+   */
+  private startRemoteAdminScanner(): void {
+    if (this.remoteAdminScannerInterval) {
+      clearInterval(this.remoteAdminScannerInterval);
+      this.remoteAdminScannerInterval = null;
+    }
+
+    // Load setting from database if not already set
+    if (this.remoteAdminScannerIntervalMinutes === 0) {
+      const savedInterval = databaseService.getSetting('remoteAdminScannerIntervalMinutes');
+      if (savedInterval) {
+        this.remoteAdminScannerIntervalMinutes = parseInt(savedInterval, 10) || 0;
+      }
+    }
+
+    // If interval is 0, scanner is disabled
+    if (this.remoteAdminScannerIntervalMinutes === 0) {
+      logger.info('🔑 Remote admin scanner is disabled');
+      return;
+    }
+
+    const intervalMs = this.remoteAdminScannerIntervalMinutes * 60 * 1000;
+    logger.info(`🔑 Starting remote admin scanner with ${this.remoteAdminScannerIntervalMinutes} minute interval`);
+
+    this.remoteAdminScannerInterval = setInterval(async () => {
+      if (this.isConnected && this.localNodeInfo) {
+        try {
+          await this.scanNextNodeForRemoteAdmin();
+        } catch (error) {
+          logger.error('❌ Error in remote admin scanner:', error);
+        }
+      } else {
+        logger.debug('🔑 Remote admin scanner: Skipping - not connected or no local node info');
+      }
+    }, intervalMs);
+  }
+
+  /**
+   * Scan the next eligible node for remote admin capability
+   */
+  private async scanNextNodeForRemoteAdmin(): Promise<void> {
+    if (!this.localNodeInfo) {
+      logger.debug('🔑 Remote admin scan: No local node info');
+      return;
+    }
+
+    const targetNode = await databaseService.getNodeNeedingRemoteAdminCheckAsync(this.localNodeInfo.nodeNum);
+    if (!targetNode) {
+      logger.info('🔑 Remote admin scan: No nodes available for scanning');
+      return;
+    }
+
+    // Skip if already being scanned
+    if (this.pendingRemoteAdminScans.has(targetNode.nodeNum)) {
+      logger.debug(`🔑 Remote admin scan: Node ${targetNode.nodeNum} already being scanned`);
+      return;
+    }
+
+    const targetName = targetNode.longName || targetNode.nodeId;
+    logger.info(`🔑 Remote admin scan: Checking ${targetName} (${targetNode.nodeId}) for admin capability`);
+
+    await this.scanNodeForRemoteAdmin(targetNode.nodeNum);
+  }
+
+  /**
+   * Scan a specific node for remote admin capability
+   * @param nodeNum The node number to scan
+   * @returns Object with hasRemoteAdmin flag and metadata if successful
+   */
+  async scanNodeForRemoteAdmin(nodeNum: number): Promise<{ hasRemoteAdmin: boolean; metadata: any | null }> {
+    // Track that we're scanning this node
+    this.pendingRemoteAdminScans.add(nodeNum);
+
+    try {
+      // Try to get device metadata via admin
+      const metadata = await this.requestRemoteDeviceMetadata(nodeNum);
+
+      if (metadata) {
+        // Success - node has remote admin capability
+        logger.info(`🔑 Remote admin scan: Node ${nodeNum} has remote admin access`);
+        await databaseService.updateNodeRemoteAdminStatusAsync(nodeNum, true, JSON.stringify(metadata));
+        return { hasRemoteAdmin: true, metadata };
+      } else {
+        // Timeout or failure - node doesn't have admin access (or is unreachable)
+        logger.debug(`🔑 Remote admin scan: Node ${nodeNum} does not have remote admin access`);
+        await databaseService.updateNodeRemoteAdminStatusAsync(nodeNum, false, null);
+        return { hasRemoteAdmin: false, metadata: null };
+      }
+    } catch (error) {
+      // Error - likely no admin access
+      logger.info(`🔑 Remote admin scan: Node ${nodeNum} scan failed - no admin access`);
+      logger.debug(`🔑 Remote admin scan error details:`, error);
+      await databaseService.updateNodeRemoteAdminStatusAsync(nodeNum, false, null);
+      return { hasRemoteAdmin: false, metadata: null };
+    } finally {
+      this.pendingRemoteAdminScans.delete(nodeNum);
     }
   }
 
@@ -1782,7 +1951,7 @@ class MeshtasticManager {
     // Note: Local node's public key is extracted from security config when received
   }
 
-  getLocalNodeInfo(): { nodeNum: number; nodeId: string; longName: string; shortName: string; hwModel?: number } | null {
+  getLocalNodeInfo(): { nodeNum: number; nodeId: string; longName: string; shortName: string; hwModel?: number; firmwareVersion?: string; rebootCount?: number; isLocked?: boolean } | null {
     return this.localNodeInfo;
   }
 
@@ -2307,6 +2476,20 @@ class MeshtasticManager {
           hopStart >= hopLimit) {
         const messageHops = hopStart - hopLimit;
         databaseService.updateNodeMessageHops(fromNum, messageHops);
+
+        // Store hop count as telemetry for Smart Hops tracking
+        databaseService.insertTelemetry({
+          nodeId: nodeId,
+          nodeNum: fromNum,
+          telemetryType: 'messageHops',
+          timestamp: Date.now(),
+          value: messageHops,
+          unit: 'hops',
+          createdAt: Date.now(),
+        });
+
+        // Update Link Quality based on hop count comparison
+        this.updateLinkQualityForMessage(fromNum, messageHops);
       }
     }
 
@@ -2942,24 +3125,39 @@ class MeshtasticManager {
         const envMetrics = telemetry.environmentMetrics;
         logger.debug(`🌡️ Environment telemetry: temp=${envMetrics.temperature}°C, humidity=${envMetrics.relativeHumidity}%`);
 
-        if (envMetrics.temperature !== undefined && envMetrics.temperature !== null && !isNaN(envMetrics.temperature)) {
-          databaseService.insertTelemetry({
-            nodeId, nodeNum: fromNum, telemetryType: 'temperature',
-            timestamp, value: envMetrics.temperature, unit: '°C', createdAt: now, packetTimestamp
-          });
-        }
-        if (envMetrics.relativeHumidity !== undefined && envMetrics.relativeHumidity !== null && !isNaN(envMetrics.relativeHumidity)) {
-          databaseService.insertTelemetry({
-            nodeId, nodeNum: fromNum, telemetryType: 'humidity',
-            timestamp, value: envMetrics.relativeHumidity, unit: '%', createdAt: now, packetTimestamp
-          });
-        }
-        if (envMetrics.barometricPressure !== undefined && envMetrics.barometricPressure !== null && !isNaN(envMetrics.barometricPressure)) {
-          databaseService.insertTelemetry({
-            nodeId, nodeNum: fromNum, telemetryType: 'pressure',
-            timestamp, value: envMetrics.barometricPressure, unit: 'hPa', createdAt: now, packetTimestamp
-          });
-        }
+        // Save all Environment metrics to telemetry table
+        this.saveTelemetryMetrics([
+          // Core weather metrics
+          { type: 'temperature', value: envMetrics.temperature, unit: '°C' },
+          { type: 'humidity', value: envMetrics.relativeHumidity, unit: '%' },
+          { type: 'pressure', value: envMetrics.barometricPressure, unit: 'hPa' },
+          // Air quality related
+          { type: 'gasResistance', value: envMetrics.gasResistance, unit: 'MΩ' },
+          { type: 'iaq', value: envMetrics.iaq, unit: 'IAQ' },
+          // Light sensors
+          { type: 'lux', value: envMetrics.lux, unit: 'lux' },
+          { type: 'whiteLux', value: envMetrics.whiteLux, unit: 'lux' },
+          { type: 'irLux', value: envMetrics.irLux, unit: 'lux' },
+          { type: 'uvLux', value: envMetrics.uvLux, unit: 'lux' },
+          // Wind metrics
+          { type: 'windDirection', value: envMetrics.windDirection, unit: '°' },
+          { type: 'windSpeed', value: envMetrics.windSpeed, unit: 'm/s' },
+          { type: 'windGust', value: envMetrics.windGust, unit: 'm/s' },
+          { type: 'windLull', value: envMetrics.windLull, unit: 'm/s' },
+          // Precipitation
+          { type: 'rainfall1h', value: envMetrics.rainfall1h, unit: 'mm' },
+          { type: 'rainfall24h', value: envMetrics.rainfall24h, unit: 'mm' },
+          // Soil sensors
+          { type: 'soilMoisture', value: envMetrics.soilMoisture, unit: '%' },
+          { type: 'soilTemperature', value: envMetrics.soilTemperature, unit: '°C' },
+          // Other sensors
+          { type: 'radiation', value: envMetrics.radiation, unit: 'µR/h' },
+          { type: 'distance', value: envMetrics.distance, unit: 'mm' },
+          { type: 'weight', value: envMetrics.weight, unit: 'kg' },
+          // Deprecated but still supported (use PowerMetrics for new implementations)
+          { type: 'envVoltage', value: envMetrics.voltage, unit: 'V' },
+          { type: 'envCurrent', value: envMetrics.current, unit: 'A' }
+        ], nodeId, fromNum, timestamp, packetTimestamp);
       } else if (telemetry.powerMetrics) {
         const powerMetrics = telemetry.powerMetrics;
 
@@ -3474,6 +3672,19 @@ class MeshtasticManager {
 
       databaseService.insertTraceroute(tracerouteRecord);
 
+      // Store traceroute hop count as telemetry for Smart Hops tracking
+      // Hop count is route.length + 1 (intermediate hops + final hop to destination)
+      const tracerouteHops = route.length + 1;
+      databaseService.insertTelemetry({
+        nodeId: fromNodeId,
+        nodeNum: fromNum,
+        telemetryType: 'messageHops',
+        timestamp: Date.now(),
+        value: tracerouteHops,
+        unit: 'hops',
+        createdAt: Date.now(),
+      });
+
       // Emit WebSocket event for traceroute completion
       dataEventEmitter.emitTracerouteComplete(tracerouteRecord as any);
 
@@ -3483,6 +3694,7 @@ class MeshtasticManager {
       if (this.pendingAutoTraceroutes.has(fromNum)) {
         await databaseService.updateAutoTracerouteResultByNodeAsync(fromNum, true);
         this.pendingAutoTraceroutes.delete(fromNum);
+        this.pendingTracerouteTimestamps.delete(fromNum); // Clear timeout tracking
         logger.debug(`🗺️ Auto-traceroute to ${fromNodeId} marked as successful`);
       }
 
@@ -3656,6 +3868,9 @@ class MeshtasticManager {
 
           // Emit event to notify UI of the key issue
           dataEventEmitter.emitNodeUpdate(targetNodeNum, { keyMismatchDetected: true, keySecurityIssueDetails: errorDescription });
+
+          // Penalize Link Quality for PKI error (-5)
+          this.handlePkiError(targetNodeNum);
         }
       }
 
@@ -3857,7 +4072,7 @@ class MeshtasticManager {
       const fromNum = Number(meshPacket.from);
       const fromNodeId = `!${fromNum.toString(16).padStart(8, '0')}`;
 
-      logger.debug(`🏠 Neighbor info from ${fromNodeId}:`, neighborInfo);
+      logger.info(`🏠 Neighbor info received from ${fromNodeId}:`, neighborInfo);
 
       // Get the sender node to determine their hopsAway
       let senderNode = databaseService.getNode(fromNum);
@@ -3879,7 +4094,11 @@ class MeshtasticManager {
 
       // Process each neighbor in the list
       if (neighborInfo.neighbors && Array.isArray(neighborInfo.neighbors)) {
-        logger.debug(`📡 Processing ${neighborInfo.neighbors.length} neighbors from ${fromNodeId}`);
+        logger.info(`📡 Processing ${neighborInfo.neighbors.length} neighbors from ${fromNodeId}`);
+
+        // Clear old neighbor info for this node before saving new data
+        // This ensures stale neighbors are removed when they drop from the mesh
+        databaseService.clearNeighborInfoForNode(fromNum);
 
         for (const neighbor of neighborInfo.neighbors) {
           const neighborNodeNum = Number(neighbor.nodeId);
@@ -3896,7 +4115,7 @@ class MeshtasticManager {
               hopsAway: senderHopsAway + 1,
               lastHeard: Date.now() / 1000
             });
-            logger.debug(`➕ Created new node ${neighborNodeId} with hopsAway=${senderHopsAway + 1}`);
+            logger.info(`➕ Created new node ${neighborNodeId} with hopsAway=${senderHopsAway + 1}`);
           }
 
           // Save the neighbor relationship
@@ -3908,7 +4127,7 @@ class MeshtasticManager {
             timestamp: timestamp
           });
 
-          logger.debug(`🔗 Saved neighbor: ${fromNodeId} -> ${neighborNodeId}, SNR: ${neighbor.snr || 'N/A'}`);
+          logger.info(`🔗 Saved neighbor: ${fromNodeId} -> ${neighborNodeId}, SNR: ${neighbor.snr || 'N/A'}`);
         }
       }
     } catch (error) {
@@ -5836,6 +6055,64 @@ class MeshtasticManager {
   }
 
   /**
+   * Send a telemetry request to a remote node
+   * This sends an empty telemetry packet with wantResponse=true to request telemetry data
+   */
+  async sendTelemetryRequest(
+    destination: number,
+    channel: number = 0,
+    telemetryType?: 'device' | 'environment' | 'airQuality' | 'power'
+  ): Promise<{ packetId: number; requestId: number }> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+
+    try {
+      const { data: telemetryRequestData, packetId, requestId } = meshtasticProtobufService.createTelemetryRequestMessage(
+        destination,
+        channel,
+        telemetryType
+      );
+
+      const typeLabel = telemetryType || 'device';
+      logger.info(`📊 Telemetry request packet created: ${telemetryRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, type=${typeLabel}, packetId=${packetId}, requestId=${requestId}`);
+
+      await this.transport.send(telemetryRequestData);
+
+      // Broadcast to virtual node clients (including packet monitor)
+      const virtualNodeServer = (global as any).virtualNodeServer;
+      if (virtualNodeServer) {
+        try {
+          await virtualNodeServer.broadcastToClients(telemetryRequestData);
+          logger.debug(`📡 Broadcasted outgoing Telemetry request to virtual node clients (${telemetryRequestData.length} bytes)`);
+        } catch (error) {
+          logger.error('Virtual node: Failed to broadcast outgoing Telemetry request:', error);
+        }
+      }
+
+      logger.info(`📤 Telemetry request (${typeLabel}) sent from ${this.localNodeInfo.nodeId} to !${destination.toString(16).padStart(8, '0')}`);
+
+      // Log outgoing Telemetry request to packet monitor
+      this.logOutgoingPacket(
+        67, // TELEMETRY_APP
+        destination,
+        channel,
+        `Telemetry request (${typeLabel}) to !${destination.toString(16).padStart(8, '0')}`,
+        { destination, telemetryType: typeLabel, packetId, requestId }
+      );
+
+      return { packetId, requestId };
+    } catch (error) {
+      logger.error('Error sending Telemetry request:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Broadcast NodeInfo to all nodes on a specific channel
    * Uses the broadcast address (0xFFFFFFFF) to send to all nodes
    * wantAck is set to false to reduce mesh traffic
@@ -7580,7 +7857,17 @@ class MeshtasticManager {
         });
       }
       if (adminMsg.getDeviceMetadataResponse) {
-        logger.debug('⚙️ Received GetDeviceMetadataResponse');
+        logger.debug('⚙️ Received GetDeviceMetadataResponse from node', fromNum);
+        // Store device metadata response for retrieval
+        this.remoteNodeDeviceMetadata.set(fromNum, adminMsg.getDeviceMetadataResponse);
+        logger.debug(`📊 Stored device metadata from node ${fromNum}`, {
+          firmwareVersion: adminMsg.getDeviceMetadataResponse.firmwareVersion,
+          hwModel: adminMsg.getDeviceMetadataResponse.hwModel,
+          role: adminMsg.getDeviceMetadataResponse.role,
+          hasWifi: adminMsg.getDeviceMetadataResponse.hasWifi,
+          hasBluetooth: adminMsg.getDeviceMetadataResponse.hasBluetooth,
+          hasEthernet: adminMsg.getDeviceMetadataResponse.hasEthernet
+        });
       }
     } catch (error) {
       logger.error('❌ Error processing admin message:', error);
@@ -8304,6 +8591,80 @@ class MeshtasticManager {
   }
 
   /**
+   * Request device metadata from a remote node
+   * Returns firmware version, hardware model, capabilities, role, etc.
+   */
+  async requestRemoteDeviceMetadata(destinationNodeNum: number): Promise<any> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    if (!this.localNodeInfo?.nodeNum) {
+      throw new Error('Local node number not available');
+    }
+
+    try {
+      // Get or request session passkey
+      let sessionPasskey = this.getSessionPasskey(destinationNodeNum);
+      if (sessionPasskey) {
+        logger.info(`🔑 Using cached session passkey for remote node ${destinationNodeNum}`);
+      } else {
+        logger.info(`🔑 No cached passkey for remote node ${destinationNodeNum}, requesting new one...`);
+        sessionPasskey = await this.requestRemoteSessionPasskey(destinationNodeNum);
+        if (!sessionPasskey) {
+          throw new Error(`Failed to obtain session passkey for remote node ${destinationNodeNum}`);
+        }
+      }
+
+      // Create the device metadata request message with session passkey
+      const root = getProtobufRoot();
+      if (!root) {
+        throw new Error('Protobuf definitions not loaded. Please ensure protobuf definitions are initialized.');
+      }
+      const AdminMessage = root.lookupType('meshtastic.AdminMessage');
+      if (!AdminMessage) {
+        throw new Error('AdminMessage type not found');
+      }
+
+      const adminMsg = AdminMessage.create({
+        sessionPasskey: sessionPasskey,
+        getDeviceMetadataRequest: true
+      });
+      const encoded = AdminMessage.encode(adminMsg).finish();
+
+      // Clear any existing metadata for this node before requesting (to ensure fresh data)
+      this.remoteNodeDeviceMetadata.delete(destinationNodeNum);
+
+      // Send the request
+      const adminPacket = protobufService.createAdminPacket(encoded, destinationNodeNum, this.localNodeInfo.nodeNum);
+      await this.transport.send(adminPacket);
+      logger.debug(`📡 Requested device metadata from remote node ${destinationNodeNum}`);
+
+      // Wait for the response
+      const maxWaitTime = 10000; // 10 seconds
+      const pollInterval = 250; // Check every 250ms
+      const maxPolls = maxWaitTime / pollInterval;
+
+      for (let i = 0; i < maxPolls; i++) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+
+        // Check if we have the device metadata for this remote node
+        if (this.remoteNodeDeviceMetadata.has(destinationNodeNum)) {
+          const metadata = this.remoteNodeDeviceMetadata.get(destinationNodeNum);
+          logger.debug(`✅ Received device metadata from remote node ${destinationNodeNum}`);
+          return metadata;
+        }
+      }
+
+      logger.warn(`⚠️ Device metadata not received from remote node ${destinationNodeNum} after waiting ${maxWaitTime / 1000}s`);
+      return null;
+    } catch (error) {
+      logger.error(`❌ Error requesting device metadata from remote node ${destinationNodeNum}:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Request all module configurations from the device for complete backup
    * This requests all 13 module config types defined in the protobufs
    */
@@ -8791,14 +9152,6 @@ class MeshtasticManager {
   // Get data from database instead of maintaining in-memory state
   getAllNodes(): DeviceInfo[] {
     const dbNodes = databaseService.getAllNodes();
-    if (dbNodes.length > 0) {
-      logger.debug('🔍 Sample dbNode from database:', {
-        nodeId: dbNodes[0].nodeId,
-        longName: dbNodes[0].longName,
-        role: dbNodes[0].role,
-        hopsAway: dbNodes[0].hopsAway
-      });
-    }
     return dbNodes.map(node => {
       // Get latest uptime from telemetry
       const uptimeTelemetry = databaseService.getLatestTelemetryForType(node.nodeId, 'uptimeSeconds');
@@ -8909,6 +9262,19 @@ class MeshtasticManager {
         deviceInfo.positionOverrideIsPrivate = Boolean(node.positionOverrideIsPrivate);
       }
 
+      // Add remote admin fields
+      if (node.hasRemoteAdmin !== null && node.hasRemoteAdmin !== undefined) {
+        deviceInfo.hasRemoteAdmin = Boolean(node.hasRemoteAdmin);
+        logger.debug(`🔍 Node ${node.nodeNum} hasRemoteAdmin: ${node.hasRemoteAdmin}`);
+      }
+      if (node.lastRemoteAdminCheck !== null && node.lastRemoteAdminCheck !== undefined) {
+        deviceInfo.lastRemoteAdminCheck = node.lastRemoteAdminCheck;
+      }
+      if (node.remoteAdminMetadata) {
+        deviceInfo.remoteAdminMetadata = node.remoteAdminMetadata;
+        logger.debug(`🔍 Node ${node.nodeNum} has remoteAdminMetadata`);
+      }
+
       return deviceInfo;
     });
   }
@@ -8990,6 +9356,11 @@ class MeshtasticManager {
       this.tracerouteInterval = null;
     }
 
+    if (this.remoteAdminScannerInterval) {
+      clearInterval(this.remoteAdminScannerInterval);
+      this.remoteAdminScannerInterval = null;
+    }
+
     if (this.announceInterval) {
       clearInterval(this.announceInterval);
       this.announceInterval = null;
@@ -9039,6 +9410,143 @@ class MeshtasticManager {
    */
   isUserDisconnected(): boolean {
     return this.userDisconnectedState;
+  }
+
+  // ============================================================
+  // Link Quality Management
+  // ============================================================
+
+  /**
+   * Get or initialize link quality for a node.
+   * Initial LQ = 8 - hops (clamped to 1-7 based on initial hop count)
+   * Range: 0 (dead) to 10 (excellent)
+   */
+  private getNodeLinkQuality(nodeNum: number, currentHops: number): { quality: number; lastHops: number } {
+    let lqData = this.nodeLinkQuality.get(nodeNum);
+
+    if (!lqData) {
+      // Initialize: LQ = INITIAL_BASE - hops (so 1-hop = 7, 7-hop = 1)
+      const initialQuality = Math.max(1, Math.min(LINK_QUALITY.INITIAL_BASE - 1, LINK_QUALITY.INITIAL_BASE - currentHops));
+      lqData = { quality: initialQuality, lastHops: currentHops };
+      this.nodeLinkQuality.set(nodeNum, lqData);
+
+      // Store initial LQ as telemetry
+      const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+      this.storeLinkQualityTelemetry(nodeNum, nodeId, initialQuality);
+
+      logger.debug(`📊 Link Quality initialized for ${nodeId}: ${initialQuality} (${currentHops} hops)`);
+    }
+
+    return lqData;
+  }
+
+  /**
+   * Update link quality for a node based on an event.
+   * Clamps result to MIN-MAX range (0-10).
+   */
+  private updateLinkQuality(nodeNum: number, adjustment: number, reason: string): void {
+    const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+    let lqData = this.nodeLinkQuality.get(nodeNum);
+
+    if (!lqData) {
+      // Initialize with default if not exists
+      lqData = { quality: LINK_QUALITY.DEFAULT_QUALITY, lastHops: LINK_QUALITY.DEFAULT_HOPS };
+      this.nodeLinkQuality.set(nodeNum, lqData);
+    }
+
+    const oldQuality = lqData.quality;
+    lqData.quality = Math.max(LINK_QUALITY.MIN, Math.min(LINK_QUALITY.MAX, lqData.quality + adjustment));
+
+    if (lqData.quality !== oldQuality) {
+      this.nodeLinkQuality.set(nodeNum, lqData);
+      this.storeLinkQualityTelemetry(nodeNum, nodeId, lqData.quality);
+      logger.debug(`📊 Link Quality for ${nodeId}: ${oldQuality} -> ${lqData.quality} (${adjustment >= 0 ? '+' : ''}${adjustment}, ${reason})`);
+    }
+  }
+
+  /**
+   * Update link quality based on message hop count comparison.
+   * - If hops <= previous: STABLE_MESSAGE_BONUS (+1)
+   * - If hops = previous + 1: no change
+   * - If hops >= previous + 2: DEGRADED_PATH_PENALTY (-1)
+   */
+  private updateLinkQualityForMessage(nodeNum: number, currentHops: number): void {
+    const lqData = this.getNodeLinkQuality(nodeNum, currentHops);
+    const hopDiff = currentHops - lqData.lastHops;
+
+    // Update lastHops for next comparison
+    lqData.lastHops = currentHops;
+    this.nodeLinkQuality.set(nodeNum, lqData);
+
+    if (hopDiff <= 0) {
+      // Stable or improved
+      this.updateLinkQuality(nodeNum, LINK_QUALITY.STABLE_MESSAGE_BONUS, `stable message (${currentHops} hops)`);
+    } else if (hopDiff === 1) {
+      // Increased by 1 - no change
+      logger.debug(`📊 Link Quality unchanged for node ${nodeNum.toString(16)}: hops increased by 1`);
+    } else {
+      // Increased by 2 or more
+      this.updateLinkQuality(nodeNum, LINK_QUALITY.DEGRADED_PATH_PENALTY, `degraded path (+${hopDiff} hops)`);
+    }
+  }
+
+  /**
+   * Store link quality as telemetry for graphing.
+   */
+  private storeLinkQualityTelemetry(nodeNum: number, nodeId: string, quality: number): void {
+    databaseService.insertTelemetry({
+      nodeId: nodeId,
+      nodeNum: nodeNum,
+      telemetryType: 'linkQuality',
+      timestamp: Date.now(),
+      value: quality,
+      unit: 'quality',
+      createdAt: Date.now(),
+    });
+  }
+
+  /**
+   * Handle failed traceroute - penalize link quality.
+   * Penalty: TRACEROUTE_FAIL_PENALTY (-2)
+   */
+  private handleTracerouteFailure(nodeNum: number): void {
+    this.updateLinkQuality(nodeNum, LINK_QUALITY.TRACEROUTE_FAIL_PENALTY, 'failed traceroute');
+  }
+
+  /**
+   * Handle PKI error - penalize link quality.
+   * Penalty: PKI_ERROR_PENALTY (-5)
+   */
+  private handlePkiError(nodeNum: number): void {
+    this.updateLinkQuality(nodeNum, LINK_QUALITY.PKI_ERROR_PENALTY, 'PKI error');
+  }
+
+  /**
+   * Check for timed-out traceroutes and penalize link quality.
+   * Timeout: TRACEROUTE_TIMEOUT_MS (5 minutes)
+   * Called periodically from the traceroute scheduler.
+   */
+  private checkTracerouteTimeouts(): void {
+    const now = Date.now();
+
+    for (const [nodeNum, timestamp] of this.pendingTracerouteTimestamps.entries()) {
+      if (now - timestamp > LINK_QUALITY.TRACEROUTE_TIMEOUT_MS) {
+        // Traceroute timed out
+        const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+        logger.debug(`🗺️ Auto-traceroute to ${nodeId} timed out after 5 minutes`);
+
+        // Mark as failed in database
+        databaseService.updateAutoTracerouteResultByNodeAsync(nodeNum, false)
+          .catch(err => logger.error('Failed to update auto-traceroute result:', err));
+
+        // Clean up tracking
+        this.pendingAutoTraceroutes.delete(nodeNum);
+        this.pendingTracerouteTimestamps.delete(nodeNum);
+
+        // Penalize link quality for failed traceroute (-2)
+        this.handleTracerouteFailure(nodeNum);
+      }
+    }
   }
 }
 

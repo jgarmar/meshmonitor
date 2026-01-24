@@ -33,11 +33,12 @@ import { systemBackupService } from './services/systemBackupService.js';
 import { systemRestoreService } from './services/systemRestoreService.js';
 import { duplicateKeySchedulerService } from './services/duplicateKeySchedulerService.js';
 import { solarMonitoringService } from './services/solarMonitoringService.js';
+import { newsService } from './services/newsService.js';
 import { inactiveNodeNotificationService } from './services/inactiveNodeNotificationService.js';
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import { getUserNotificationPreferencesAsync, saveUserNotificationPreferencesAsync, applyNodeNamePrefix } from './utils/notificationFiltering.js';
 import { upgradeService } from './services/upgradeService.js';
-import { enhanceNodeForClient } from './utils/nodeEnhancer.js';
+import { enhanceNodeForClient, filterNodesByChannelPermission } from './utils/nodeEnhancer.js';
 import { dynamicCspMiddleware, refreshTileHostnameCache } from './middleware/dynamicCsp.js';
 import { PortNum } from './constants/meshtastic.js';
 
@@ -379,6 +380,18 @@ setTimeout(async () => {
     });
     logger.debug('✅ Loaded auto key repair settings');
 
+    // Load remote admin scanner interval
+    const remoteAdminScannerInterval = databaseService.getSetting('remoteAdminScannerIntervalMinutes');
+    if (remoteAdminScannerInterval !== null) {
+      const intervalMinutes = parseInt(remoteAdminScannerInterval);
+      if (!isNaN(intervalMinutes) && intervalMinutes >= 0 && intervalMinutes <= 60) {
+        meshtasticManager.setRemoteAdminScannerInterval(intervalMinutes);
+        logger.debug(
+          `✅ Loaded saved remote admin scanner interval: ${intervalMinutes} minutes${intervalMinutes === 0 ? ' (disabled)' : ''}`
+        );
+      }
+    }
+
     // NOTE: We no longer mark existing nodes as welcomed on startup.
     // This is now handled when autoWelcomeEnabled is first changed to 'true'
     // via the settings endpoint. This prevents welcoming existing nodes when
@@ -398,6 +411,10 @@ setTimeout(async () => {
     // Initialize solar monitoring service
     solarMonitoringService.initialize();
     logger.debug('Solar monitoring service initialized');
+
+    // Initialize news service (fetches news from meshmonitor.org)
+    newsService.initialize();
+    logger.debug('News service initialized');
 
     // Initialize database maintenance service
     databaseMaintenanceService.initialize();
@@ -604,6 +621,7 @@ import linkPreviewRoutes from './routes/linkPreviewRoutes.js';
 import scriptContentRoutes from './routes/scriptContentRoutes.js';
 import apiTokenRoutes from './routes/apiTokenRoutes.js';
 import channelDatabaseRoutes from './routes/channelDatabaseRoutes.js';
+import newsRoutes from './routes/newsRoutes.js';
 import v1Router from './routes/v1/index.js';
 
 // CSRF token endpoint (must be before CSRF protection middleware)
@@ -670,6 +688,9 @@ apiRouter.use('/packets', optionalAuth(), packetRoutes);
 // Solar monitoring routes
 apiRouter.use('/solar', optionalAuth(), solarRoutes);
 
+// News routes (public feed, authenticated status endpoints)
+apiRouter.use('/news', newsRoutes);
+
 // Upgrade routes (requires authentication)
 apiRouter.use('/upgrade', upgradeRoutes);
 
@@ -689,10 +710,12 @@ apiRouter.use('/', scriptContentRoutes);
  */
 apiRouter.get('/nodes', optionalAuth(), async (req, res) => {
   try {
-    const nodes = meshtasticManager.getAllNodes();
+    const allNodes = meshtasticManager.getAllNodes();
     const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
 
-    const enhancedNodes = await Promise.all(nodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions)));
+    // Filter nodes based on channel read permissions
+    const filteredNodes = await filterNodesByChannelPermission(allNodes, (req as any).user);
+    const enhancedNodes = await Promise.all(filteredNodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions)));
     res.json(enhancedNodes);
   } catch (error) {
     logger.error('Error fetching nodes:', error);
@@ -703,7 +726,10 @@ apiRouter.get('/nodes', optionalAuth(), async (req, res) => {
 apiRouter.get('/nodes/active', optionalAuth(), async (req, res) => {
   try {
     const days = parseInt(req.query.days as string) || 7;
-    const dbNodes = databaseService.getActiveNodes(days);
+    const allDbNodes = databaseService.getActiveNodes(days);
+
+    // Filter nodes based on channel read permissions
+    const dbNodes = await filterNodesByChannelPermission(allDbNodes, (req as any).user);
 
     // Map raw DB nodes to DeviceInfo format then enhance
     const maskedNodes = await Promise.all(dbNodes.map(async node => {
@@ -1328,6 +1354,97 @@ apiRouter.delete('/nodes/:nodeId/position-override', requirePermission('nodes', 
   }
 });
 
+// Delete neighbor info for a node
+apiRouter.delete('/nodes/:nodeId/neighbors', requirePermission('nodes', 'write'), async (req, res) => {
+  try {
+    const { nodeId } = req.params;
+
+    // Convert nodeId (hex string like !a1b2c3d4) to nodeNum (integer)
+    const nodeNumStr = nodeId.replace('!', '');
+
+    // Validate hex string format (must be exactly 8 hex characters)
+    if (!/^[0-9a-fA-F]{8}$/.test(nodeNumStr)) {
+      const errorResponse: ApiErrorResponse = {
+        error: 'Invalid nodeId format',
+        code: 'INVALID_NODE_ID',
+        details: 'nodeId must be in format !XXXXXXXX (8 hex characters)',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    const nodeNum = parseInt(nodeNumStr, 16);
+
+    // Delete neighbor info from database
+    const deletedCount = await databaseService.deleteNeighborInfoForNodeAsync(nodeNum);
+
+    res.json({
+      success: true,
+      nodeNum,
+      deletedCount,
+      message: `Deleted ${deletedCount} neighbor records`,
+    });
+  } catch (error) {
+    logger.error('Error deleting neighbor info:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to delete neighbor info',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Manually scan a node for remote admin capability
+apiRouter.post('/nodes/:nodeNum/scan-remote-admin', requirePermission('settings', 'write'), async (req, res) => {
+  try {
+    const { nodeNum } = req.params;
+    const parsedNodeNum = parseInt(nodeNum, 10);
+
+    if (isNaN(parsedNodeNum)) {
+      const errorResponse: ApiErrorResponse = {
+        error: 'Invalid nodeNum format',
+        code: 'INVALID_NODE_NUM',
+        details: 'nodeNum must be a valid integer',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    // Check if the node exists
+    const node = databaseService.getNode(parsedNodeNum);
+    if (!node) {
+      const errorResponse: ApiErrorResponse = {
+        error: 'Node not found',
+        code: 'NODE_NOT_FOUND',
+        details: `No node found with nodeNum ${parsedNodeNum}`,
+      };
+      res.status(404).json(errorResponse);
+      return;
+    }
+
+    logger.info(`Manual remote admin scan requested for node ${parsedNodeNum}`);
+
+    // Perform the scan
+    const result = await meshtasticManager.scanNodeForRemoteAdmin(parsedNodeNum);
+
+    res.json({
+      success: true,
+      nodeNum: parsedNodeNum,
+      hasRemoteAdmin: result.hasRemoteAdmin,
+      metadata: result.metadata,
+    });
+  } catch (error) {
+    logger.error('Error scanning node for remote admin:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to scan node for remote admin',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
 // Get nodes with key security issues (low-entropy or duplicate keys)
 apiRouter.get('/nodes/security-issues', optionalAuth(), (_req, res) => {
   try {
@@ -1700,9 +1817,10 @@ apiRouter.get('/messages/unread-counts', optionalAuth(), async (req, res) => {
     // Get DM unread counts if user has messages permission
     if (hasMessagesRead && localNodeInfo) {
       const directMessages: { [nodeId: string]: number } = {};
-      // Get all nodes that have DMs
+      // Get all nodes that have DMs, filtered by channel permission
       const allNodes = meshtasticManager.getAllNodes();
-      for (const node of allNodes) {
+      const visibleNodes = await filterNodesByChannelPermission(allNodes, req.user);
+      for (const node of visibleNodes) {
         if (node.user?.id) {
           const count = await databaseService.getUnreadDMCountAsync(localNodeInfo.nodeId, node.user.id, userId);
           if (count > 0) {
@@ -2626,6 +2744,47 @@ apiRouter.post('/neighborinfo/request', requirePermission('traceroute', 'write')
   }
 });
 
+// Telemetry request endpoint (request telemetry from remote node)
+apiRouter.post('/telemetry/request', requirePermission('messages', 'write'), async (req, res) => {
+  try {
+    const { destination, telemetryType } = req.body;
+    if (!destination) {
+      return res.status(400).json({ error: 'Destination node number is required' });
+    }
+
+    // Validate telemetry type if provided
+    const validTypes = ['device', 'environment', 'airQuality', 'power'];
+    if (telemetryType && !validTypes.includes(telemetryType)) {
+      return res.status(400).json({ error: `Invalid telemetry type. Must be one of: ${validTypes.join(', ')}` });
+    }
+
+    const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
+
+    // Look up the node to get its channel
+    const node = databaseService.getNode(destinationNum);
+    const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
+
+    const { packetId, requestId } = await meshtasticManager.sendTelemetryRequest(
+      destinationNum,
+      channel,
+      telemetryType as 'device' | 'environment' | 'airQuality' | 'power' | undefined
+    );
+
+    const typeLabel = telemetryType || 'device';
+    logger.info(`📊 Telemetry request (${typeLabel}) sent to ${destinationNum.toString(16)} on channel ${channel}, packetId=${packetId}, requestId=${requestId}`);
+
+    res.json({
+      success: true,
+      message: `Telemetry request (${typeLabel}) sent to ${destinationNum.toString(16)} on channel ${channel}`,
+      packetId,
+      requestId
+    });
+  } catch (error) {
+    logger.error('Error sending telemetry request:', error);
+    res.status(500).json({ error: 'Failed to send telemetry request' });
+  }
+});
+
 // Get recent traceroutes (last 24 hours)
 apiRouter.get('/traceroutes/recent', (req, res) => {
   try {
@@ -2795,7 +2954,9 @@ const getEffectivePosition = (node: ReturnType<typeof databaseService.getNode>) 
   if (!node) return { latitude: undefined, longitude: undefined };
 
   // Check for position override first
-  if (node.positionOverrideEnabled === true && node.latitudeOverride != null && node.longitudeOverride != null) {
+  // Note: SQLite returns 1 for boolean true, PostgreSQL/MySQL return true via Drizzle
+  // Using truthy check handles both cases (1 and true are both truthy)
+  if (node.positionOverrideEnabled && node.latitudeOverride != null && node.longitudeOverride != null) {
     return { latitude: node.latitudeOverride, longitude: node.longitudeOverride };
   }
 
@@ -3030,6 +3191,66 @@ apiRouter.get('/telemetry/:nodeId/rates', optionalAuth(), async (req, res) => {
   }
 });
 
+// Get smart hops statistics (min/max/avg hop counts over time) for a node
+apiRouter.get('/telemetry/:nodeId/smarthops', optionalAuth(), async (req, res) => {
+  try {
+    // Allow users with info read OR dashboard read
+    if (
+      !req.user?.isAdmin &&
+      !await hasPermission(req.user!, 'info', 'read') &&
+      !await hasPermission(req.user!, 'dashboard', 'read')
+    ) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    const { nodeId } = req.params;
+    // Validate and clamp hours (1-168, default 24)
+    const hoursParam = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
+    // Validate and clamp interval (5-60 minutes, default 15)
+    const intervalParam = Math.max(5, Math.min(60, parseInt(req.query.interval as string) || 15));
+
+    // Calculate cutoff timestamp for filtering
+    const cutoffTime = Date.now() - hoursParam * 60 * 60 * 1000;
+
+    // Get smart hops statistics
+    const stats = await databaseService.getSmartHopsStatsAsync(nodeId, cutoffTime, intervalParam);
+
+    res.json({ success: true, data: stats });
+  } catch (error) {
+    logger.error('Error fetching smart hops stats:', error);
+    res.status(500).json({ error: 'Failed to fetch smart hops statistics' });
+  }
+});
+
+// Get link quality history for a node
+apiRouter.get('/telemetry/:nodeId/linkquality', optionalAuth(), async (req, res) => {
+  try {
+    // Allow users with info read OR dashboard read
+    if (
+      !req.user?.isAdmin &&
+      !await hasPermission(req.user!, 'info', 'read') &&
+      !await hasPermission(req.user!, 'dashboard', 'read')
+    ) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    const { nodeId } = req.params;
+    // Validate and clamp hours (1-168, default 24)
+    const hoursParam = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
+
+    // Calculate cutoff timestamp for filtering
+    const cutoffTime = Date.now() - hoursParam * 60 * 60 * 1000;
+
+    // Get link quality history
+    const history = await databaseService.getLinkQualityHistoryAsync(nodeId, cutoffTime);
+
+    res.json({ success: true, data: history });
+  } catch (error) {
+    logger.error('Error fetching link quality history:', error);
+    res.status(500).json({ error: 'Failed to fetch link quality history' });
+  }
+});
+
 // Delete telemetry data for a specific node and type
 apiRouter.delete('/telemetry/:nodeId/:telemetryType', requireAuth(), requirePermission('info', 'write'), (req, res) => {
   try {
@@ -3052,9 +3273,12 @@ apiRouter.delete('/telemetry/:nodeId/:telemetryType', requireAuth(), requirePerm
 });
 
 // Check which nodes have telemetry data
-apiRouter.get('/telemetry/available/nodes', requirePermission('info', 'read'), (_req, res) => {
+apiRouter.get('/telemetry/available/nodes', requirePermission('info', 'read'), async (req, res) => {
   try {
-    const nodes = databaseService.getAllNodes();
+    const allNodes = databaseService.getAllNodes();
+    // Filter nodes based on channel read permissions
+    const nodes = await filterNodesByChannelPermission(allNodes, (req as any).user);
+
     const nodesWithTelemetry: string[] = [];
     const nodesWithWeather: string[] = [];
     const nodesWithEstimatedPosition: string[] = [];
@@ -3189,12 +3413,14 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       result.connection = { error: 'Failed to get connection status' };
     }
 
-    // 2. Nodes (always available with optionalAuth)
+    // 2. Nodes (always available with optionalAuth, filtered by channel permissions)
     try {
-      const nodes = meshtasticManager.getAllNodes();
+      const allNodes = meshtasticManager.getAllNodes();
       const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
 
-      result.nodes = await Promise.all(nodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions)));
+      // Filter nodes based on channel read permissions
+      const filteredNodes = await filterNodesByChannelPermission(allNodes, (req as any).user);
+      result.nodes = await Promise.all(filteredNodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions)));
     } catch (error) {
       logger.error('Error fetching nodes in poll:', error);
       result.nodes = [];
@@ -3252,7 +3478,9 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       if (hasMessagesRead && localNodeInfo) {
         const directMessages: { [nodeId: string]: number } = {};
         const allNodes = meshtasticManager.getAllNodes();
-        for (const node of allNodes) {
+        // Filter nodes by channel permission
+        const visibleNodes = await filterNodesByChannelPermission(allNodes, req.user);
+        for (const node of visibleNodes) {
           if (node.user?.id) {
             const count = await databaseService.getUnreadDMCountAsync(localNodeInfo.nodeId, node.user.id, userId);
             if (count > 0) {
@@ -3318,11 +3546,14 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       logger.error('Error fetching channels in poll:', error);
     }
 
-    // 6. Telemetry availability (requires info:read permission)
+    // 6. Telemetry availability (requires info:read permission, filtered by channel permissions)
     try {
       const hasInfoRead = req.user?.isAdmin || await hasPermission(req.user!, 'info', 'read');
       if (hasInfoRead) {
-        const nodes = databaseService.getAllNodes();
+        const allNodes = databaseService.getAllNodes();
+        // Filter nodes based on channel read permissions
+        const nodes = await filterNodesByChannelPermission(allNodes, req.user);
+
         const nodesWithTelemetry: string[] = [];
         const nodesWithWeather: string[] = [];
         const nodesWithEstimatedPosition: string[] = [];
@@ -4402,6 +4633,8 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'autoKeyManagementIntervalMinutes',
       'autoKeyManagementMaxExchanges',
       'autoKeyManagementAutoPurge',
+      'remoteAdminScannerIntervalMinutes',
+      'remoteAdminScannerExpirationHours',
     ];
     const filteredSettings: Record<string, string> = {};
 
@@ -4631,6 +4864,14 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       const interval = parseInt(filteredSettings.tracerouteIntervalMinutes);
       if (!isNaN(interval) && interval >= 0 && interval <= 60) {
         meshtasticManager.setTracerouteInterval(interval);
+      }
+    }
+
+    // Apply remote admin scanner interval if changed
+    if ('remoteAdminScannerIntervalMinutes' in filteredSettings) {
+      const interval = parseInt(filteredSettings.remoteAdminScannerIntervalMinutes);
+      if (!isNaN(interval) && interval >= 0 && interval <= 60) {
+        meshtasticManager.setRemoteAdminScannerInterval(interval);
       }
     }
 
@@ -6050,6 +6291,79 @@ apiRouter.post('/admin/load-owner', requireAdmin(), async (req, res) => {
   }
 });
 
+// Admin get device metadata endpoint - requires admin role
+apiRouter.post('/admin/get-device-metadata', requireAdmin(), async (req, res) => {
+  try {
+    const { nodeNum } = req.body;
+
+    const destinationNodeNum = nodeNum !== undefined ? Number(nodeNum) : (meshtasticManager.getLocalNodeInfo()?.nodeNum || 0);
+    const localNodeNum = meshtasticManager.getLocalNodeInfo()?.nodeNum || 0;
+    const isLocalNode = destinationNodeNum === 0 || destinationNodeNum === localNodeNum;
+
+    if (isLocalNode) {
+      // For local node, return cached device metadata from local node info
+      const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+      if (localNodeInfo) {
+        // Get node data from database for additional info
+        const nodeData = localNodeInfo.nodeNum ? databaseService.getNode(localNodeInfo.nodeNum) : null;
+        return res.json({
+          deviceMetadata: {
+            firmwareVersion: localNodeInfo.firmwareVersion || 'Unknown',
+            hwModel: nodeData?.hwModel || 0,
+            role: nodeData?.role || 0,
+            hasWifi: false,  // Not tracked for local node
+            hasBluetooth: false,
+            hasEthernet: false,
+            canShutdown: false,
+            hasRemoteHardware: false,
+            deviceStateVersion: 0,
+            positionFlags: 0
+          }
+        });
+      } else {
+        return res.status(404).json({ error: 'Local node information not available' });
+      }
+    } else {
+      // For remote node, request device metadata
+      const metadata = await meshtasticManager.requestRemoteDeviceMetadata(destinationNodeNum);
+      if (metadata) {
+        // Successfully retrieved metadata - update hasRemoteAdmin flag and save metadata
+        try {
+          await databaseService.updateNodeRemoteAdminStatusAsync(
+            destinationNodeNum,
+            true,
+            JSON.stringify(metadata)
+          );
+          logger.info(`✅ Updated hasRemoteAdmin=true and saved metadata for node ${destinationNodeNum}`);
+        } catch (dbError) {
+          logger.error(`Failed to save remote admin status for node ${destinationNodeNum}:`, dbError);
+          // Continue with response even if database update fails
+        }
+
+        return res.json({
+          deviceMetadata: {
+            firmwareVersion: metadata.firmwareVersion || 'Unknown',
+            deviceStateVersion: metadata.deviceStateVersion || 0,
+            canShutdown: metadata.canShutdown || false,
+            hasWifi: metadata.hasWifi || false,
+            hasBluetooth: metadata.hasBluetooth || false,
+            hasEthernet: metadata.hasEthernet || false,
+            role: metadata.role || 0,
+            positionFlags: metadata.positionFlags || 0,
+            hwModel: metadata.hwModel || 0,
+            hasRemoteHardware: metadata.hasRemoteHardware || false
+          }
+        });
+      } else {
+        return res.status(404).json({ error: `Device metadata not received from remote node ${destinationNodeNum}` });
+      }
+    }
+  } catch (error: any) {
+    logger.error('Error getting device metadata:', error);
+    res.status(500).json({ error: error.message || 'Failed to get device metadata' });
+  }
+});
+
 // Admin commands endpoint - requires admin role
 // Admin endpoint: Export configuration for remote nodes
 apiRouter.post('/admin/export-config', requireAdmin(), async (req, res) => {
@@ -6431,7 +6745,29 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
         if (!params.config) {
           return res.status(400).json({ error: 'config is required for setSecurityConfig' });
         }
-        adminMessage = protobufService.createSetSecurityConfigMessage(params.config, sessionPasskey || undefined);
+        // IMPORTANT: Preserve existing public/private keys when updating security config
+        // If we don't include them, the firmware may reset them to empty/random values
+        // Only do this for LOCAL node - for remote nodes we don't have their private key
+        {
+          let configToSend = params.config;
+          if (isLocalNode) {
+            const existingKeys = meshtasticManager.getSecurityKeys();
+            configToSend = {
+              ...params.config,
+              // Include existing keys if not explicitly provided
+              publicKey: params.config.publicKey || existingKeys.publicKey,
+              privateKey: params.config.privateKey || existingKeys.privateKey
+            };
+            logger.debug('Preserving existing public/private keys for local node security config update');
+          } else {
+            // For remote nodes, explicitly exclude publicKey/privateKey to let firmware preserve them
+            // We don't have the remote node's private key, so we can't include it
+            const { publicKey, privateKey, ...remoteConfig } = params.config;
+            configToSend = remoteConfig;
+            logger.debug('Excluding publicKey/privateKey from remote node security config update');
+          }
+          adminMessage = protobufService.createSetSecurityConfigMessage(configToSend, sessionPasskey || undefined);
+        }
         break;
       case 'setFixedPosition':
         if (params.latitude === undefined || params.longitude === undefined) {
@@ -6494,9 +6830,24 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
     // Send the admin command
     await meshtasticManager.sendAdminCommand(adminMessage, destinationNodeNum);
 
-    res.json({ 
-      success: true, 
-      message: `Admin command '${command}' sent to node ${destinationNodeNum}` 
+    // If command succeeded on a remote node, update hasRemoteAdmin flag
+    if (!isLocalNode) {
+      try {
+        await databaseService.updateNodeRemoteAdminStatusAsync(
+          destinationNodeNum,
+          true,
+          null  // Don't overwrite existing metadata, just set the flag
+        );
+        logger.info(`✅ Updated hasRemoteAdmin=true for node ${destinationNodeNum} after successful '${command}' command`);
+      } catch (dbError) {
+        logger.error(`Failed to update hasRemoteAdmin for node ${destinationNodeNum}:`, dbError);
+        // Continue with response even if database update fails
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Admin command '${command}' sent to node ${destinationNodeNum}`
     });
   } catch (error: any) {
     logger.error('Error executing admin command:', error);

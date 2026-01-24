@@ -26,6 +26,7 @@ import AutoWelcomeSection from './components/AutoWelcomeSection';
 import AutoResponderSection from './components/AutoResponderSection';
 import AutoKeyManagementSection from './components/AutoKeyManagementSection';
 import TimerTriggersSection from './components/TimerTriggersSection';
+import RemoteAdminScannerSection from './components/RemoteAdminScannerSection';
 import SectionNav from './components/SectionNav';
 import { ToastProvider, useToast } from './components/ToastContainer';
 import { RebootModal } from './components/RebootModal';
@@ -37,6 +38,7 @@ import { SystemStatusModal } from './components/SystemStatusModal';
 import { NodePopup } from './components/NodePopup';
 import { EmojiPickerModal } from './components/EmojiPickerModal';
 import { AdvancedNodeFilterPopup } from './components/AdvancedNodeFilterPopup';
+import { NewsPopup } from './components/NewsPopup';
 // import { version } from '../package.json' // Removed - footer no longer displayed
 import { type TemperatureUnit } from './utils/temperature';
 // calculateDistance and formatDistance moved to useTraceroutePaths hook
@@ -118,6 +120,8 @@ function App() {
   const [configRefreshTrigger, setConfigRefreshTrigger] = useState(0);
   const [showTracerouteHistoryModal, setShowTracerouteHistoryModal] = useState(false);
   const [showPurgeDataModal, setShowPurgeDataModal] = useState(false);
+  const [showNewsPopup, setShowNewsPopup] = useState(false);
+  const [forceShowAllNews, setForceShowAllNews] = useState(false);
   const [showPositionOverrideModal, setShowPositionOverrideModal] = useState(false);
   const [selectedRouteSegment, setSelectedRouteSegment] = useState<{ nodeNum1: number; nodeNum2: number } | null>(null);
   const [emojiPickerMessage, setEmojiPickerMessage] = useState<MeshMessage | null>(null);
@@ -280,7 +284,6 @@ function App() {
   const {
     showPaths,
     showRoute,
-    showNeighborInfo,
     showMqttNodes,
     showEstimatedPositions,
     setMapCenterTarget,
@@ -380,6 +383,24 @@ function App() {
       }
     };
     fetchChannelDatabaseEntries();
+  }, [authStatus?.authenticated]);
+
+  // Show news popup when authenticated user has unread news
+  useEffect(() => {
+    const checkUnreadNews = async () => {
+      if (!authStatus?.authenticated) return;
+      try {
+        const response = await api.getUnreadNews();
+        if (response.items && response.items.length > 0) {
+          setForceShowAllNews(false);
+          setShowNewsPopup(true);
+        }
+      } catch (err) {
+        // News might not be available, fail silently
+        logger.debug('Failed to fetch unread news:', err);
+      }
+    };
+    checkUnreadNews();
   }, [authStatus?.authenticated]);
 
   // Messaging context
@@ -565,6 +586,9 @@ function App() {
 
   // NeighborInfo request loading state
   const [neighborInfoLoading, setNeighborInfoLoading] = useState<string | null>(null);
+
+  // Telemetry request loading state
+  const [telemetryRequestLoading, setTelemetryRequestLoading] = useState<string | null>(null);
 
   // Play notification sound using Web Audio API
   const playNotificationSound = useCallback(() => {
@@ -1306,9 +1330,9 @@ function App() {
   // Traceroutes are now synced via the poll mechanism (processPollData)
   // This provides consistent data across Dashboard Widget, Node View, and Traceroute History Modal
 
-  // Fetch neighbor info when showNeighborInfo is enabled
+  // Fetch neighbor info when connected (needed for both map display and Messages tab)
   useEffect(() => {
-    if (showNeighborInfo && shouldShowData()) {
+    if (shouldShowData()) {
       fetchNeighborInfo();
       // Only auto-refresh when connected (not when viewing cached data)
       if (connectionStatus === 'connected') {
@@ -1316,7 +1340,7 @@ function App() {
         return () => clearInterval(interval);
       }
     }
-  }, [showNeighborInfo, connectionStatus]);
+  }, [connectionStatus]);
 
   // Fetch position history when a mobile node is selected
   useEffect(() => {
@@ -2582,6 +2606,46 @@ function App() {
     } catch (error) {
       logger.error('Failed to send neighborinfo request:', error);
       setNeighborInfoLoading(null);
+    }
+  };
+
+  const handleRequestTelemetry = async (nodeId: string, telemetryType: 'device' | 'environment' | 'airQuality' | 'power') => {
+    if (connectionStatus !== 'connected') {
+      return;
+    }
+
+    // Prevent duplicate requests (debounce logic)
+    if (telemetryRequestLoading === nodeId) {
+      logger.debug(`📊 Telemetry request already in progress for ${nodeId}`);
+      return;
+    }
+
+    try {
+      // Set loading state
+      setTelemetryRequestLoading(nodeId);
+
+      // Convert nodeId to node number for backend
+      const nodeNumStr = nodeId.replace('!', '');
+      const nodeNum = parseInt(nodeNumStr, 16);
+
+      // Use direct fetch with CSRF token
+      await authFetch(`${baseUrl}/api/telemetry/request`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ destination: nodeNum, telemetryType }),
+      });
+
+      logger.debug(`📊 Telemetry request (${telemetryType}) sent to ${nodeId}`);
+
+      // Clear loading state after 30 seconds
+      setTimeout(() => {
+        setTelemetryRequestLoading(null);
+      }, 30000);
+    } catch (error) {
+      logger.error('Failed to send telemetry request:', error);
+      setTelemetryRequestLoading(null);
     }
   };
 
@@ -4009,6 +4073,10 @@ function App() {
             setUnreadCounts(prev => ({ ...prev, [channels[0].id]: 0 }));
           }
         }}
+        onNewsClick={() => {
+          setForceShowAllNews(true);
+          setShowNewsPopup(true);
+        }}
         baseUrl={baseUrl}
         connectedNodeName={connectedNodeName}
       />
@@ -4121,6 +4189,7 @@ function App() {
             positionLoading={positionLoading}
             nodeInfoLoading={nodeInfoLoading}
             neighborInfoLoading={neighborInfoLoading}
+            telemetryRequestLoading={telemetryRequestLoading}
             timeFormat={timeFormat}
             dateFormat={dateFormat}
             temperatureUnit={temperatureUnit}
@@ -4134,6 +4203,7 @@ function App() {
             handleExchangePosition={handleExchangePosition}
             handleExchangeNodeInfo={handleExchangeNodeInfo}
             handleRequestNeighborInfo={handleRequestNeighborInfo}
+            handleRequestTelemetry={handleRequestTelemetry}
             handleDeleteMessage={handleDeleteMessage}
             handleSenderClick={handleSenderClick}
             handleSendTapback={handleSendTapback}
@@ -4242,6 +4312,7 @@ function App() {
               items={[
                 { id: 'auto-welcome', label: t('automation.welcome.title', 'Auto Welcome') },
                 { id: 'auto-traceroute', label: t('automation.traceroute.title', 'Auto Traceroute') },
+                { id: 'remote-admin-scanner', label: t('automation.remote_admin_scanner.title', 'Remote Admin Scanner') },
                 { id: 'auto-acknowledge', label: t('automation.acknowledge.title', 'Auto Acknowledge') },
                 { id: 'auto-announce', label: t('automation.announce.title', 'Auto Announce') },
                 { id: 'auto-responder', label: t('automation.auto_responder.title', 'Auto Responder') },
@@ -4271,6 +4342,11 @@ function App() {
                   intervalMinutes={tracerouteIntervalMinutes}
                   baseUrl={baseUrl}
                   onIntervalChange={setTracerouteIntervalMinutes}
+                />
+              </div>
+              <div id="remote-admin-scanner">
+                <RemoteAdminScannerSection
+                  baseUrl={baseUrl}
                 />
               </div>
               <div id="auto-acknowledge">
@@ -4410,6 +4486,17 @@ function App() {
         traceroutes={traceroutes}
         currentNodeId={currentNodeId}
         distanceUnit={distanceUnit}
+      />
+
+      {/* News Popup */}
+      <NewsPopup
+        isOpen={showNewsPopup}
+        onClose={() => {
+          setShowNewsPopup(false);
+          setForceShowAllNews(false);
+        }}
+        forceShowAll={forceShowAllNews}
+        isAuthenticated={authStatus?.authenticated || false}
       />
 
       {/* System Status Modal */}

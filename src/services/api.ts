@@ -738,6 +738,22 @@ class ApiService {
     return response.json();
   }
 
+  async purgeNeighborInfo(nodeId: string) {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/nodes/${nodeId}/neighbors`, {
+      method: 'DELETE',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to purge neighbor info');
+    }
+
+    return response.json();
+  }
+
   async getLongestActiveRouteSegment() {
     await this.ensureBaseUrl();
     const response = await fetch(`${this.baseUrl}/api/route-segments/longest-active`);
@@ -1250,6 +1266,73 @@ class ApiService {
     progress: RetroactiveDecryptionProgress | null;
   }> {
     return this.get('/api/channel-database/retroactive-decrypt/progress');
+  }
+
+  // ==================== News API ====================
+
+  /**
+   * Get cached news feed
+   */
+  async getNewsFeed(): Promise<{
+    version: string;
+    lastUpdated: string;
+    items: Array<{
+      id: string;
+      title: string;
+      content: string;
+      date: string;
+      category: 'release' | 'security' | 'feature' | 'maintenance';
+      priority: 'normal' | 'important';
+    }>;
+  }> {
+    return this.get('/api/news');
+  }
+
+  /**
+   * Get user's news status (last seen, dismissed items)
+   */
+  async getUserNewsStatus(): Promise<{
+    lastSeenNewsId: string | null;
+    dismissedNewsIds: string[];
+  }> {
+    return this.get('/api/news/user/status');
+  }
+
+  /**
+   * Update user's news status
+   */
+  async updateUserNewsStatus(lastSeenNewsId: string | null, dismissedNewsIds: string[]): Promise<{
+    success: boolean;
+  }> {
+    return this.post('/api/news/user/status', {
+      lastSeenNewsId,
+      dismissedNewsIds,
+    });
+  }
+
+  /**
+   * Dismiss a specific news item
+   */
+  async dismissNewsItem(newsId: string): Promise<{
+    success: boolean;
+  }> {
+    return this.post(`/api/news/dismiss/${newsId}`);
+  }
+
+  /**
+   * Get unread news items for the current user
+   */
+  async getUnreadNews(): Promise<{
+    items: Array<{
+      id: string;
+      title: string;
+      content: string;
+      date: string;
+      category: 'release' | 'security' | 'feature' | 'maintenance';
+      priority: 'normal' | 'important';
+    }>;
+  }> {
+    return this.get('/api/news/unread');
   }
 }
 

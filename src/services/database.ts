@@ -56,6 +56,10 @@ import { migration as notificationChannelSettingsMigration, runMigration049Postg
 import { migration as channelDatabaseMigration, runMigration050Postgres, runMigration050Mysql } from '../server/migrations/050_add_channel_database.js';
 import { migration as decryptedByMessagesMigration, runMigration051Postgres, runMigration051Mysql } from '../server/migrations/051_add_decrypted_by_to_messages.js';
 import { migration as upgradeHistorySchemaMigration, runMigration052Postgres, runMigration052Mysql } from '../server/migrations/052_fix_upgrade_history_schema.js';
+import { migration as viewOnMapPermissionMigration, runMigration053Postgres, runMigration053Mysql } from '../server/migrations/053_add_view_on_map_permission.js';
+import { migration as newsTablesMigration, runMigration054Postgres, runMigration054Mysql } from '../server/migrations/054_add_news_tables.js';
+import { migration as remoteAdminColumnsMigration, runMigration055Postgres, runMigration055Mysql } from '../server/migrations/055_add_remote_admin_columns.js';
+import { migration as backupHistoryColumnsMigration, runMigration056Postgres, runMigration056Mysql } from '../server/migrations/056_fix_backup_history_columns.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
 
 // Drizzle ORM imports for dual-database support
@@ -135,6 +139,10 @@ export interface DbNode {
   longitudeOverride?: number; // Override longitude
   altitudeOverride?: number; // Override altitude
   positionOverrideIsPrivate?: boolean; // Override privacy (false = public, true = private)
+  // Remote admin discovery (Migration 055)
+  hasRemoteAdmin?: boolean; // Has remote admin access
+  lastRemoteAdminCheck?: number; // Unix timestamp ms of last check
+  remoteAdminMetadata?: string; // JSON string of metadata response
   createdAt: number;
   updatedAt: number;
 }
@@ -783,6 +791,9 @@ class DatabaseService {
             longitudeOverride: node.longitudeOverride ?? undefined,
             altitudeOverride: node.altitudeOverride ?? undefined,
             positionOverrideIsPrivate: node.positionOverrideIsPrivate ?? undefined,
+            hasRemoteAdmin: node.hasRemoteAdmin ?? undefined,
+            lastRemoteAdminCheck: node.lastRemoteAdminCheck ?? undefined,
+            remoteAdminMetadata: node.remoteAdminMetadata ?? undefined,
             createdAt: node.createdAt,
             updatedAt: node.updatedAt,
           };
@@ -882,6 +893,10 @@ class DatabaseService {
     this.runChannelDatabaseMigration();
     this.runDecryptedByMessagesMigration();
     this.runUpgradeHistorySchemaMigration();
+    this.runViewOnMapPermissionMigration();
+    this.runNewsTablesMigration();
+    this.runRemoteAdminColumnsMigration();
+    this.runBackupHistoryColumnsMigration();
     this.ensureAutomationDefaults();
     this.warmupCaches();
     this.isInitialized = true;
@@ -1914,6 +1929,86 @@ class DatabaseService {
     }
   }
 
+  private runViewOnMapPermissionMigration(): void {
+    try {
+      const migrationKey = 'migration_053_view_on_map_permission';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ View on map permission migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 053: Add view on map permission column...');
+      viewOnMapPermissionMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ View on map permission migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run view on map permission migration:', error);
+      throw error;
+    }
+  }
+
+  private runNewsTablesMigration(): void {
+    try {
+      const migrationKey = 'migration_054_news_tables';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ News tables migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 054: Add news tables...');
+      newsTablesMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ News tables migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run news tables migration:', error);
+      throw error;
+    }
+  }
+
+  private runRemoteAdminColumnsMigration(): void {
+    try {
+      const migrationKey = 'migration_055_remote_admin_columns';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Remote admin columns migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 055: Add remote admin columns...');
+      remoteAdminColumnsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Remote admin columns migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run remote admin columns migration:', error);
+      throw error;
+    }
+  }
+
+  private runBackupHistoryColumnsMigration(): void {
+    try {
+      const migrationKey = 'migration_056_backup_history_columns';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Backup history columns migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 056: Fix backup_history column names...');
+      backupHistoryColumnsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Backup history columns migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run backup history columns migration:', error);
+      throw error;
+    }
+  }
+
   private ensureBroadcastNode(): void {
     logger.debug('🔍 ensureBroadcastNode() called');
     try {
@@ -2594,6 +2689,10 @@ class DatabaseService {
           longitudeOverride: nodeData.longitudeOverride ?? existingNode?.longitudeOverride,
           altitudeOverride: nodeData.altitudeOverride ?? existingNode?.altitudeOverride,
           positionOverrideIsPrivate: nodeData.positionOverrideIsPrivate ?? existingNode?.positionOverrideIsPrivate,
+          // Remote admin discovery - preserve existing values
+          hasRemoteAdmin: existingNode?.hasRemoteAdmin,
+          lastRemoteAdminCheck: existingNode?.lastRemoteAdminCheck,
+          remoteAdminMetadata: existingNode?.remoteAdminMetadata,
           createdAt: existingNode?.createdAt ?? now,
           updatedAt: now,
         };
@@ -4304,6 +4403,44 @@ class DatabaseService {
   }
 
   /**
+   * Get smart hops statistics for a node.
+   * Returns min/max/avg hop counts aggregated into time buckets.
+   *
+   * @param nodeId - Node ID to get statistics for (e.g., '!abcd1234')
+   * @param sinceTimestamp - Only include telemetry after this timestamp
+   * @param intervalMinutes - Time bucket interval in minutes (default: 15)
+   * @returns Array of time-bucketed hop statistics
+   */
+  async getSmartHopsStatsAsync(
+    nodeId: string,
+    sinceTimestamp: number,
+    intervalMinutes: number = 15
+  ): Promise<Array<{ timestamp: number; minHops: number; maxHops: number; avgHops: number }>> {
+    if (!this.telemetryRepo) {
+      return [];
+    }
+    return this.telemetryRepo.getSmartHopsStats(nodeId, sinceTimestamp, intervalMinutes);
+  }
+
+  /**
+   * Get link quality history for a node.
+   * Returns link quality values over time for graphing.
+   *
+   * @param nodeId - Node ID to get history for (e.g., '!abcd1234')
+   * @param sinceTimestamp - Only include telemetry after this timestamp
+   * @returns Array of { timestamp, quality } records
+   */
+  async getLinkQualityHistoryAsync(
+    nodeId: string,
+    sinceTimestamp: number
+  ): Promise<Array<{ timestamp: number; quality: number }>> {
+    if (!this.telemetryRepo) {
+      return [];
+    }
+    return this.telemetryRepo.getLinkQualityHistory(nodeId, sinceTimestamp);
+  }
+
+  /**
    * Get all traceroutes for position recalculation.
    * Returns traceroutes with route data, ordered by timestamp for chronological processing.
    */
@@ -5081,6 +5218,67 @@ class DatabaseService {
     } catch (error) {
       logger.error('Error in getNodeNeedingTracerouteAsync:', error);
       return null;
+    }
+  }
+
+  /**
+   * Get a node that needs remote admin checking.
+   * Returns null if no nodes need checking.
+   */
+  async getNodeNeedingRemoteAdminCheckAsync(localNodeNum: number): Promise<DbNode | null> {
+    try {
+      // Get maxNodeAgeHours setting to filter only active nodes
+      // lastHeard is stored in SECONDS (Unix timestamp)
+      const maxNodeAgeHours = parseInt(this.getSetting('maxNodeAgeHours') || '24');
+      const activeNodeCutoffSeconds = Math.floor(Date.now() / 1000) - (maxNodeAgeHours * 60 * 60);
+
+      // Get expiration hours (default 168 = 1 week)
+      // lastRemoteAdminCheck is stored in MILLISECONDS
+      const expirationHours = parseInt(this.getSetting('remoteAdminScannerExpirationHours') || '168');
+      const expirationMsAgo = Date.now() - (expirationHours * 60 * 60 * 1000);
+
+      if (this.nodesRepo) {
+        const node = await this.nodesRepo.getNodeNeedingRemoteAdminCheckAsync(
+          localNodeNum,
+          activeNodeCutoffSeconds,
+          expirationMsAgo
+        );
+        return node as DbNode | null;
+      }
+
+      return null;
+    } catch (error) {
+      logger.error('Error in getNodeNeedingRemoteAdminCheckAsync:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Update a node's remote admin status
+   */
+  async updateNodeRemoteAdminStatusAsync(
+    nodeNum: number,
+    hasRemoteAdmin: boolean,
+    metadata: string | null
+  ): Promise<void> {
+    try {
+      if (this.nodesRepo) {
+        await this.nodesRepo.updateNodeRemoteAdminStatusAsync(nodeNum, hasRemoteAdmin, metadata);
+      }
+
+      // Update cache for PostgreSQL/MySQL
+      if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+        const existingNode = this.nodesCache.get(nodeNum);
+        if (existingNode) {
+          existingNode.hasRemoteAdmin = hasRemoteAdmin;
+          existingNode.lastRemoteAdminCheck = Date.now();
+          existingNode.remoteAdminMetadata = metadata ?? undefined;
+          existingNode.updatedAt = Date.now();
+          this.nodesCache.set(nodeNum, existingNode);
+        }
+      }
+    } catch (error) {
+      logger.error('Error in updateNodeRemoteAdminStatusAsync:', error);
     }
   }
 
@@ -6844,6 +7042,29 @@ class DatabaseService {
     );
   }
 
+  /**
+   * Clear all neighbor info for a specific node (called before saving new neighbor info)
+   */
+  clearNeighborInfoForNode(nodeNum: number): void {
+    // For PostgreSQL/MySQL, use async repo
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      // Clear local cache for this node
+      this._neighborsCache = this._neighborsCache.filter(n => n.nodeNum !== nodeNum);
+      this._neighborsByNodeCache.delete(nodeNum);
+
+      if (this.neighborsRepo) {
+        this.neighborsRepo.deleteNeighborInfoForNode(nodeNum).catch(err =>
+          logger.debug('Failed to clear neighbor info:', err)
+        );
+      }
+      return;
+    }
+
+    // SQLite: direct delete
+    const stmt = this.db.prepare('DELETE FROM neighbor_info WHERE nodeNum = ?');
+    stmt.run(nodeNum);
+  }
+
   private convertRepoNeighborInfo(n: import('../db/types.js').DbNeighborInfo): DbNeighborInfo {
     return {
       id: n.id,
@@ -6944,6 +7165,27 @@ class DatabaseService {
     return result;
   }
 
+  /**
+   * Delete all neighbor info for a specific node
+   *
+   * @param nodeNum The node number to delete neighbor info for
+   * @returns Number of neighbor records deleted
+   */
+  async deleteNeighborInfoForNodeAsync(nodeNum: number): Promise<number> {
+    if (!this.neighborsRepo) {
+      return 0;
+    }
+
+    // Clear from cache
+    this._neighborsByNodeCache.delete(nodeNum);
+    this._neighborsCache = this._neighborsCache.filter(n => n.nodeNum !== nodeNum);
+
+    // Delete from database
+    const deleted = await this.neighborsRepo.deleteNeighborInfoForNode(nodeNum);
+    logger.info(`Deleted ${deleted} neighbor records for node ${nodeNum}`);
+    return deleted;
+  }
+
   // Favorite operations
   setNodeFavorite(nodeNum: number, isFavorite: boolean): void {
     // For PostgreSQL/MySQL, update cache and fire-and-forget
@@ -7028,10 +7270,41 @@ class DatabaseService {
     enabled: boolean,
     latitude?: number,
     longitude?: number,
-    altitude?: number,    
+    altitude?: number,
     isPrivate: boolean = false
   ): void {
     const now = Date.now();
+
+    // For PostgreSQL/MySQL, use cache and async repo
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      const existingNode = this.nodesCache.get(nodeNum);
+      if (!existingNode) {
+        const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+        logger.warn(`⚠️ Failed to update position override for node ${nodeId} (${nodeNum}): node not found in cache`);
+        throw new Error(`Node ${nodeId} not found`);
+      }
+
+      // Update cache
+      existingNode.positionOverrideEnabled = enabled;
+      existingNode.latitudeOverride = enabled && latitude !== undefined ? latitude : undefined;
+      existingNode.longitudeOverride = enabled && longitude !== undefined ? longitude : undefined;
+      existingNode.altitudeOverride = enabled && altitude !== undefined ? altitude : undefined;
+      existingNode.positionOverrideIsPrivate = enabled && isPrivate;
+      existingNode.updatedAt = now;
+      this.nodesCache.set(nodeNum, existingNode);
+
+      // Fire and forget async update
+      if (this.nodesRepo) {
+        this.nodesRepo.upsertNode(existingNode).catch(err => {
+          logger.error('Failed to update position override:', err);
+        });
+      }
+
+      logger.debug(`📍 Node ${nodeNum} position override ${enabled ? 'enabled' : 'disabled'}${enabled ? ` (${latitude}, ${longitude}, ${altitude}m)${isPrivate ? ' [PRIVATE]' : ''}` : ''}`);
+      return;
+    }
+
+    // SQLite path
     const stmt = this.db.prepare(`
       UPDATE nodes SET
         positionOverrideEnabled = ?,
@@ -7068,6 +7341,23 @@ class DatabaseService {
     altitude?: number;
     isPrivate: boolean;
   } | null {
+    // For PostgreSQL/MySQL, use cache
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      const node = this.nodesCache.get(nodeNum);
+      if (!node) {
+        return null;
+      }
+
+      return {
+        enabled: node.positionOverrideEnabled === true,
+        latitude: node.latitudeOverride ?? undefined,
+        longitude: node.longitudeOverride ?? undefined,
+        altitude: node.altitudeOverride ?? undefined,
+        isPrivate: node.positionOverrideIsPrivate === true,
+      };
+    }
+
+    // SQLite path
     const stmt = this.db.prepare(`
       SELECT positionOverrideEnabled, latitudeOverride, longitudeOverride, altitudeOverride, positionOverrideIsPrivate
       FROM nodes
@@ -7256,9 +7546,9 @@ class DatabaseService {
 
       // Default permissions for anonymous user
       const defaultAnonPermissions = [
-        { resource: 'dashboard' as const, canRead: true, canWrite: false, canDelete: false },
-        { resource: 'nodes' as const, canRead: true, canWrite: false, canDelete: false },
-        { resource: 'info' as const, canRead: true, canWrite: false, canDelete: false }
+        { resource: 'dashboard' as const, canViewOnMap: false, canRead: true, canWrite: false, canDelete: false },
+        { resource: 'nodes' as const, canViewOnMap: false, canRead: true, canWrite: false, canDelete: false },
+        { resource: 'info' as const, canViewOnMap: false, canRead: true, canWrite: false, canDelete: false }
       ];
 
       // Use appropriate method based on database type
@@ -7292,6 +7582,7 @@ class DatabaseService {
           await this.authRepo.createPermission({
             userId: anonymousId,
             resource: perm.resource,
+            canViewOnMap: perm.canViewOnMap,
             canRead: perm.canRead,
             canWrite: perm.canWrite,
             canDelete: perm.canDelete
@@ -7331,6 +7622,7 @@ class DatabaseService {
           this.permissionModel.grant({
             userId: anonymous.id,
             resource: perm.resource,
+            canViewOnMap: perm.canViewOnMap,
             canRead: perm.canRead,
             canWrite: perm.canWrite,
             grantedBy: anonymous.id
@@ -8845,6 +9137,10 @@ class DatabaseService {
 
     const client = await pool.connect();
     try {
+      // Run migration 056 FIRST to fix backup_history table schema
+      // This must run before POSTGRES_SCHEMA_SQL which creates indexes on columns that may not exist
+      await runMigration056Postgres(client);
+
       // Execute the canonical schema SQL - all statements are idempotent
       // (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
       await client.query(POSTGRES_SCHEMA_SQL);
@@ -8863,6 +9159,15 @@ class DatabaseService {
 
       // Run migration 052: Fix upgrade_history schema
       await runMigration052Postgres(client);
+
+      // Run migration 053: Add viewOnMap permission column
+      await runMigration053Postgres(client);
+
+      // Run migration 054: Add news tables
+      await runMigration054Postgres(client);
+
+      // Run migration 055: Add remote admin discovery columns
+      await runMigration055Postgres(client);
 
       // Verify all expected tables exist
       const result = await client.query(`
@@ -8889,6 +9194,10 @@ class DatabaseService {
    */
   private async createMySQLSchema(pool: MySQLPool): Promise<void> {
     logger.info('[MySQL] Ensuring database schema is up to date...');
+
+    // Run migration 056 FIRST to fix backup_history table schema
+    // This must run before MYSQL_SCHEMA_SQL which creates indexes on columns that may not exist
+    await runMigration056Mysql(pool);
 
     const connection = await pool.getConnection();
     try {
@@ -8930,6 +9239,15 @@ class DatabaseService {
 
       // Run migration 052: Fix upgrade_history schema
       await runMigration052Mysql(pool);
+
+      // Run migration 053: Add viewOnMap permission column
+      await runMigration053Mysql(pool);
+
+      // Run migration 054: Add news tables
+      await runMigration054Mysql(pool);
+
+      // Run migration 055: Add remote admin discovery columns
+      await runMigration055Mysql(pool);
 
       // Verify all expected tables exist
       const [rows] = await connection.query(`
@@ -9086,6 +9404,7 @@ class DatabaseService {
       const permissions = await this.authRepo.getPermissionsForUser(userId);
       for (const perm of permissions) {
         if (perm.resource === resource) {
+          if (action === 'viewOnMap') return perm.canViewOnMap;
           if (action === 'read') return perm.canRead;
           if (action === 'write') return perm.canWrite;
         }
@@ -9101,12 +9420,13 @@ class DatabaseService {
    * Works with all database backends (SQLite, PostgreSQL, MySQL).
    * Returns permissions in the same format as PermissionModel.getUserPermissionSet()
    */
-  async getUserPermissionSetAsync(userId: number): Promise<Record<string, { read: boolean; write: boolean }>> {
+  async getUserPermissionSetAsync(userId: number): Promise<Record<string, { viewOnMap?: boolean; read: boolean; write: boolean }>> {
     if (this.authRepo) {
       const permissions = await this.authRepo.getPermissionsForUser(userId);
-      const permissionSet: Record<string, { read: boolean; write: boolean }> = {};
+      const permissionSet: Record<string, { viewOnMap?: boolean; read: boolean; write: boolean }> = {};
       for (const perm of permissions) {
         permissionSet[perm.resource] = {
+          viewOnMap: perm.canViewOnMap ?? false,
           read: perm.canRead,
           write: perm.canWrite,
         };
@@ -9403,6 +9723,191 @@ class DatabaseService {
       throw new Error('Channel database repository not initialized');
     }
     return this.channelDatabaseRepo.deletePermissionAsync(userId, channelDatabaseId);
+  }
+
+  // ============ NEWS CACHE ============
+
+  /**
+   * Get cached news feed
+   */
+  async getNewsCacheAsync(): Promise<{ feedData: string; fetchedAt: number; sourceUrl: string } | null> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.getNewsCache();
+  }
+
+  /**
+   * Save news feed to cache
+   */
+  async saveNewsCacheAsync(feedData: string, sourceUrl: string): Promise<void> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    return this.miscRepo.saveNewsCache({
+      feedData,
+      fetchedAt: now,
+      sourceUrl,
+    });
+  }
+
+  // ============ USER NEWS STATUS ============
+
+  /**
+   * Get user's news status
+   */
+  async getUserNewsStatusAsync(userId: number): Promise<{ lastSeenNewsId: string | null; dismissedNewsIds: string[] } | null> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    const status = await this.miscRepo.getUserNewsStatus(userId);
+    if (!status) {
+      return null;
+    }
+    return {
+      lastSeenNewsId: status.lastSeenNewsId ?? null,
+      dismissedNewsIds: status.dismissedNewsIds ? JSON.parse(status.dismissedNewsIds) : [],
+    };
+  }
+
+  /**
+   * Save user's news status
+   */
+  async saveUserNewsStatusAsync(userId: number, lastSeenNewsId: string | null, dismissedNewsIds: string[]): Promise<void> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.saveUserNewsStatus({
+      userId,
+      lastSeenNewsId,
+      dismissedNewsIds: JSON.stringify(dismissedNewsIds),
+      updatedAt: Math.floor(Date.now() / 1000),
+    });
+  }
+
+  // ============ BACKUP HISTORY ============
+
+  /**
+   * Insert a new backup history record
+   */
+  async insertBackupHistoryAsync(backup: {
+    filename: string;
+    filePath: string;
+    timestamp: number;
+    backupType: string;
+    fileSize?: number | null;
+    nodeId?: string | null;
+    nodeNum?: number | null;
+  }): Promise<void> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.insertBackupHistory({
+      ...backup,
+      createdAt: Date.now(),
+    });
+  }
+
+  /**
+   * Get all backup history records ordered by timestamp (newest first)
+   */
+  async getBackupHistoryListAsync(): Promise<Array<{
+    id?: number;
+    filename: string;
+    filePath: string;
+    timestamp: number;
+    backupType: string;
+    fileSize?: number | null;
+    nodeId?: string | null;
+    nodeNum?: number | null;
+    createdAt: number;
+  }>> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.getBackupHistoryList();
+  }
+
+  /**
+   * Get a backup history record by filename
+   */
+  async getBackupByFilenameAsync(filename: string): Promise<{
+    id?: number;
+    filename: string;
+    filePath: string;
+    timestamp: number;
+    backupType: string;
+    fileSize?: number | null;
+    nodeId?: string | null;
+    nodeNum?: number | null;
+    createdAt: number;
+  } | null> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.getBackupByFilename(filename);
+  }
+
+  /**
+   * Delete a backup history record by filename
+   */
+  async deleteBackupHistoryAsync(filename: string): Promise<void> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.deleteBackupHistory(filename);
+  }
+
+  /**
+   * Count total backup history records
+   */
+  async countBackupsAsync(): Promise<number> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.countBackups();
+  }
+
+  /**
+   * Get oldest backup history records (for purging)
+   */
+  async getOldestBackupsAsync(limit: number): Promise<Array<{
+    id?: number;
+    filename: string;
+    filePath: string;
+    timestamp: number;
+    backupType: string;
+    fileSize?: number | null;
+    nodeId?: string | null;
+    nodeNum?: number | null;
+    createdAt: number;
+  }>> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    return this.miscRepo.getOldestBackups(limit);
+  }
+
+  /**
+   * Get backup statistics
+   */
+  async getBackupStatsAsync(): Promise<{
+    count: number;
+    totalSize: number;
+    oldestBackup: string | null;
+    newestBackup: string | null;
+  }> {
+    if (!this.miscRepo) {
+      throw new Error('Misc repository not initialized');
+    }
+    const stats = await this.miscRepo.getBackupStats();
+    return {
+      count: stats.count,
+      totalSize: stats.totalSize,
+      oldestBackup: stats.oldestTimestamp ? new Date(stats.oldestTimestamp).toISOString() : null,
+      newestBackup: stats.newestTimestamp ? new Date(stats.newestTimestamp).toISOString() : null,
+    };
   }
 }
 
