@@ -1257,6 +1257,111 @@ export class MeshtasticProtobufService {
   }
 
   /**
+   * Create a FromRadio message containing a text message MeshPacket
+   * Used to replay historical messages to virtual node clients
+   *
+   * @param message - Message data from database
+   * @returns Encoded FromRadio bytes or null on failure
+   */
+  async createFromRadioTextMessage(message: {
+    id?: string;  // Database message ID (format: "fromNum_packetId") - used to extract original packet ID
+    fromNodeNum: number;
+    toNodeNum: number;
+    text: string;
+    channel: number;
+    timestamp: number;
+    requestId?: number | null;
+    hopLimit?: number | null;
+    rxTime?: number | null;
+    rxSnr?: number | null;
+    rxRssi?: number | null;
+    replyId?: number | null;
+    emoji?: number | null;
+  }): Promise<Uint8Array | null> {
+    const root = getProtobufRoot();
+    if (!root) {
+      logger.error('❌ Protobuf definitions not loaded');
+      return null;
+    }
+
+    try {
+      const FromRadio = root.lookupType('meshtastic.FromRadio');
+      const MeshPacket = root.lookupType('meshtastic.MeshPacket');
+      const Data = root.lookupType('meshtastic.Data');
+
+      // Create the Data payload with the text message
+      // Include replyId and emoji for tapbacks/reactions to display correctly
+      const textBytes = new TextEncoder().encode(message.text);
+
+      // Build data message fields - only include replyId/emoji if they have valid values
+      // This ensures tapbacks are properly associated with their original messages
+      const dataFields: Record<string, unknown> = {
+        portnum: PortNum.TEXT_MESSAGE_APP,
+        payload: textBytes,
+      };
+
+      // Add replyId if present (links this message/reaction to another message)
+      if (message.replyId && message.replyId > 0) {
+        dataFields.replyId = message.replyId;
+      }
+
+      // Add emoji flag if present (indicates this is a tapback/reaction, not a regular message)
+      if (message.emoji && message.emoji > 0) {
+        dataFields.emoji = message.emoji;
+      }
+
+      const dataMessage = Data.create(dataFields);
+
+      // Generate a packet ID - prefer the original packet ID if available
+      // Message IDs are stored in format "fromNum_packetId", so we can extract the original
+      // This is critical for tapbacks to link correctly to their original messages
+      let packetId = message.requestId;
+      if (!packetId && message.id) {
+        const idParts = message.id.split('_');
+        if (idParts.length > 1) {
+          const extractedId = parseInt(idParts[1], 10);
+          if (!isNaN(extractedId) && extractedId > 0) {
+            packetId = extractedId;
+          }
+        }
+      }
+      // Fallback to timestamp-based ID if no packet ID found
+      if (!packetId) {
+        packetId = message.timestamp & 0xffffffff;
+      }
+
+      // Convert timestamp from milliseconds (database format) to seconds (Meshtastic protocol)
+      // The database stores timestamps as milliseconds since epoch, but MeshPacket.rxTime
+      // expects Unix seconds. Without this conversion, the 13-digit ms timestamp overflows
+      // 32-bit integers and wraps to dates in the 1960s on iOS clients.
+      const rxTimeSeconds = Math.floor((message.rxTime || message.timestamp) / 1000);
+
+      // Create the MeshPacket
+      const meshPacket = MeshPacket.create({
+        from: message.fromNodeNum,
+        to: message.toNodeNum,
+        channel: message.channel >= 0 ? message.channel : 0, // Use 0 for DMs
+        decoded: dataMessage,
+        id: packetId,
+        rxTime: rxTimeSeconds,
+        rxSnr: message.rxSnr || 0,
+        rxRssi: message.rxRssi || 0,
+        hopLimit: message.hopLimit || 3,
+      });
+
+      // Wrap in FromRadio
+      const fromRadio = FromRadio.create({
+        packet: meshPacket,
+      });
+
+      return FromRadio.encode(fromRadio).finish();
+    } catch (error) {
+      logger.error('❌ Failed to create FromRadio text message:', error);
+      return null;
+    }
+  }
+
+  /**
    * Strip PKI encryption from a ToRadio packet with from=0
    * This is needed because Android clients send PKI-encrypted packets with from=0,
    * which fail validation at the physical node when relayed through Virtual Node Server

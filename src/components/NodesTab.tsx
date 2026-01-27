@@ -492,7 +492,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // Stable callback factories for node item interactions
   const handleNodeClick = useCallback((node: DeviceInfo) => {
     return () => {
-      setSelectedNodeId(node.user?.id || null);
+      const nodeId = node.user?.id || null;
+      // Toggle selection: if already selected, deselect; otherwise select
+      if (selectedNodeId === nodeId) {
+        setSelectedNodeId(null);
+        return;
+      }
+      setSelectedNodeId(nodeId);
       // When showRoute is enabled, let TracerouteBoundsController handle the zoom
       // to fit the entire traceroute path instead of just centering on the node
       if (!showRoute) {
@@ -508,7 +514,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         }
       }
     };
-  }, [setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed, showRoute]);
+  }, [selectedNodeId, setSelectedNodeId, centerMapOnNode, setIsNodeListCollapsed, showRoute]);
 
   const handleFavoriteClick = useCallback((node: DeviceInfo) => {
     return (e: React.MouseEvent) => toggleFavorite(node, e);
@@ -1688,7 +1694,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
               {/* Draw uncertainty circles for estimated positions */}
               {showEstimatedPositions && nodesWithPosition
-                .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id) && (showMqttNodes || !node.viaMqtt) && (showIncompleteNodes || isNodeComplete(node)))
+                .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id) && (showMqttNodes || !node.viaMqtt) && (showIncompleteNodes || isNodeComplete(node)) && (!tracerouteNodeNums || tracerouteNodeNums.has(node.nodeNum)))
                 .map(node => {
                   // Calculate radius based on precision bits (higher precision = smaller circle)
                   // Meshtastic uses precision_bits to reduce coordinate precision
@@ -1777,6 +1783,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
                 // Filter out segments where either endpoint is not visible (Issue #1149)
                 if (visibleNodeNums && (!visibleNodeNums.has(ni.nodeNum) || !visibleNodeNums.has(ni.neighborNodeNum))) {
+                  return null;
+                }
+
+                // When traceroute is active, only show segments for nodes in the traceroute
+                if (tracerouteNodeNums && (!tracerouteNodeNums.has(ni.nodeNum) || !tracerouteNodeNums.has(ni.neighborNodeNum))) {
                   return null;
                 }
 

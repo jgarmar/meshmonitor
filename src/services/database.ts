@@ -60,6 +60,9 @@ import { migration as viewOnMapPermissionMigration, runMigration053Postgres, run
 import { migration as newsTablesMigration, runMigration054Postgres, runMigration054Mysql } from '../server/migrations/054_add_news_tables.js';
 import { migration as remoteAdminColumnsMigration, runMigration055Postgres, runMigration055Mysql } from '../server/migrations/055_add_remote_admin_columns.js';
 import { migration as backupHistoryColumnsMigration, runMigration056Postgres, runMigration056Mysql } from '../server/migrations/056_fix_backup_history_columns.js';
+import { migration as packetViaMqttMigration, runMigration057Postgres, runMigration057Mysql } from '../server/migrations/057_add_packet_via_mqtt.js';
+import { migration as transportMechanismMigration, runMigration058Postgres, runMigration058Mysql } from '../server/migrations/058_convert_via_mqtt_to_transport_mechanism.js';
+import { migration as channelDbViewOnMapMigration, runMigration059Postgres, runMigration059Mysql } from '../server/migrations/059_add_channel_database_view_on_map.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
 
 // Drizzle ORM imports for dual-database support
@@ -280,6 +283,7 @@ export interface DbPacketLog {
   created_at?: number;
   decrypted_by?: 'node' | 'server' | null;
   decrypted_channel_id?: number | null;
+  transport_mechanism?: number;
 }
 
 export interface DbCustomTheme {
@@ -897,6 +901,9 @@ class DatabaseService {
     this.runNewsTablesMigration();
     this.runRemoteAdminColumnsMigration();
     this.runBackupHistoryColumnsMigration();
+    this.runPacketViaMqttMigration();
+    this.runTransportMechanismMigration();
+    this.runChannelDbViewOnMapMigration();
     this.ensureAutomationDefaults();
     this.warmupCaches();
     this.isInitialized = true;
@@ -2005,6 +2012,66 @@ class DatabaseService {
       logger.debug('✅ Backup history columns migration completed successfully');
     } catch (error) {
       logger.error('❌ Failed to run backup history columns migration:', error);
+      throw error;
+    }
+  }
+
+  private runPacketViaMqttMigration(): void {
+    try {
+      const migrationKey = 'migration_057_packet_via_mqtt';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Packet via_mqtt migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 057: Add via_mqtt column to packet_log...');
+      packetViaMqttMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Packet via_mqtt migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run packet via_mqtt migration:', error);
+      throw error;
+    }
+  }
+
+  private runTransportMechanismMigration(): void {
+    try {
+      const migrationKey = 'migration_058_transport_mechanism';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Transport mechanism migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 058: Convert via_mqtt to transport_mechanism...');
+      transportMechanismMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Transport mechanism migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run transport mechanism migration:', error);
+      throw error;
+    }
+  }
+
+  private runChannelDbViewOnMapMigration(): void {
+    try {
+      const migrationKey = 'migration_059_channel_db_view_on_map';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Channel database view on map migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 059: Add can_view_on_map to channel_database_permissions...');
+      channelDbViewOnMapMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Channel database view on map migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run channel database view on map migration:', error);
       throw error;
     }
   }
@@ -3288,6 +3355,19 @@ class DatabaseService {
     }
     // For SQLite, use sync method
     return this.getMessageByRequestId(requestId);
+  }
+
+  async getMessagesAsync(limit: number = 100, offset: number = 0): Promise<DbMessage[]> {
+    // For PostgreSQL/MySQL, use async repo
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      if (this.messagesRepo) {
+        const messages = await this.messagesRepo.getMessages(limit, offset);
+        return messages.map(msg => this.convertRepoMessage(msg));
+      }
+      return [];
+    }
+    // For SQLite, use sync method
+    return this.getMessages(limit, offset);
   }
 
   // Internal cache for messages (used for PostgreSQL sync compatibility)
@@ -8407,8 +8487,8 @@ class DatabaseService {
       INSERT INTO packet_log (
         packet_id, timestamp, from_node, from_node_id, to_node, to_node_id,
         channel, portnum, portnum_name, encrypted, snr, rssi, hop_limit, hop_start,
-        relay_node, payload_size, want_ack, priority, payload_preview, metadata, direction
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        relay_node, payload_size, want_ack, priority, payload_preview, metadata, direction, transport_mechanism
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const result = stmt.run(
@@ -8432,7 +8512,8 @@ class DatabaseService {
       packet.priority ?? null,
       packet.payload_preview ?? null,
       packet.metadata ?? null,
-      packet.direction ?? 'rx'
+      packet.direction ?? 'rx',
+      packet.transport_mechanism ?? null
     );
 
     // Enforce max count limit
@@ -8505,6 +8586,7 @@ class DatabaseService {
         metadata: packet.metadata ?? null,
         direction: packet.direction ?? 'rx',
         created_at: Date.now(),
+        transport_mechanism: packet.transport_mechanism ?? null,
       };
 
       // Use type assertion to avoid complex type narrowing
@@ -8645,6 +8727,40 @@ class DatabaseService {
     const result = stmt.run();
     logger.debug(`🧹 Cleared ${result.changes} packet log entries`);
     return Number(result.changes);
+  }
+
+  /**
+   * Clear all packet logs - async version for PostgreSQL/MySQL
+   */
+  async clearPacketLogsAsync(): Promise<number> {
+    // For PostgreSQL
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        const result = await this.postgresPool.query('DELETE FROM packet_log');
+        const deletedCount = result.rowCount ?? 0;
+        logger.debug(`🧹 Cleared ${deletedCount} packet log entries (PostgreSQL)`);
+        return deletedCount;
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to clear packet logs (PostgreSQL):', error);
+        throw error;
+      }
+    }
+
+    // For MySQL/MariaDB
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        const [result] = await this.mysqlPool.execute('DELETE FROM packet_log');
+        const deletedCount = (result as any).affectedRows ?? 0;
+        logger.debug(`🧹 Cleared ${deletedCount} packet log entries (MySQL)`);
+        return deletedCount;
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to clear packet logs (MySQL):', error);
+        throw error;
+      }
+    }
+
+    // Fallback to SQLite
+    return this.clearPacketLogs();
   }
 
   /**
@@ -9169,6 +9285,15 @@ class DatabaseService {
       // Run migration 055: Add remote admin discovery columns
       await runMigration055Postgres(client);
 
+      // Run migration 057: Add via_mqtt column to packet_log
+      await runMigration057Postgres(client);
+
+      // Run migration 058: Convert via_mqtt to transport_mechanism
+      await runMigration058Postgres(client);
+
+      // Run migration 059: Add canViewOnMap to channel_database_permissions
+      await runMigration059Postgres(client);
+
       // Verify all expected tables exist
       const result = await client.query(`
         SELECT table_name FROM information_schema.tables
@@ -9248,6 +9373,15 @@ class DatabaseService {
 
       // Run migration 055: Add remote admin discovery columns
       await runMigration055Mysql(pool);
+
+      // Run migration 057: Add via_mqtt column to packet_log
+      await runMigration057Mysql(pool);
+
+      // Run migration 058: Convert via_mqtt to transport_mechanism
+      await runMigration058Mysql(pool);
+
+      // Run migration 059: Add canViewOnMap to channel_database_permissions
+      await runMigration059Mysql(pool);
 
       // Verify all expected tables exist
       const [rows] = await connection.query(`
@@ -9706,6 +9840,7 @@ class DatabaseService {
   async setChannelDatabasePermissionAsync(data: {
     userId: number;
     channelDatabaseId: number;
+    canViewOnMap: boolean;
     canRead: boolean;
     grantedBy?: number | null;
   }): Promise<void> {
@@ -9713,6 +9848,24 @@ class DatabaseService {
       throw new Error('Channel database repository not initialized');
     }
     return this.channelDatabaseRepo.setPermissionAsync(data);
+  }
+
+  /**
+   * Get channel database permissions for a user as a map keyed by channel database ID
+   * Returns { [channelDbId]: { viewOnMap: boolean, read: boolean } }
+   */
+  async getChannelDatabasePermissionsForUserAsSetAsync(userId: number): Promise<{
+    [channelDbId: number]: { viewOnMap: boolean; read: boolean }
+  }> {
+    const permissions = await this.getChannelDatabasePermissionsForUserAsync(userId);
+    const result: { [channelDbId: number]: { viewOnMap: boolean; read: boolean } } = {};
+    for (const perm of permissions) {
+      result[perm.channelDatabaseId] = {
+        viewOnMap: perm.canViewOnMap,
+        read: perm.canRead,
+      };
+    }
+    return result;
   }
 
   /**

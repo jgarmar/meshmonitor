@@ -735,6 +735,11 @@ export class VirtualNodeServer extends EventEmitter {
 
       logger.info(`Virtual node: ✓ Sent ${staticCount} cached static messages (config, channels, metadata)`);
 
+      // NOTE: Message history replay was removed in v3.2.6 (issue #1608)
+      // Sending cached messages on each reconnection caused problems with clients
+      // that don't deduplicate messages, leading to duplicate chats and incorrect
+      // hop counts. Clients should rely on real-time message forwarding instead.
+
       // === STEP 4: Send custom ConfigComplete with client's requested ID ===
       const useConfigId = configId || 1;
       logger.info(`Virtual node: Sending ConfigComplete to ${clientId} with ID ${useConfigId}...`);

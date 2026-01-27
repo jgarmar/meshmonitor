@@ -16,7 +16,7 @@ import { dataEventEmitter } from './services/dataEventEmitter.js';
 import { messageQueueService } from './messageQueueService.js';
 import { normalizeTriggerPatterns } from '../utils/autoResponderUtils.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
-import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET } from './constants/meshtastic.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism } from './constants/meshtastic.js';
 import { createRequire } from 'module';
 import * as cron from 'node-cron';
 import fs from 'fs';
@@ -622,7 +622,8 @@ class MeshtasticManager {
       encrypted: false,  // Outgoing packets are logged before encryption
       payload_preview: payloadPreview,
       metadata: JSON.stringify({ ...metadata, direction: 'tx' }),
-      direction: 'tx'
+      direction: 'tx',
+      transport_mechanism: TransportMechanism.INTERNAL,  // Outgoing packets are sent via direct connection
     });
   }
 
@@ -2183,6 +2184,7 @@ class MeshtasticManager {
       const displayName = channelName || `Channel ${channel.index}`; // For logging only
       const hasValidConfig = channel.settings.name !== undefined ||
                             channel.settings.psk ||
+                            channel.role === 0 || // DISABLED role (explicitly set)
                             channel.role === 1 || // PRIMARY role
                             channel.role === 2 || // SECONDARY role
                             channel.index === 0;   // Always include channel 0
@@ -2390,7 +2392,7 @@ class MeshtasticManager {
           hop_start: meshPacket.hopStart,
           want_ack: meshPacket.wantAck,
           priority: meshPacket.priority,
-          via_mqtt: meshPacket.viaMqtt
+          transport_mechanism: meshPacket.transportMechanism
         };
 
         // Include encrypted payload bytes if packet is encrypted
@@ -2429,6 +2431,8 @@ class MeshtasticManager {
           direction: fromNum === this.localNodeInfo?.nodeNum ? 'tx' : 'rx',
           decrypted_by: decryptedBy ?? undefined,
           decrypted_channel_id: decryptedChannelId ?? undefined,
+          // Note: ?? (nullish coalescing) correctly preserves 0 (INTERNAL), only defaults on null/undefined
+          transport_mechanism: meshPacket.transportMechanism ?? TransportMechanism.LORA,
         });
         } // end else (not internal packet)
       }
@@ -8334,6 +8338,7 @@ class MeshtasticManager {
       if (isModuleConfig) {
         const moduleConfigMap: { [key: number]: string } = {
           0: 'mqtt',
+          5: 'telemetry',
           9: 'neighborInfo'
         };
         const configKey = moduleConfigMap[configType];
@@ -8382,6 +8387,7 @@ class MeshtasticManager {
             // Map module config types to their keys
             const moduleConfigMap: { [key: number]: string } = {
               0: 'mqtt',
+              5: 'telemetry',
               9: 'neighborInfo'
             };
             const configKey = moduleConfigMap[configType];
