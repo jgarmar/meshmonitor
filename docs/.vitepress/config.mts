@@ -27,6 +27,7 @@ export default defineConfig({
         items: [
           { text: 'Features', link: '/features/settings' },
           { text: 'Configuration', link: '/configuration/' },
+          { text: 'Add-ons', link: '/add-ons/' },
           { text: 'Development', link: '/development/' }
         ]
       },
@@ -45,7 +46,9 @@ export default defineConfig({
             { text: 'Push Notifications', link: '/features/notifications' },
             { text: 'Packet Monitor', link: '/features/packet-monitor' },
             { text: 'Channel Database', link: '/features/channel-database' },
+            { text: 'Security', link: '/features/security' },
             { text: 'Link Quality & Smart Hops', link: '/features/link-quality' },
+            { text: 'MeshCore (Experimental)', link: '/features/meshcore' },
             { text: '🌍 Translations', link: '/features/translations' },
             { text: '🎨 Theme Gallery', link: '/THEME_GALLERY' },
             { text: '🌐 Site Gallery', link: '/site-gallery' },
@@ -64,7 +67,6 @@ export default defineConfig({
             { text: 'BLE Bridge', link: '/configuration/ble-bridge' },
             { text: 'Serial Bridge', link: '/configuration/serial-bridge' },
             { text: 'Virtual Node', link: '/configuration/virtual-node' },
-            { text: 'MQTT Client Proxy', link: '/configuration/mqtt-proxy' },
             { text: '🗺️ Custom Tile Servers', link: '/configuration/custom-tile-servers' },
             { text: 'SSO Setup', link: '/configuration/sso' },
             { text: 'Reverse Proxy', link: '/configuration/reverse-proxy' },
@@ -79,6 +81,16 @@ export default defineConfig({
           items: [
             { text: 'Deployment Guide', link: '/deployment/DEPLOYMENT_GUIDE' },
             { text: '📦 Proxmox LXC', link: '/deployment/PROXMOX_LXC_GUIDE' }
+          ]
+        }
+      ],
+      '/add-ons/': [
+        {
+          text: 'Community Add-ons',
+          items: [
+            { text: 'Overview', link: '/add-ons/' },
+            { text: 'MQTT Client Proxy', link: '/add-ons/mqtt-proxy' },
+            { text: 'AI Responder', link: '/add-ons/ai-responder' }
           ]
         }
       ],
@@ -127,14 +139,55 @@ export default defineConfig({
     lineNumbers: true
   },
 
-  // Ignore dead links in old documentation files
+  // Ignore dead links in old documentation files and excluded internal docs
   ignoreDeadLinks: [
     /^http:\/\/localhost/,
     (url) => {
-      return url.includes('/deployment/') || url.includes('/architecture/') || url.includes('/database/')
+      // Ignore links to excluded directories
+      if (url.includes('/deployment/') || url.includes('/architecture/') || url.includes('/database/') || url.includes('/operations/')) {
+        return true;
+      }
+      // Ignore links to excluded internal documentation files
+      const excludedDocs = [
+        'ARCHITECTURE_LESSONS', 'AUTHENTICATION', 'AUTH_IMPLEMENTATION_SUMMARY',
+        'CHANGE_PASSWORD_FEATURE', 'development-learnings', 'mqtt-vs-http-analysis',
+        'proxy-compatibility-analysis', 'PUSH_NOTIFICATIONS', 'REFACTORING_PLAN',
+        'SECURITY_AUDIT', 'TEST_UPDATES', 'v2.0.0-authentication-plan',
+        'v2.16-IMPLEMENTATION-SUMMARY', 'MACOS_CODE_SIGNING_SETUP',
+        'PERMISSIONS_QUICK_REFERENCE', 'security-duplicate-keys', 'security-low-entropy-keys',
+        'database-migration', 'meshtastic-config-import'
+      ];
+      return excludedDocs.some(doc => url.includes(doc));
     }
   ],
 
-  // Exclude old documentation directories from VitePress processing
-  srcExclude: ['**/architecture/**', '**/database/**', '**/api/**']
+  // Exclude old documentation directories and internal development docs from VitePress processing
+  // These are available on GitHub for developers who need them
+  srcExclude: [
+    '**/architecture/**',
+    '**/database/**',
+    '**/api/**',
+    '**/planning/**',
+    '**/operations/**',
+    // Internal development documentation (available on GitHub)
+    'ARCHITECTURE_LESSONS.md',
+    'AUTHENTICATION.md',
+    'AUTH_IMPLEMENTATION_SUMMARY.md',
+    'CHANGE_PASSWORD_FEATURE.md',
+    'development-learnings.md',
+    'mqtt-vs-http-analysis.md',
+    'proxy-compatibility-analysis.md',
+    'PUSH_NOTIFICATIONS.md',
+    'REFACTORING_PLAN.md',
+    'SECURITY_AUDIT.md',
+    'TEST_UPDATES.md',
+    'v2.0.0-authentication-plan.md',
+    'v2.16-IMPLEMENTATION-SUMMARY.md',
+    'MACOS_CODE_SIGNING_SETUP.md',
+    'PERMISSIONS_QUICK_REFERENCE.md',
+    'security-duplicate-keys.md',
+    'security-low-entropy-keys.md',
+    'database-migration.md',
+    'meshtastic-config-import.md'
+  ]
 })

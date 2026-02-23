@@ -5,7 +5,7 @@
  * Handles the Channels tab with channel selection and messaging.
  */
 
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
@@ -162,12 +162,23 @@ export default function ChannelsTab({
   // State for "Jump to Bottom" button
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
 
+  // Virtual Channel info modal state
+  const [virtualChannelInfoModal, setVirtualChannelInfoModal] = useState<ChannelDatabaseEntry | null>(null);
+
   // Relay node modal state
   const [relayModalOpen, setRelayModalOpen] = useState(false);
   const [selectedRelayNode, setSelectedRelayNode] = useState<number | null>(null);
   const [selectedRxTime, setSelectedRxTime] = useState<Date | undefined>(undefined);
   const [selectedMessageRssi, setSelectedMessageRssi] = useState<number | undefined>(undefined);
   const [directNeighborStats, setDirectNeighborStats] = useState<Record<number, { avgRssi: number; packetCount: number; lastHeard: number }>>({});
+
+  // Compute auto-position channel: lowest-index channel with positionPrecision > 0
+  const autoPositionChannelId = useMemo(() => {
+    const sorted = [...channels]
+      .filter(ch => ch.id < CHANNEL_DB_OFFSET && (ch.positionPrecision ?? 0) > 0)
+      .sort((a, b) => a.id - b.id);
+    return sorted.length > 0 ? sorted[0].id : null;
+  }, [channels]);
 
   // Map nodes to the format expected by RelayNodeModal
   const mappedNodes = nodes.map(node => {
@@ -176,7 +187,7 @@ export default function ChannelsTab({
       nodeNum: node.nodeNum,
       nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
       longName: node.user?.longName || `Node ${node.nodeNum}`,
-      shortName: node.user?.shortName || node.nodeNum.toString(16).substring(0, 4),
+      shortName: node.user?.shortName || node.nodeNum.toString(16).padStart(8, '0').slice(-4),
       hopsAway: node.hopsAway,
       role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
       avgDirectRssi: stats?.avgRssi,
@@ -262,6 +273,11 @@ export default function ChannelsTab({
     // Add channels from channel configurations first (these are authoritative)
     channels.forEach(ch => channelSet.add(ch.id));
 
+    // Add virtual channels from Channel Database
+    channelDatabaseEntries.forEach(entry => {
+      channelSet.add(CHANNEL_DB_OFFSET + entry.id);
+    });
+
     // Add channels from messages
     messages.forEach(msg => {
       channelSet.add(msg.channel);
@@ -311,6 +327,21 @@ export default function ChannelsTab({
   const selectedChannelConfig =
     channelInfoModal !== null ? channels.find(ch => ch.id === channelInfoModal) || null : null;
 
+  // Handle info link click - opens appropriate modal based on channel type
+  const handleInfoLinkClick = useCallback((channelId: number) => {
+    if (channelId >= CHANNEL_DB_OFFSET) {
+      // Virtual channel from Channel Database
+      const channelDbId = channelId - CHANNEL_DB_OFFSET;
+      const dbChannel = channelDatabaseEntries.find(entry => entry.id === channelDbId);
+      if (dbChannel) {
+        setVirtualChannelInfoModal(dbChannel);
+      }
+    } else {
+      // Device channel
+      setChannelInfoModal(channelId);
+    }
+  }, [channelDatabaseEntries, setChannelInfoModal]);
+
   const availableChannels = getAvailableChannels();
 
   return (
@@ -354,10 +385,11 @@ export default function ChannelsTab({
                   const uplink = channelConfig?.uplinkEnabled ? '↑' : '';
                   const downlink = channelConfig?.downlinkEnabled ? '↓' : '';
                   const encryptionIcon = encryptionStatus === 'secure' ? '🔒' : encryptionStatus === 'default' ? '🔐' : '🔓';
+                  const locationIcon = channelId === autoPositionChannelId ? '📍' : '';
 
                   return (
                     <option key={channelId} value={channelId}>
-                      {encryptionIcon} {displayName} #{channelId} {uplink}
+                      {encryptionIcon}{locationIcon ? ` ${locationIcon}` : ''} {displayName} #{channelId} {uplink}
                       {downlink} {unread > 0 ? `(${unread})` : ''}
                     </option>
                   );
@@ -415,13 +447,21 @@ export default function ChannelsTab({
                               );
                             }
                           })()}
+                          {channelId === autoPositionChannelId && (
+                            <span
+                              className="location-icon"
+                              title={t('channels.location_auto_position')}
+                            >
+                              📍
+                            </span>
+                          )}
                           <a
                             href="#"
                             className="channel-info-link"
                             onClick={e => {
                               e.preventDefault();
                               e.stopPropagation();
-                              setChannelInfoModal(channelId);
+                              handleInfoLinkClick(channelId);
                             }}
                             title={t('channels.show_channel_info')}
                           >
@@ -471,7 +511,7 @@ export default function ChannelsTab({
                       className="channel-info-link"
                       onClick={e => {
                         e.preventDefault();
-                        setChannelInfoModal(selectedChannel);
+                        handleInfoLinkClick(selectedChannel);
                       }}
                       title={t('channels.show_channel_info')}
                       style={{ fontSize: '0.8rem' }}
@@ -705,7 +745,7 @@ export default function ChannelsTab({
                                         {reactions.map(reaction => (
                                           <span
                                             key={reaction.id}
-                                            className="reaction"
+                                            className={`reaction ${isMyMessage(reaction) ? 'mine' : 'theirs'}`}
                                             title={t('channels.reaction_tooltip', { name: getNodeShortName(reaction.from) })}
                                             onClick={() => handleSendTapback(reaction.text, msg)}
                                           >
@@ -891,6 +931,18 @@ export default function ChannelsTab({
                         )}
                       </span>
                     </div>
+                    <div className="info-row">
+                      <span className="info-label">{t('channels.location_sharing')}:</span>
+                      <span className="info-value">
+                        {selectedChannelConfig.id === autoPositionChannelId ? (
+                          <span className="status-enabled">
+                            {t('channels.location_auto_position')}
+                          </span>
+                        ) : (
+                          <span className="status-disabled">{t('channels.location_disabled')}</span>
+                        )}
+                      </span>
+                    </div>
                     {selectedChannelConfig.createdAt && (
                       <div className="info-row">
                         <span className="info-label">{t('channels.discovered')}</span>
@@ -949,6 +1001,108 @@ export default function ChannelsTab({
             </div>
           );
         })()}
+
+      {/* Virtual Channel Info Modal */}
+      {virtualChannelInfoModal && (
+        <div className="modal-overlay" onClick={() => setVirtualChannelInfoModal(null)}>
+          <div className="modal-content channel-info-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>{t('channels.virtual_channel_info_title', 'Virtual Channel Info')}</h2>
+              <button className="modal-close" onClick={() => setVirtualChannelInfoModal(null)}>
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="channel-info-grid">
+                <div className="info-row">
+                  <span className="info-label">{t('channels.channel_name')}</span>
+                  <span className="info-value">{virtualChannelInfoModal.name}</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-label">{t('channels.channel_number')}</span>
+                  <span className="info-value">#{CHANNEL_DB_OFFSET + virtualChannelInfoModal.id}</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-label">{t('channels.encryption')}</span>
+                  <span className="info-value">
+                    {(() => {
+                      const status = getEncryptionStatus(virtualChannelInfoModal.psk);
+                      if (status === 'secure') {
+                        return <span className="status-secure">{t('channels.status_secure')}</span>;
+                      } else if (status === 'default') {
+                        return <span className="status-default-key">{t('channels.status_default_key')}</span>;
+                      } else {
+                        return <span className="status-unencrypted">{t('channels.status_unencrypted')}</span>;
+                      }
+                    })()}
+                  </span>
+                </div>
+                {virtualChannelInfoModal.psk && (
+                  <div className="info-row">
+                    <span className="info-label">{t('channels.psk_base64')}</span>
+                    <span
+                      className="info-value info-value-code"
+                      style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}
+                    >
+                      {showPsk ? virtualChannelInfoModal.psk : '••••••••'}
+                      <button
+                        onClick={() => setShowPsk(!showPsk)}
+                        style={{
+                          padding: '0.25rem 0.5rem',
+                          fontSize: '0.75rem',
+                          background: 'var(--ctp-surface1)',
+                          border: '1px solid var(--ctp-surface2)',
+                          borderRadius: '4px',
+                          color: 'var(--ctp-text)',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s',
+                        }}
+                        onMouseOver={e => (e.currentTarget.style.background = 'var(--ctp-surface2)')}
+                        onMouseOut={e => (e.currentTarget.style.background = 'var(--ctp-surface1)')}
+                      >
+                        {showPsk ? t('channels.hide') : t('channels.show')}
+                      </button>
+                    </span>
+                  </div>
+                )}
+                {virtualChannelInfoModal.description && (
+                  <div className="info-row">
+                    <span className="info-label">{t('channels.description', 'Description')}</span>
+                    <span className="info-value">{virtualChannelInfoModal.description}</span>
+                  </div>
+                )}
+                <div className="info-row">
+                  <span className="info-label">{t('channels.source', 'Source')}</span>
+                  <span className="info-value">
+                    <span style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.25rem',
+                      color: 'var(--ctp-blue)',
+                    }}>
+                      🔑 {t('channels.channel_database', 'Channel Database')}
+                    </span>
+                  </span>
+                </div>
+                <div className="info-row">
+                  <span className="info-label">{t('channels.access_mode', 'Access Mode')}</span>
+                  <span className="info-value">
+                    <span style={{ color: 'var(--ctp-yellow)' }}>
+                      {t('channels.read_only', 'Read-only')}
+                    </span>
+                  </span>
+                </div>
+                {virtualChannelInfoModal.decryptedPacketCount !== undefined && virtualChannelInfoModal.decryptedPacketCount > 0 && (
+                  <div className="info-row">
+                    <span className="info-label">{t('channels.packets_decrypted', 'Packets Decrypted')}</span>
+                    <span className="info-value">{virtualChannelInfoModal.decryptedPacketCount.toLocaleString()}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Relay node modal */}
       {relayModalOpen && selectedRelayNode !== null && (

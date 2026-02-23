@@ -1,17 +1,18 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, Circle, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, Circle, Rectangle, useMap } from 'react-leaflet';
+import L from 'leaflet';
 import type { Marker as LeafletMarker } from 'leaflet';
 import { DeviceInfo } from '../types/device';
 import { TabType } from '../types/ui';
 import { ResourceType } from '../types/permission';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
-import { generateArrowMarkers } from '../utils/mapHelpers.tsx';
-import { getEffectivePosition, getHardwareModelName, getRoleName, hasValidEffectivePosition, isNodeComplete, parseNodeId, TRACEROUTE_DISPLAY_HOURS } from '../utils/nodeHelpers';
-import { formatTime, formatDateTime, formatRelativeTime } from '../utils/datetime';
+import { getPositionHistoryColor, generateHeadingAwarePath, generatePositionHistoryArrows } from '../utils/mapHelpers.tsx';
+import { getEffectivePosition, getRoleName, hasValidEffectivePosition, isNodeComplete, parseNodeId } from '../utils/nodeHelpers';
+import PositionHistoryLegend from './PositionHistoryLegend';
+import { formatTime, formatDateTime } from '../utils/datetime';
 import { getDistanceToNode } from '../utils/distance';
 import { getTilesetById } from '../config/tilesets';
-import { formatTracerouteRoute } from '../utils/traceroute';
 import { getEffectiveHops } from '../utils/nodeHops';
 import { useMapContext } from '../contexts/MapContext';
 import { useTelemetryNodes, useDeviceConfig, useNodes } from '../hooks/useServerData';
@@ -28,8 +29,9 @@ import { TilesetSelector } from './TilesetSelector';
 import { MapCenterController } from './MapCenterController';
 import PacketMonitorPanel from './PacketMonitorPanel';
 import { getPacketStats } from '../services/packetApi';
-import { NodeFilterPopup } from './NodeFilterPopup';
+
 import { VectorTileLayer } from './VectorTileLayer';
+import { MapNodePopupContent } from './MapNodePopupContent';
 
 /**
  * Spiderfier initialization constants
@@ -40,6 +42,13 @@ const SPIDERFIER_INIT = {
   /** Interval between initialization attempts (ms) - 50 attempts × 100ms = 5 seconds total */
   RETRY_INTERVAL_MS: 100,
 } as const;
+
+/**
+ * MeshCore theming constants
+ * Note: These are hardcoded because they're used in Leaflet divIcon template strings
+ * where CSS variables are not available. This matches var(--ctp-mauve) from Catppuccin Mocha.
+ */
+const MESHCORE_COLOR = '#cba6f7'; // Catppuccin Mocha mauve
 
 interface NodesTabProps {
   processedNodes: DeviceInfo[];
@@ -57,6 +66,12 @@ interface NodesTabProps {
   tracerouteNodeNums?: Set<number> | null;
   /** Bounding box of the selected traceroute for zoom-to-fit */
   tracerouteBounds?: [[number, number], [number, number]] | null;
+  /** Handler for initiating a traceroute to a node */
+  onTraceroute?: (nodeId: string) => void;
+  /** Current connection status */
+  connectionStatus?: string;
+  /** Node ID currently being tracerouted (for loading state) */
+  tracerouteLoading?: string | null;
 }
 
 // Helper function to check if a date is today
@@ -180,6 +195,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   visibleNodeNums,
   tracerouteNodeNums,
   tracerouteBounds,
+  onTraceroute,
+  connectionStatus,
+  tracerouteLoading,
 }) => {
   const { t } = useTranslation();
   // Use context hooks
@@ -194,12 +212,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setShowMotion,
     showMqttNodes,
     setShowMqttNodes,
+    showMeshCoreNodes,
+    setShowMeshCoreNodes,
+    meshCoreNodes,
     showAnimations,
     setShowAnimations,
     showEstimatedPositions,
     setShowEstimatedPositions,
-    showAccuracyCircles,
-    setShowAccuracyCircles,
+    showAccuracyRegions,
+    setShowAccuracyRegions,
     animatedNodes,
     triggerNodeAnimation,
     mapCenterTarget,
@@ -212,6 +233,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     neighborInfo,
     positionHistory,
     traceroutes,
+    positionHistoryHours,
+    setPositionHistoryHours,
   } = useMapContext();
 
   const { currentNodeId } = useDeviceConfig();
@@ -238,6 +261,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setShowNodeFilterPopup,
     isNodeListCollapsed,
     setIsNodeListCollapsed,
+    filterRemoteAdminOnly,
   } = useUI();
 
   const {
@@ -248,6 +272,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     mapPinStyle,
     customTilesets,
     distanceUnit,
+    positionHistoryLineStyle,
     nodeDimmingEnabled,
     nodeDimmingStartHours,
     nodeDimmingMinOpacity,
@@ -255,7 +280,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     nodeHopsCalculation,
   } = useSettings();
 
-  const { hasPermission } = useAuth();
+  const { hasPermission, authStatus } = useAuth();
 
   // Parse current node ID to get node number for effective hops calculation
   const currentNodeNum = currentNodeId ? parseNodeId(currentNodeId) : null;
@@ -278,7 +303,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // Ref for spiderfier controller to manage overlapping markers
   const spiderfierRef = useRef<SpiderfierControllerRef>(null);
 
-  // Packet Monitor state (desktop only)
+  // Packet Monitor state
   const [showPacketMonitor, setShowPacketMonitor] = useState(() => {
     // Load from localStorage
     const saved = localStorage.getItem('showPacketMonitor');
@@ -475,11 +500,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const setSelectedNodeIdRef = useRef(setSelectedNodeId);
   const centerMapOnNodeRef = useRef(centerMapOnNode);
   const showRouteRef = useRef(showRoute);
+  const traceroutesRef = useRef(traceroutes);
 
   // Stable ref callback for markers to prevent unnecessary re-renders
   const handleMarkerRef = React.useCallback((ref: LeafletMarker | null, nodeId: string | undefined) => {
     if (ref && nodeId) {
       markerRefs.current.set(nodeId, ref);
+      // Tag marker with nodeId so the spiderfier click handler can identify it
+      // even if the spiderfier holds a stale marker reference
+      (ref as any)._meshNodeId = nodeId;
       // Add marker to spiderfier for overlap handling, passing nodeId to allow multiple markers at same position
       spiderfierRef.current?.addMarker(ref, nodeId);
     }
@@ -771,6 +800,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setSelectedNodeIdRef.current = setSelectedNodeId;
     centerMapOnNodeRef.current = centerMapOnNode;
     showRouteRef.current = showRoute;
+    traceroutesRef.current = traceroutes;
   });
 
   // Track if listeners have been set up
@@ -789,20 +819,55 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       }
 
       const clickHandler = (marker: any) => {
-        // Find the node data from the marker
-        const nodeEntry = Array.from(markerRefs.current.entries()).find(([_, ref]) => ref === marker);
-        if (nodeEntry) {
-          const nodeId = nodeEntry[0];
-          setSelectedNodeIdRef.current(nodeId);
-          // When showRoute is enabled, let TracerouteBoundsController handle the zoom
-          // Otherwise, center on the clicked node
-          if (!showRouteRef.current) {
+        // Get nodeId from the marker's tag (set in handleMarkerRef).
+        // This is more reliable than reference equality with markerRefs because
+        // the spiderfier may hold a stale marker reference after React-Leaflet
+        // recreates the underlying Leaflet marker object.
+        const nodeId: string | undefined = marker._meshNodeId;
+        if (!nodeId) return;
+
+        // Close popup to prevent Leaflet's native toggle from interfering
+        // The popup will be re-opened after the map pan starts
+        marker.closePopup();
+
+        setSelectedNodeIdRef.current(nodeId);
+        // When showRoute is enabled, let TracerouteBoundsController handle the zoom
+        // to fit the entire traceroute path instead of just centering on the node.
+        // But if the node has no valid traceroute, fall back to centering on it.
+        if (!showRouteRef.current) {
+          const node = processedNodesRef.current.find(n => n.user?.id === nodeId);
+          if (node) {
+            centerMapOnNodeRef.current(node);
+          }
+        } else {
+          // Check if this node has a valid traceroute
+          const hasTraceroute = traceroutesRef.current.some(tr => {
+            const matches = tr.toNodeId === nodeId || tr.fromNodeId === nodeId;
+            if (!matches) return false;
+            return tr.route && tr.route !== 'null' && tr.route !== '' &&
+                   tr.routeBack && tr.routeBack !== 'null' && tr.routeBack !== '';
+          });
+          // If no valid traceroute, still center on the node
+          if (!hasTraceroute) {
             const node = processedNodesRef.current.find(n => n.user?.id === nodeId);
             if (node) {
               centerMapOnNodeRef.current(node);
             }
           }
         }
+
+        // Open popup after delay to let MapCenterController start the pan animation
+        // This matches the sidebar behavior (App.tsx useEffect opens at 100ms)
+        // and handles re-clicking the same marker (where selectedNodeId doesn't change)
+        // Use the current marker from markerRefs (not the spiderfier's potentially stale ref)
+        setTimeout(() => {
+          const currentMarker = markerRefs.current.get(nodeId) || marker;
+          const popup = currentMarker.getPopup();
+          if (popup) {
+            popup.options.autoPan = false;
+          }
+          currentMarker.openPopup();
+        }, 100);
       };
 
       const spiderfyHandler = (_markers: any[]) => {
@@ -956,6 +1021,45 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     return `${n.nodeNum}-${pos.latitude}-${pos.longitude}`;
   }).join(',')]);
 
+  // Memoize marker icons to prevent unnecessary Leaflet DOM rebuilds
+  // React-Leaflet calls setIcon() whenever the icon prop reference changes, which
+  // destroys and recreates the entire icon DOM element. By memoizing icons, we ensure
+  // setIcon() is only called when visual properties actually change (hops, selection, zoom, etc.),
+  // not on every render. This prevents icon DOM rebuilds from interfering with position updates.
+  const showLabel = mapZoom >= 13;
+  const nodeIcons = React.useMemo(() => {
+    const iconMap = new Map<number, L.DivIcon>();
+    nodesWithPosition.forEach(node => {
+      const roleNum = typeof node.user?.role === 'string'
+        ? parseInt(node.user.role, 10)
+        : (typeof node.user?.role === 'number' ? node.user.role : 0);
+      const isRouter = roleNum === 2;
+      const isSelected = selectedNodeId === node.user?.id;
+      const isLocalNode = node.user?.id === currentNodeId;
+      const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
+      const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
+
+      const icon = createNodeIcon({
+        hops,
+        isSelected,
+        isRouter,
+        shortName: node.user?.shortName,
+        showLabel: showLabel || shouldAnimate,
+        animate: shouldAnimate,
+        highlightSelected: showRoute && isSelected,
+        pinStyle: mapPinStyle,
+      });
+      iconMap.set(node.nodeNum, icon);
+    });
+    return iconMap;
+  }, [nodesWithPosition.map(n => {
+    const isSelected = selectedNodeId === n.user?.id;
+    const isLocalNode = n.user?.id === currentNodeId;
+    const hops = isLocalNode ? 0 : getEffectiveHops(n, nodeHopsCalculation, traceroutes, currentNodeNum);
+    const shouldAnimate = showAnimations && animatedNodes.has(n.user?.id || '');
+    return `${n.nodeNum}-${hops}-${isSelected}-${n.user?.role}-${n.user?.shortName}-${showLabel}-${shouldAnimate}-${showRoute && isSelected}-${mapPinStyle}`;
+  }).join(',')]);
+
   // Calculate center point of all nodes for initial map view
   // Use saved map center from localStorage if available, otherwise calculate from nodes
   const getMapCenter = (): [number, number] => {
@@ -1047,23 +1151,46 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 if (!showIncompleteNodes && !isNodeComplete(node)) {
                   return false;
                 }
+                // Remote admin filter
+                if (filterRemoteAdminOnly && !node.hasRemoteAdmin) {
+                  return false;
+                }
                 return true;
               }).length;
-              const isFiltered = securityFilter !== 'all' || !showIncompleteNodes;
+              const meshCoreCount = showMeshCoreNodes ? meshCoreNodes.length : 0;
+              const isFiltered = securityFilter !== 'all' || !showIncompleteNodes || filterRemoteAdminOnly;
+              if (meshCoreCount > 0) {
+                return isFiltered
+                  ? `${filteredCount}/${processedNodes.length} + ${meshCoreCount} MC`
+                  : `${filteredCount} + ${meshCoreCount} MC`;
+              }
               return isFiltered ? `${filteredCount}/${processedNodes.length}` : processedNodes.length;
             })()})</h3>
           </div>
           )}
           {!isNodeListCollapsed && (
           <div className="node-controls">
-            <input
-              type="text"
-              placeholder={t('nodes.filter_placeholder')}
-              value={nodesNodeFilter}
-              onChange={(e) => setNodesNodeFilter(e.target.value)}
-              onMouseDown={stopPropagation}
-              className="filter-input-small"
-            />
+            <div className="filter-input-wrapper">
+              <input
+                type="text"
+                placeholder={t('nodes.filter_placeholder')}
+                value={nodesNodeFilter}
+                onChange={(e) => setNodesNodeFilter(e.target.value)}
+                onMouseDown={stopPropagation}
+                className="filter-input-small"
+              />
+              {nodesNodeFilter && (
+                <button
+                  className="filter-clear-btn"
+                  onClick={() => setNodesNodeFilter('')}
+                  onMouseDown={stopPropagation}
+                  title={t('common.clear_filter')}
+                  type="button"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
             <div className="sort-controls">
               <button
                 className="filter-popup-btn"
@@ -1117,6 +1244,104 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         </div>
         {!isNodeListCollapsed && (
         <div className="nodes-list">
+          {/* MeshCore nodes section - shows regardless of Meshtastic connection */}
+          {showMeshCoreNodes && meshCoreNodes.length > 0 && (
+            <div className="meshcore-section">
+              <div className="meshcore-section-header" style={{
+                padding: '8px 12px',
+                background: 'color-mix(in srgb, var(--ctp-mauve) 10%, transparent)',
+                borderBottom: '1px solid color-mix(in srgb, var(--ctp-mauve) 30%, transparent)',
+                fontSize: '12px',
+                fontWeight: 'bold',
+                color: 'var(--ctp-mauve)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px'
+              }}>
+                <span style={{
+                  background: 'var(--ctp-mauve)',
+                  color: 'var(--ctp-base)',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  fontSize: '10px'
+                }}>MC</span>
+                MeshCore ({meshCoreNodes.length})
+              </div>
+              {meshCoreNodes.map(mcNode => {
+                const hasPosition = mcNode.latitude && mcNode.longitude;
+                const advTypeName = mcNode.advType === 1 ? 'Companion' : mcNode.advType === 2 ? 'Repeater' : mcNode.advType === 3 ? 'Router' : '';
+                return (
+                  <div
+                    key={`mc-${mcNode.publicKey}`}
+                    className={`node-item meshcore-node ${selectedNodeId === `mc-${mcNode.publicKey}` ? 'selected' : ''}`}
+                    onClick={() => {
+                      if (hasPosition) {
+                        setMapCenterTarget([mcNode.latitude, mcNode.longitude]);
+                      }
+                      setSelectedNodeId(`mc-${mcNode.publicKey}`);
+                    }}
+                    style={{ borderLeft: '3px solid var(--ctp-mauve)' }}
+                  >
+                    <div className="node-header">
+                      <div className="node-name">
+                        <span style={{
+                          background: 'var(--ctp-mauve)',
+                          color: 'var(--ctp-base)',
+                          padding: '1px 4px',
+                          borderRadius: '3px',
+                          fontSize: '9px',
+                          marginRight: '6px'
+                        }}>MC</span>
+                        <div className="node-name-text">
+                          <div className="node-longname">
+                            {mcNode.name || 'MeshCore Node'}
+                          </div>
+                          {advTypeName && (
+                            <div className="node-role" title="MeshCore device type">{advTypeName}</div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="node-actions">
+                        <div className="node-short" style={{ color: 'var(--ctp-mauve)' }}>
+                          {mcNode.publicKey.substring(0, 4)}...
+                        </div>
+                      </div>
+                    </div>
+                    <div className="node-details">
+                      <div className="node-stats">
+                        {mcNode.snr !== undefined && (
+                          <span className="stat" title="SNR">
+                            📶 {mcNode.snr.toFixed(1)}dB
+                          </span>
+                        )}
+                        {mcNode.rssi !== undefined && (
+                          <span className="stat" title="RSSI">
+                            📡 {mcNode.rssi}dBm
+                          </span>
+                        )}
+                      </div>
+                      <div className="node-time">
+                        {mcNode.lastSeen ? (() => {
+                          const date = new Date(mcNode.lastSeen);
+                          return isToday(date)
+                            ? formatTime(date, timeFormat)
+                            : formatDateTime(date, timeFormat, dateFormat);
+                        })() : '-'}
+                      </div>
+                    </div>
+                    <div className="node-indicators">
+                      {hasPosition && (
+                        <div className="node-location" title="Has GPS location">
+                          📍
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Meshtastic nodes section */}
           {shouldShowData() ? (() => {
             // Find the home node for distance calculations (use unfiltered nodes to ensure home node is found)
             const homeNode = nodes.find(n => n.user?.id === currentNodeId);
@@ -1142,6 +1367,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 return false;
               }
 
+              // Remote admin filter
+              if (filterRemoteAdminOnly && !node.hasRemoteAdmin) {
+                return false;
+              }
+
               return true;
             });
 
@@ -1154,6 +1384,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
             return sortedNodes.length > 0 ? (
               <>
+              {/* Meshtastic nodes */}
               {sortedNodes.map(node => (
                 <div
                   key={node.nodeNum}
@@ -1179,6 +1410,24 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       </div>
                     </div>
                     <div className="node-actions">
+                      {node.position && node.position.latitude != null && node.position.longitude != null && (
+                        <span className="node-indicator-icon" title={t('nodes.location')}>📍</span>
+                      )}
+                      {node.viaMqtt && (
+                        <span className="node-indicator-icon" title={t('nodes.via_mqtt')}>🌐</span>
+                      )}
+                      {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
+                        <span className="node-indicator-icon" title={t('nodes.has_telemetry')}>📊</span>
+                      )}
+                      {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
+                        <span className="node-indicator-icon" title={t('nodes.has_weather')}>☀️</span>
+                      )}
+                      {node.user?.id && nodesWithPKC.has(node.user.id) && (
+                        <span className="node-indicator-icon" title={t('nodes.has_pkc')}>🔐</span>
+                      )}
+                      {node.hasRemoteAdmin && (
+                        <span className="node-indicator-icon" title={t('nodes.has_remote_admin')}>🛠️</span>
+                      )}
                       {hasPermission('messages', 'read') && (
                         <button
                           className="dm-icon"
@@ -1252,37 +1501,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     </div>
                   </div>
 
-                  <div className="node-indicators">
-                    {node.position && node.position.latitude != null && node.position.longitude != null && (
-                      <div className="node-location" title={t('nodes.location')}>
-                        📍
-                        {node.isMobile && <span title={t('nodes.mobile_node')} style={{ marginLeft: '4px' }}>🚶</span>}
-                        {node.position.altitude != null && (
-                          <span title={t('nodes.elevation')} style={{ marginLeft: '4px' }}>⛰️ {Math.round(node.position.altitude)}m</span>
-                        )}
-                      </div>
-                    )}
-                    {node.viaMqtt && (
-                      <div className="node-mqtt" title={t('nodes.via_mqtt')}>
-                        🌐
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
-                      <div className="node-telemetry" title={t('nodes.has_telemetry')}>
-                        📊
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
-                      <div className="node-weather" title={t('nodes.has_weather')}>
-                        ☀️
-                      </div>
-                    )}
-                    {node.user?.id && nodesWithPKC.has(node.user.id) && (
-                      <div className="node-pkc" title={t('nodes.has_pkc')}>
-                        🔐
-                      </div>
-                    )}
-                  </div>
                 </div>
               ))}
               </>
@@ -1292,9 +1510,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               </div>
             );
           })() : (
-            <div className="no-data">
-              Connect to Meshtastic node
-            </div>
+            // Only show "Connect to Meshtastic node" if there are also no MeshCore nodes
+            !(showMeshCoreNodes && meshCoreNodes.length > 0) && (
+              <div className="no-data">
+                Connect to Meshtastic node
+              </div>
+            )
           )}
         </div>
         )}
@@ -1312,7 +1533,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         className={`map-container ${showPacketMonitor && canViewPacketMonitor ? 'with-packet-monitor' : ''}`}
         style={showPacketMonitor && canViewPacketMonitor ? { height: `calc(100% - ${packetMonitorHeight}px)` } : undefined}
       >
-        {shouldShowData() ? (
+        {(shouldShowData() || meshCoreNodes.length > 0) ? (
           <>
             <div
               ref={mapControlsRef}
@@ -1391,6 +1612,16 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     />
                     <span>Show MQTT</span>
                   </label>
+                  {authStatus?.meshcoreEnabled && (
+                  <label className="map-control-item">
+                    <input
+                      type="checkbox"
+                      checked={showMeshCoreNodes}
+                      onChange={(e) => setShowMeshCoreNodes(e.target.checked)}
+                    />
+                    <span>Show MeshCore</span>
+                  </label>
+                  )}
                   <label className="map-control-item">
                     <input
                       type="checkbox"
@@ -1399,6 +1630,47 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     />
                     <span>Show Position History</span>
                   </label>
+                  {showMotion && positionHistory.length > 1 && (() => {
+                    // Calculate max hours from oldest position in history
+                    const oldestTimestamp = positionHistory[0].timestamp;
+                    const now = Date.now();
+                    const maxHours = Math.max(1, Math.ceil((now - oldestTimestamp) / (1000 * 60 * 60)));
+
+                    // Current slider value (default to max if not set)
+                    const currentHours = positionHistoryHours ?? maxHours;
+
+                    // Format the display value
+                    const formatDuration = (hours: number, isMax: boolean): string => {
+                      if (isMax && hours === maxHours) return 'All';
+                      if (hours < 24) return `${hours}h`;
+                      const days = Math.floor(hours / 24);
+                      const remainingHours = hours % 24;
+                      if (remainingHours === 0) return `${days}d`;
+                      return `${days}d ${remainingHours}h`;
+                    };
+
+                    return (
+                      <div className="position-history-slider">
+                        <input
+                          type="range"
+                          min={1}
+                          max={maxHours}
+                          value={currentHours}
+                          aria-label="Position history duration"
+                          aria-valuemin={1}
+                          aria-valuemax={maxHours}
+                          aria-valuenow={currentHours}
+                          aria-valuetext={formatDuration(currentHours, currentHours >= maxHours)}
+                          onChange={(e) => {
+                            const value = parseInt(e.target.value, 10);
+                            // Set to null if at max (show all)
+                            setPositionHistoryHours(value >= maxHours ? null : value);
+                          }}
+                        />
+                        <span className="slider-value">{formatDuration(currentHours, currentHours >= maxHours)}</span>
+                      </div>
+                    );
+                  })()}
                   <label className="map-control-item">
                     <input
                       type="checkbox"
@@ -1418,10 +1690,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   <label className="map-control-item">
                     <input
                       type="checkbox"
-                      checked={showAccuracyCircles}
-                      onChange={(e) => setShowAccuracyCircles(e.target.checked)}
+                      checked={showAccuracyRegions}
+                      onChange={(e) => setShowAccuracyRegions(e.target.checked)}
                     />
-                    <span>Show Accuracy Circles</span>
+                    <span>Show Accuracy Regions</span>
                   </label>
                   {canViewPacketMonitor && packetLogEnabled && (
                     <label className="map-control-item packet-monitor-toggle">
@@ -1475,32 +1747,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   return true;
                 })
                 .map(node => {
-                const roleNum = typeof node.user?.role === 'string'
-                  ? parseInt(node.user.role, 10)
-                  : (typeof node.user?.role === 'number' ? node.user.role : 0);
-                const isRouter = roleNum === 2;
-                const isSelected = selectedNodeId === node.user?.id;
-
-                // Get hop count for this node
-                // Local node always gets 0 hops (green), otherwise use effective hops based on setting
-                const isLocalNode = node.user?.id === currentNodeId;
-                const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                const showLabel = mapZoom >= 13; // Show labels when zoomed in
-
-                const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
-
-                const markerIcon = createNodeIcon({
-                  hops: hops, // 0 (local) = green, 999 (no hops_away data) = grey
-                  isSelected,
-                  isRouter,
-                  shortName: node.user?.shortName,
-                  showLabel: showLabel || shouldAnimate, // Show label when animating OR zoomed in
-                  animate: shouldAnimate,
-                  pinStyle: mapPinStyle
-                });
-
-                // Use memoized position to prevent React-Leaflet from resetting marker position
+                // Use memoized icon and position to prevent unnecessary Leaflet DOM rebuilds
+                const markerIcon = nodeIcons.get(node.nodeNum)!;
                 const position = nodePositions.get(node.nodeNum)!;
+                const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
 
                 // Calculate opacity based on last heard time
                 const markerOpacity = calculateNodeOpacity(
@@ -1537,171 +1787,108 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                     </div>
                   </Tooltip>
                 )}
-                <Popup autoPan={false}>
-                  <div className="node-popup">
-                    <div className="node-popup-header">
-                      <div className="node-popup-title">{node.user?.longName || `Node ${node.nodeNum}`}</div>
-                      {node.user?.shortName && (
-                        <div className="node-popup-subtitle">{node.user.shortName}</div>
-                      )}
-                    </div>
-
-                    <div className="node-popup-grid">
-                      {node.user?.id && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">🆔</span>
-                          <span className="node-popup-value">{node.user.id}</span>
-                        </div>
-                      )}
-
-                      {node.user?.role !== undefined && (() => {
-                        const roleNum = typeof node.user.role === 'string'
-                          ? parseInt(node.user.role, 10)
-                          : node.user.role;
-                        const roleName = getRoleName(roleNum);
-                        return roleName ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">👤</span>
-                            <span className="node-popup-value">{roleName}</span>
-                          </div>
-                        ) : null;
-                      })()}
-
-                      {node.user?.hwModel !== undefined && (() => {
-                        const hwModelName = getHardwareModelName(node.user.hwModel);
-                        return hwModelName ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">🖥️</span>
-                            <span className="node-popup-value">{hwModelName}</span>
-                          </div>
-                        ) : null;
-                      })()}
-
-                      {node.snr != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">📶</span>
-                          <span className="node-popup-value">{node.snr.toFixed(1)} dB</span>
-                        </div>
-                      )}
-
-                      {(() => {
-                        const popupHops = getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                        return popupHops < 999 ? (
-                          <div className="node-popup-item">
-                            <span className="node-popup-icon">🔗</span>
-                            <span className="node-popup-value">{popupHops} hop{popupHops !== 1 ? 's' : ''}</span>
-                          </div>
-                        ) : null;
-                      })()}
-
-                      {node.position?.altitude != null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">⛰️</span>
-                          <span className="node-popup-value">{node.position.altitude}m</span>
-                        </div>
-                      )}
-
-                      {node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null && (
-                        <div className="node-popup-item">
-                          <span className="node-popup-icon">{node.deviceMetrics.batteryLevel === 101 ? '🔌' : '🔋'}</span>
-                          <span className="node-popup-value">
-                            {node.deviceMetrics.batteryLevel === 101 ? 'Plugged In' : `${node.deviceMetrics.batteryLevel}%`}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {node.lastHeard && (
-                      <div className="node-popup-footer">
-                        <span className="node-popup-icon">🕐</span>
-                        {formatDateTime(new Date(node.lastHeard * 1000), timeFormat, dateFormat)}
-                      </div>
-                    )}
-
-                    {/* Traceroute Section */}
-                    {(() => {
-                      if (!currentNodeId || !node.user?.id || currentNodeId === node.user.id) return null;
-
-                      // Get current node number from ID
-                      const currentNodeNum = parseNodeId(currentNodeId);
-                      if (currentNodeNum === null) return null;
-
-                      // Use shared constant for traceroute visibility window
-                      const cutoff = Date.now() - TRACEROUTE_DISPLAY_HOURS * 60 * 60 * 1000;
-
-                      // Find the most recent traceroute between these two nodes
-                      const recentTraceroute = traceroutes
-                        .filter(tr => {
-                          const isRelevant =
-                            (tr.fromNodeNum === currentNodeNum && tr.toNodeNum === node.nodeNum) ||
-                            (tr.fromNodeNum === node.nodeNum && tr.toNodeNum === currentNodeNum);
-                          return isRelevant && tr.timestamp >= cutoff;
-                        })
-                        .sort((a, b) => b.timestamp - a.timestamp)[0];
-
-                      if (!recentTraceroute) return null;
-
-                      return (
-                        <div className="node-popup-traceroute">
-                          <div className="traceroute-header">
-                            <strong>{t('node_popup.last_traceroute')}</strong>
-                            <span className="traceroute-age">
-                              ({formatRelativeTime(recentTraceroute.timestamp)})
-                            </span>
-                          </div>
-                          {recentTraceroute.route && recentTraceroute.route !== 'null' ? (
-                            <>
-                              <div className="traceroute-path">
-                                <span className="traceroute-label">{t('node_popup.forward_path')}:</span>
-                                <span className="traceroute-route">
-                                  {formatTracerouteRoute(
-                                    recentTraceroute.route,
-                                    recentTraceroute.snrTowards,
-                                    recentTraceroute.fromNodeNum,
-                                    recentTraceroute.toNodeNum,
-                                    nodes,
-                                    distanceUnit
-                                  )}
-                                </span>
-                              </div>
-                              {recentTraceroute.routeBack && recentTraceroute.routeBack !== 'null' && (
-                                <div className="traceroute-path">
-                                  <span className="traceroute-label">{t('node_popup.return_path')}:</span>
-                                  <span className="traceroute-route">
-                                    {formatTracerouteRoute(
-                                      recentTraceroute.routeBack,
-                                      recentTraceroute.snrBack,
-                                      recentTraceroute.toNodeNum,
-                                      recentTraceroute.fromNodeNum,
-                                      nodes,
-                                      distanceUnit
-                                    )}
-                                  </span>
-                                </div>
-                              )}
-                            </>
-                          ) : (
-                            <div className="traceroute-failed">
-                              {t('node_popup.traceroute_failed')}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })()}
-
-                    {node.user?.id && hasPermission('messages', 'read') && (
-                      <button
-                        className="node-popup-btn"
-                        onClick={handlePopupDMClick(node)}
-                      >
-                        💬 Direct Message
-                      </button>
-                    )}
-                  </div>
-                </Popup>
+                {/* Hide popup when showRoute is enabled and node has a valid traceroute,
+                    since TracerouteBoundsController zooms to fit the route */}
+                {!(showRoute && traceroutes.some(tr => {
+                  const matches = tr.toNodeId === node.user?.id || tr.fromNodeId === node.user?.id;
+                  if (!matches) return false;
+                  return tr.route && tr.route !== 'null' && tr.route !== '' &&
+                         tr.routeBack && tr.routeBack !== 'null' && tr.routeBack !== '';
+                })) && (
+                  <Popup autoPan={false}>
+                    <MapNodePopupContent
+                      node={node}
+                      nodes={nodes}
+                      currentNodeId={currentNodeId}
+                      timeFormat={timeFormat}
+                      dateFormat={dateFormat}
+                      distanceUnit={distanceUnit}
+                      traceroutes={traceroutes}
+                      hasPermission={hasPermission}
+                      onDMNode={handlePopupDMClick(node)}
+                      onTraceroute={onTraceroute ? () => onTraceroute(node.user!.id) : undefined}
+                      connectionStatus={connectionStatus}
+                      tracerouteLoading={tracerouteLoading}
+                      getEffectiveHops={(n) => getEffectiveHops(n, nodeHopsCalculation, traceroutes, currentNodeNum)}
+                    />
+                  </Popup>
+                )}
               </Marker>
                 );
               })}
+
+              {/* MeshCore nodes */}
+              {showMeshCoreNodes && meshCoreNodes
+                .filter(node => node.latitude && node.longitude)
+                .map(node => {
+                  const position: [number, number] = [node.latitude, node.longitude];
+                  // Use MeshCore theme color (Catppuccin mauve) for MeshCore nodes
+                  const meshCoreIcon = L.divIcon({
+                    className: 'meshcore-marker',
+                    html: `
+                      <div style="
+                        width: 24px;
+                        height: 24px;
+                        background: ${MESHCORE_COLOR};
+                        border: 2px solid white;
+                        border-radius: 50%;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        color: var(--ctp-base, #1e1e2e);
+                        font-size: 10px;
+                        font-weight: bold;
+                      ">MC</div>
+                      <div style="
+                        position: absolute;
+                        top: -20px;
+                        left: 50%;
+                        transform: translateX(-50%);
+                        background: ${MESHCORE_COLOR}e6;
+                        color: var(--ctp-base, #1e1e2e);
+                        padding: 2px 6px;
+                        border-radius: 3px;
+                        font-size: 11px;
+                        white-space: nowrap;
+                      ">${node.name || 'MeshCore'}</div>
+                    `,
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12],
+                  });
+
+                  return (
+                    <Marker
+                      key={`meshcore-${node.publicKey}`}
+                      position={position}
+                      icon={meshCoreIcon}
+                    >
+                      <Tooltip>
+                        <strong>{node.name || 'MeshCore Node'}</strong>
+                        <br />
+                        <small>MeshCore Device</small>
+                        {node.rssi !== undefined && <><br />RSSI: {node.rssi} dBm</>}
+                        {node.snr !== undefined && <><br />SNR: {node.snr} dB</>}
+                      </Tooltip>
+                      <Popup>
+                        <div style={{ minWidth: '200px' }}>
+                          <h3 style={{ margin: '0 0 8px 0', color: 'var(--ctp-mauve)' }}>
+                            {node.name || 'MeshCore Node'}
+                          </h3>
+                          <div style={{ fontSize: '12px', color: '#666' }}>
+                            <strong>Type:</strong> MeshCore Device<br />
+                            <strong>Public Key:</strong> {node.publicKey.substring(0, 16)}...<br />
+                            {node.latitude && <><strong>Latitude:</strong> {node.latitude.toFixed(6)}<br /></>}
+                            {node.longitude && <><strong>Longitude:</strong> {node.longitude.toFixed(6)}<br /></>}
+                            {node.rssi !== undefined && <><strong>RSSI:</strong> {node.rssi} dBm<br /></>}
+                            {node.snr !== undefined && <><strong>SNR:</strong> {node.snr} dB<br /></>}
+                            {node.lastSeen && <><strong>Last Seen:</strong> {new Date(node.lastSeen).toLocaleString()}<br /></>}
+                          </div>
+                        </div>
+                      </Popup>
+                    </Marker>
+                  );
+                })}
 
               {/* Draw uncertainty circles for estimated positions */}
               {showEstimatedPositions && nodesWithPosition
@@ -1736,38 +1923,58 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   );
                 })}
 
-              {/* Draw position accuracy circles for all nodes with precision data */}
-              {showAccuracyCircles && nodesWithPosition
+              {/* Draw position accuracy regions (rectangles) for all nodes with precision data */}
+              {showAccuracyRegions && nodesWithPosition
                 .filter(node => {
                   // Check precision data exists
                   if (node.positionPrecisionBits === undefined || node.positionPrecisionBits === null) return false;
                   if (node.positionPrecisionBits <= 0 || node.positionPrecisionBits >= 32) return false;
+                  // Don't show accuracy region for nodes with overridden positions
+                  if (node.positionIsOverride) return false;
                   // Apply standard filters
                   if (!showMqttNodes && node.viaMqtt) return false;
                   if (!showIncompleteNodes && !isNodeComplete(node)) return false;
-                  // When traceroute is active, only show circles for nodes in the traceroute
+                  // When traceroute is active, only show regions for nodes in the traceroute
                   if (tracerouteNodeNums && !tracerouteNodeNums.has(node.nodeNum)) return false;
                   return true;
                 })
                 .map(node => {
-                  // Convert precision_bits to radius in meters
+                  // Convert precision_bits to size in meters
                   // precision_bits indicates how many bits of lat/lon are valid
                   // Earth's circumference is ~40,075,000 meters
-                  // At N precision bits, accuracy is Earth's circumference / 2^N
-                  // Radius is half of that accuracy diameter
+                  // At N precision bits, the grid cell size is Earth's circumference / 2^N
                   const earthCircumference = 40_075_000; // meters
-                  const radiusMeters = earthCircumference / Math.pow(2, node.positionPrecisionBits!) / 2;
+                  const sizeMeters = earthCircumference / Math.pow(2, node.positionPrecisionBits!);
+                  const halfSizeMeters = sizeMeters / 2;
 
-                  // Get hop color for the circle (same as marker)
+                  // Convert meters to lat/lng offsets
+                  // 1 degree of latitude is approximately 111,111 meters
+                  const metersPerDegreeLat = 111_111;
+                  const lat = node.position!.latitude;
+                  const lng = node.position!.longitude;
+
+                  // Latitude offset is constant
+                  const latOffset = halfSizeMeters / metersPerDegreeLat;
+
+                  // Longitude offset varies with latitude (cos(lat) factor)
+                  const metersPerDegreeLng = metersPerDegreeLat * Math.cos(lat * Math.PI / 180);
+                  const lngOffset = halfSizeMeters / metersPerDegreeLng;
+
+                  // Calculate bounds: [[south, west], [north, east]]
+                  const bounds: [[number, number], [number, number]] = [
+                    [lat - latOffset, lng - lngOffset],
+                    [lat + latOffset, lng + lngOffset]
+                  ];
+
+                  // Get hop color for the region (same as marker)
                   const isLocalNode = node.user?.id === currentNodeId;
                   const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
                   const color = getHopColor(hops);
 
                   return (
-                    <Circle
+                    <Rectangle
                       key={`accuracy-${node.nodeNum}`}
-                      center={[node.position!.latitude, node.position!.longitude]}
-                      radius={radiusMeters}
+                      bounds={bounds}
                       pathOptions={{
                         color: color,
                         fillColor: color,
@@ -1839,54 +2046,120 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               {/* Note: Selected node traceroute with separate forward and back paths */}
               {/* This is handled by traceroutePathsElements passed from parent */}
 
-              {/* Draw position history for mobile nodes */}
+              {/* Draw position history for mobile nodes with color gradient */}
               {showMotion && positionHistory.length > 1 && (() => {
-                const historyPositions: [number, number][] = positionHistory.map(p =>
-                  [p.latitude, p.longitude] as [number, number]
-                );
+                // Filter position history based on slider value
+                const filteredHistory = positionHistoryHours != null
+                  ? positionHistory.filter(p => p.timestamp >= Date.now() - (positionHistoryHours * 60 * 60 * 1000))
+                  : positionHistory;
+
+                // Need at least 2 positions to draw a line
+                if (filteredHistory.length < 2) return null;
 
                 const elements: React.ReactElement[] = [];
+                const segmentCount = filteredHistory.length - 1;
+                const segmentColors: string[] = [];
 
-                // Draw blue line for position history
-                elements.push(
-                  <Polyline
-                    key="position-history-line"
-                    positions={historyPositions}
-                    color="#0066ff"
-                    weight={3}
-                    opacity={0.7}
-                  >
-                    <Popup>
-                      <div className="route-popup">
-                        <h4>Position History</h4>
-                        <div className="route-usage">
-                          {positionHistory.length} position{positionHistory.length !== 1 ? 's' : ''} recorded
-                        </div>
-                        <div className="route-usage">
-                          {formatDateTime(new Date(positionHistory[0].timestamp), timeFormat, dateFormat)} - {formatDateTime(new Date(positionHistory[positionHistory.length - 1].timestamp), timeFormat, dateFormat)}
-                        </div>
-                      </div>
-                    </Popup>
-                  </Polyline>
-                );
+                // Draw individual segments with gradient colors
+                for (let i = 0; i < segmentCount; i++) {
+                  const startPos = filteredHistory[i];
+                  const endPos = filteredHistory[i + 1];
+                  const color = getPositionHistoryColor(i, segmentCount);
+                  segmentColors.push(color);
 
-                // Generate arrow markers for position history
-                const historyArrows = generateArrowMarkers(
-                  historyPositions,
-                  'position-history',
-                  '#0066ff',
-                  0
+                  // Generate path - use Bezier curve if heading data is available
+                  const segmentPath = positionHistoryLineStyle === 'spline' && startPos.groundTrack !== undefined
+                    ? generateHeadingAwarePath(
+                        [startPos.latitude, startPos.longitude],
+                        [endPos.latitude, endPos.longitude],
+                        startPos.groundTrack,
+                        startPos.groundSpeed,
+                        10
+                      )
+                    : [[startPos.latitude, startPos.longitude] as [number, number], [endPos.latitude, endPos.longitude] as [number, number]];
+
+                  elements.push(
+                    <Polyline
+                      key={`position-history-segment-${i}`}
+                      positions={segmentPath}
+                      color={color}
+                      weight={3}
+                      opacity={0.8}
+                    >
+                      <Popup>
+                        <div className="route-popup">
+                          <h4>Position Segment {i + 1}</h4>
+                          <div className="route-usage">
+                            <strong>From:</strong> {formatDateTime(new Date(startPos.timestamp), timeFormat, dateFormat)}
+                          </div>
+                          <div className="route-usage">
+                            <strong>To:</strong> {formatDateTime(new Date(endPos.timestamp), timeFormat, dateFormat)}
+                          </div>
+                          {startPos.groundSpeed !== undefined && (() => {
+                            const converted = startPos.groundSpeed * 3.6;
+                            // If converted > 200 km/h, assume raw is already in km/h
+                            const speedKmh = converted > 200 ? startPos.groundSpeed : converted;
+                            // Convert to mph if user prefers miles
+                            const speed = distanceUnit === 'mi' ? speedKmh * 0.621371 : speedKmh;
+                            const unit = distanceUnit === 'mi' ? 'mph' : 'km/h';
+                            return (
+                              <div className="route-usage">
+                                <strong>Speed:</strong> {speed.toFixed(1)} {unit}
+                              </div>
+                            );
+                          })()}
+                          {startPos.groundTrack !== undefined && (() => {
+                            // Data is stored in millidegrees - detect and convert
+                            let heading = startPos.groundTrack;
+                            if (heading > 360) heading = heading / 1000;
+                            return (
+                              <div className="route-usage">
+                                <strong>Heading:</strong> {heading.toFixed(0)}°
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      </Popup>
+                    </Polyline>
+                  );
+                }
+
+                // Generate arrow markers with performance limiting (max 30 arrows)
+                // Pass full history items so arrows can show heading and popup info
+                const historyArrows = generatePositionHistoryArrows(
+                  filteredHistory,
+                  segmentColors,
+                  30,
+                  distanceUnit
                 );
                 elements.push(...historyArrows);
 
                 return elements;
+              })()}
+
+              {/* Position History Legend */}
+              {showMotion && positionHistory.length > 1 && (() => {
+                const filteredHistory = positionHistoryHours != null
+                  ? positionHistory.filter(p => p.timestamp >= Date.now() - (positionHistoryHours * 60 * 60 * 1000))
+                  : positionHistory;
+
+                if (filteredHistory.length < 2) return null;
+
+                return (
+                  <PositionHistoryLegend
+                    oldestTime={filteredHistory[0].timestamp}
+                    newestTime={filteredHistory[filteredHistory.length - 1].timestamp}
+                    timeFormat={timeFormat}
+                    dateFormat={dateFormat}
+                  />
+                );
               })()}
           </MapContainer>
           <TilesetSelector
             selectedTilesetId={activeTileset}
             onTilesetChange={setMapTileset}
           />
-          {nodesWithPosition.length === 0 && (
+          {nodesWithPosition.length === 0 && meshCoreNodes.filter(n => n.latitude && n.longitude).length === 0 && (
             <div className="map-overlay">
               <div className="overlay-content">
                 <h3>📍 No Node Locations</h3>
@@ -1900,13 +2173,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           <div className="map-placeholder">
             <div className="placeholder-content">
               <h3>Map View</h3>
-              <p>Connect to a Meshtastic node to view node locations on the map</p>
+              <p>Connect to a Meshtastic or MeshCore device to view node locations on the map</p>
             </div>
           </div>
         )}
       </div>
 
-      {/* Packet Monitor Panel (Desktop Only) */}
+      {/* Packet Monitor Panel */}
       {showPacketMonitor && canViewPacketMonitor && (
         <div
           className={`packet-monitor-container ${isPacketMonitorResizing ? 'resizing' : ''}`}
@@ -1925,11 +2198,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         </div>
       )}
 
-      {/* Node Filter Popup */}
-      <NodeFilterPopup
-        isOpen={showNodeFilterPopup}
-        onClose={() => setShowNodeFilterPopup(false)}
-      />
     </div>
   );
 };
@@ -2018,6 +2286,13 @@ const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
 
   // If tracerouteBounds changed (for zoom-to-fit), must re-render
   if (JSON.stringify(prevProps.tracerouteBounds) !== JSON.stringify(nextProps.tracerouteBounds)) {
+    return false; // Allow re-render
+  }
+
+  // If connection status or traceroute loading state changed, must re-render
+  // (for traceroute button disabled state and loading indicator)
+  if (prevProps.connectionStatus !== nextProps.connectionStatus ||
+      prevProps.tracerouteLoading !== nextProps.tracerouteLoading) {
     return false; // Allow re-render
   }
 

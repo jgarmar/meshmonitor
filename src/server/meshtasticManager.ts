@@ -16,8 +16,9 @@ import { channelDecryptionService } from './services/channelDecryptionService.js
 import { dataEventEmitter } from './services/dataEventEmitter.js';
 import { messageQueueService } from './messageQueueService.js';
 import { normalizeTriggerPatterns } from '../utils/autoResponderUtils.js';
+import { isWithinTimeWindow } from './utils/timeWindow.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
-import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism } from './constants/meshtastic.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, MIN_TRACEROUTE_INTERVAL_MS } from './constants/meshtastic.js';
 import { createRequire } from 'module';
 import * as cron from 'node-cron';
 import fs from 'fs';
@@ -148,6 +149,47 @@ export function shouldExcludeFromPacketLog(
   return isLocalPacket && isInternalPortnum;
 }
 
+/**
+ * Determines if a packet is a "phantom" internal state update from the local device.
+ * These are packets the Meshtastic device sends to TCP clients to report its internal
+ * state, but they are NOT actual RF transmissions. They should not be logged as "TX"
+ * packets because they clutter the packet log and don't represent actual mesh traffic.
+ *
+ * Phantom packets are identified by:
+ * - from_node === localNodeNum (originated from local device)
+ * - transport_mechanism === INTERNAL (0) or undefined
+ * - hop_start === 0 or undefined (hasn't traveled any hops)
+ *
+ * @param fromNum - Source node number
+ * @param localNodeNum - The local node's number (null if not connected)
+ * @param transportMechanism - Transport mechanism from the packet (0 = INTERNAL)
+ * @param hopStart - Hop start value from the packet
+ * @returns true if the packet is a phantom internal state update
+ */
+export function isPhantomInternalPacket(
+  fromNum: number,
+  localNodeNum: number | null,
+  transportMechanism: number | undefined,
+  hopStart: number | undefined
+): boolean {
+  // If we don't know the local node, can't determine if it's local traffic
+  if (!localNodeNum) return false;
+
+  // Must be from the local node
+  if (fromNum !== localNodeNum) return false;
+
+  // Transport mechanism must be INTERNAL (0) or undefined
+  // Note: TransportMechanism.INTERNAL === 0
+  const isInternalTransport = transportMechanism === undefined || transportMechanism === 0;
+  if (!isInternalTransport) return false;
+
+  // Hop start must be 0 or undefined (hasn't traveled any hops)
+  const hasNotTraveled = hopStart === undefined || hopStart === 0;
+  if (!hasNotTraveled) return false;
+
+  return true;
+}
+
 type TextMessage = {
   id: string;
   fromNodeNum: number;
@@ -184,9 +226,10 @@ interface AutoResponderTrigger {
   trigger: string | string[];
   response: string;
   responseType?: 'text' | 'http' | 'script';
-  channel?: number | 'dm';
+  channel?: number | 'dm' | 'none';
   verifyResponse?: boolean;
   multiline?: boolean;
+  scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
 }
 
 /**
@@ -204,10 +247,28 @@ interface GeofenceTriggerConfig {
   responseType: 'text' | 'script';
   response?: string;
   scriptPath?: string;
-  channel: number | 'dm';
+  scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
+  channel: number | 'dm' | 'none';
+  verifyResponse?: boolean; // Enable retry logic (3 attempts) for DM messages
   lastRun?: number;
   lastResult?: 'success' | 'error';
   lastError?: string;
+}
+
+interface AutoPingSession {
+  requestedBy: number;      // nodeNum of the user who requested
+  channel: number;           // channel the DM came on
+  totalPings: number;
+  completedPings: number;
+  successfulPings: number;
+  failedPings: number;
+  intervalMs: number;
+  timer: ReturnType<typeof setInterval> | null;
+  pendingRequestId: number | null;
+  pendingTimeout: ReturnType<typeof setTimeout> | null;
+  startTime: number;
+  lastPingSentAt: number;
+  results: Array<{ pingNum: number; status: 'ack' | 'nak' | 'timeout'; durationMs?: number; sentAt: number }>;
 }
 
 class MeshtasticManager {
@@ -215,8 +276,12 @@ class MeshtasticManager {
   private isConnected = false;
   private userDisconnectedState = false;  // Track user-initiated disconnect
   private tracerouteInterval: NodeJS.Timeout | null = null;
+  private tracerouteJitterTimeout: NodeJS.Timeout | null = null;
   private tracerouteIntervalMinutes: number = 0;
+  private lastTracerouteSentTime: number = 0;
   private localStatsInterval: NodeJS.Timeout | null = null;
+  private timeOffsetSamples: number[] = [];
+  private timeOffsetInterval: NodeJS.Timeout | null = null;
   private localStatsIntervalMinutes: number = 5;  // Default 5 minutes
   private announceInterval: NodeJS.Timeout | null = null;
   private announceCronJob: cron.ScheduledTask | null = null;
@@ -229,6 +294,9 @@ class MeshtasticManager {
   private remoteAdminScannerInterval: NodeJS.Timeout | null = null;
   private remoteAdminScannerIntervalMinutes: number = 0; // 0 = disabled
   private pendingRemoteAdminScans: Set<number> = new Set(); // Track nodes being scanned
+  private timeSyncInterval: NodeJS.Timeout | null = null;
+  private timeSyncIntervalMinutes: number = 0; // 0 = disabled
+  private pendingTimeSyncs: Set<number> = new Set(); // Track nodes being synced
   private keyRepairInterval: NodeJS.Timeout | null = null;
   private keyRepairEnabled: boolean = false;
   private keyRepairIntervalMinutes: number = 5;  // Default 5 minutes
@@ -260,6 +328,8 @@ class MeshtasticManager {
     moduleConfig: any;
     lastUpdated: number;
   }> = new Map();
+  // Track pending module config requests so empty Proto3 responses can be mapped to the correct key
+  private pendingModuleConfigRequests: Map<number, string> = new Map();
   // Per-node channel storage for remote nodes
   private remoteNodeChannels: Map<number, Map<number, any>> = new Map();
   // Per-node owner storage for remote nodes
@@ -268,6 +338,9 @@ class MeshtasticManager {
   private remoteNodeDeviceMetadata: Map<number, any> = new Map();
   private favoritesSupportCache: boolean | null = null;  // Cache firmware support check result
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
+
+  // Auto-ping session tracking
+  private autoPingSessions: Map<number, AutoPingSession> = new Map(); // keyed by requester nodeNum
 
   // Auto-welcome tracking to prevent race conditions
   private welcomingNodes: Set<number> = new Set();  // Track nodes currently being welcomed
@@ -360,10 +433,74 @@ class MeshtasticManager {
    */
   private getConfig(): MeshtasticConfig {
     const env = getEnvironmentConfig();
+
+    // Check for runtime override in settings (set via UI)
+    const overrideIp = databaseService.getSetting('meshtasticNodeIpOverride');
+    const overridePortStr = databaseService.getSetting('meshtasticTcpPortOverride');
+    const overridePort = overridePortStr ? parseInt(overridePortStr, 10) : null;
+
     return {
-      nodeIp: env.meshtasticNodeIp,
-      tcpPort: env.meshtasticTcpPort
+      nodeIp: overrideIp || env.meshtasticNodeIp,
+      tcpPort: (overridePort && !isNaN(overridePort)) ? overridePort : env.meshtasticTcpPort
     };
+  }
+
+  /**
+   * Get connection config for scripts. When Virtual Node is enabled, returns
+   * localhost + virtual node port so scripts connect through the Virtual Node
+   * instead of opening a second TCP connection to the physical node (which would
+   * kill MeshMonitor's connection). Falls back to getConfig() when Virtual Node
+   * is disabled.
+   */
+  private getScriptConnectionConfig(): MeshtasticConfig {
+    const env = getEnvironmentConfig();
+    if (env.enableVirtualNode) {
+      return {
+        nodeIp: '127.0.0.1',
+        tcpPort: env.virtualNodePort,
+      };
+    }
+    return this.getConfig();
+  }
+
+  /**
+   * Set a runtime IP (and optionally port) override and reconnect
+   * Accepts formats: "192.168.1.100", "192.168.1.100:4403", "hostname", "hostname:4403"
+   * This setting is temporary and will reset when the container restarts
+   */
+  async setNodeIpOverride(address: string): Promise<void> {
+    // Parse IP and optional port from address
+    let ip = address;
+    let port: string | null = null;
+
+    // Check for port suffix (handle both IPv4 and hostname with port)
+    const portMatch = address.match(/^(.+):(\d+)$/);
+    if (portMatch) {
+      ip = portMatch[1];
+      port = portMatch[2];
+    }
+
+    await databaseService.setSettingAsync('meshtasticNodeIpOverride', ip);
+    if (port) {
+      await databaseService.setSettingAsync('meshtasticTcpPortOverride', port);
+    } else {
+      // Clear port override if not specified (use default)
+      await databaseService.setSettingAsync('meshtasticTcpPortOverride', '');
+    }
+
+    // Disconnect and reconnect with new IP/port
+    this.disconnect();
+    await this.connect();
+  }
+
+  /**
+   * Clear the runtime IP/port override and revert to defaults
+   */
+  async clearNodeIpOverride(): Promise<void> {
+    await databaseService.setSettingAsync('meshtasticNodeIpOverride', '');
+    await databaseService.setSettingAsync('meshtasticTcpPortOverride', '');
+    this.disconnect();
+    await this.connect();
   }
 
   /**
@@ -375,7 +512,8 @@ class MeshtasticManager {
     nodeId: string,
     fromNum: number,
     timestamp: number,
-    packetTimestamp: number | undefined
+    packetTimestamp: number | undefined,
+    packetId?: number
   ): void {
     const now = Date.now();
     for (const metric of metricsToSave) {
@@ -388,7 +526,8 @@ class MeshtasticManager {
           value: Number(metric.value),
           unit: metric.unit,
           createdAt: now,
-          packetTimestamp
+          packetTimestamp,
+          packetId
         });
       }
     }
@@ -511,8 +650,14 @@ class MeshtasticManager {
         // Start remote admin discovery scanner
         this.startRemoteAdminScanner();
 
+        // Start automatic time sync scheduler
+        this.startTimeSyncScheduler();
+
         // Start automatic LocalStats collection
         this.startLocalStatsScheduler();
+
+        // Start time-offset telemetry scheduler
+        this.startTimeOffsetScheduler();
 
         // Start automatic announcement scheduler
         this.startAnnounceScheduler();
@@ -681,6 +826,11 @@ class MeshtasticManager {
       this.transport = null;
     }
 
+    if (this.tracerouteJitterTimeout) {
+      clearTimeout(this.tracerouteJitterTimeout);
+      this.tracerouteJitterTimeout = null;
+    }
+
     if (this.tracerouteInterval) {
       clearInterval(this.tracerouteInterval);
       this.tracerouteInterval = null;
@@ -691,8 +841,17 @@ class MeshtasticManager {
       this.remoteAdminScannerInterval = null;
     }
 
+    if (this.timeSyncInterval) {
+      clearInterval(this.timeSyncInterval);
+      this.timeSyncInterval = null;
+    }
+
     // Stop LocalStats collection
     this.stopLocalStatsScheduler();
+
+    // Stop time-offset telemetry collection
+    this.stopTimeOffsetScheduler();
+    this.timeOffsetSamples = [];
 
     logger.debug('Disconnected from Meshtastic node');
   }
@@ -706,6 +865,12 @@ class MeshtasticManager {
   }
 
   private startTracerouteScheduler(): void {
+    // Clear any pending jitter timeout to prevent leaked timers
+    if (this.tracerouteJitterTimeout) {
+      clearTimeout(this.tracerouteJitterTimeout);
+      this.tracerouteJitterTimeout = null;
+    }
+
     if (this.tracerouteInterval) {
       clearInterval(this.tracerouteInterval);
       this.tracerouteInterval = null;
@@ -730,8 +895,26 @@ class MeshtasticManager {
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
+      // Check time window schedule
+      const scheduleEnabled = databaseService.getSetting('tracerouteScheduleEnabled');
+      if (scheduleEnabled === 'true') {
+        const start = databaseService.getSetting('tracerouteScheduleStart') || '00:00';
+        const end = databaseService.getSetting('tracerouteScheduleEnd') || '00:00';
+        if (!isWithinTimeWindow(start, end)) {
+          logger.debug(`🗺️ Auto-traceroute: Skipping - outside schedule window (${start}-${end})`);
+          return;
+        }
+      }
+
       if (this.isConnected && this.localNodeInfo) {
         try {
+          // Enforce minimum interval between traceroute sends (Meshtastic firmware rate limit)
+          const timeSinceLastSend = Date.now() - this.lastTracerouteSentTime;
+          if (this.lastTracerouteSentTime > 0 && timeSinceLastSend < MIN_TRACEROUTE_INTERVAL_MS) {
+            logger.debug(`🗺️ Auto-traceroute: Skipping - only ${Math.round(timeSinceLastSend / 1000)}s since last send (minimum ${MIN_TRACEROUTE_INTERVAL_MS / 1000}s)`);
+            return;
+          }
+
           // Use async version which supports PostgreSQL/MySQL
           const targetNode = await databaseService.getNodeNeedingTracerouteAsync(this.localNodeInfo.nodeNum);
           if (targetNode) {
@@ -744,6 +927,7 @@ class MeshtasticManager {
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
             this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
+            this.lastTracerouteSentTime = Date.now();
             await this.sendTraceroute(targetNode.nodeNum, channel);
 
             // Check for timed-out traceroutes (> 5 minutes old)
@@ -760,7 +944,8 @@ class MeshtasticManager {
     };
 
     // Delay first execution by jitter, then start regular interval
-    setTimeout(() => {
+    this.tracerouteJitterTimeout = setTimeout(() => {
+      this.tracerouteJitterTimeout = null;
       // Execute first traceroute
       executeTraceroute();
 
@@ -835,6 +1020,17 @@ class MeshtasticManager {
     logger.info(`🔑 Starting remote admin scanner with ${this.remoteAdminScannerIntervalMinutes} minute interval`);
 
     this.remoteAdminScannerInterval = setInterval(async () => {
+      // Check time window schedule
+      const scheduleEnabled = databaseService.getSetting('remoteAdminScheduleEnabled');
+      if (scheduleEnabled === 'true') {
+        const start = databaseService.getSetting('remoteAdminScheduleStart') || '00:00';
+        const end = databaseService.getSetting('remoteAdminScheduleEnd') || '00:00';
+        if (!isWithinTimeWindow(start, end)) {
+          logger.debug(`🔑 Remote admin scanner: Skipping - outside schedule window (${start}-${end})`);
+          return;
+        }
+      }
+
       if (this.isConnected && this.localNodeInfo) {
         try {
           await this.scanNextNodeForRemoteAdmin();
@@ -845,6 +1041,102 @@ class MeshtasticManager {
         logger.debug('🔑 Remote admin scanner: Skipping - not connected or no local node info');
       }
     }, intervalMs);
+  }
+
+  /**
+   * Set the auto time sync interval in minutes
+   * @param minutes Interval in minutes (15-1440), 0 to disable
+   */
+  setTimeSyncInterval(minutes: number): void {
+    if (minutes !== 0 && (minutes < 15 || minutes > 1440)) {
+      throw new Error('Time sync interval must be 0 (disabled) or between 15 and 1440 minutes');
+    }
+    this.timeSyncIntervalMinutes = minutes;
+
+    if (minutes === 0) {
+      logger.debug('🕐 Time sync scheduler set to 0 (disabled)');
+    } else {
+      logger.debug(`🕐 Time sync scheduler interval updated to ${minutes} minutes`);
+    }
+
+    if (this.isConnected) {
+      this.startTimeSyncScheduler();
+    }
+  }
+
+  /**
+   * Start the automatic time sync scheduler
+   */
+  private startTimeSyncScheduler(): void {
+    if (this.timeSyncInterval) {
+      clearInterval(this.timeSyncInterval);
+      this.timeSyncInterval = null;
+    }
+
+    // Load settings from database if not already set
+    if (this.timeSyncIntervalMinutes === 0) {
+      if (databaseService.isAutoTimeSyncEnabled()) {
+        this.timeSyncIntervalMinutes = databaseService.getAutoTimeSyncIntervalMinutes();
+      }
+    }
+
+    // If interval is 0 or time sync is disabled, scheduler is disabled
+    if (this.timeSyncIntervalMinutes === 0 || !databaseService.isAutoTimeSyncEnabled()) {
+      logger.info('🕐 Time sync scheduler is disabled');
+      return;
+    }
+
+    const intervalMs = this.timeSyncIntervalMinutes * 60 * 1000;
+    logger.info(`🕐 Starting time sync scheduler with ${this.timeSyncIntervalMinutes} minute interval`);
+
+    this.timeSyncInterval = setInterval(async () => {
+      if (this.isConnected && this.localNodeInfo) {
+        try {
+          await this.syncNextNodeTime();
+        } catch (error) {
+          logger.error('❌ Error in time sync scheduler:', error);
+        }
+      } else {
+        logger.debug('🕐 Time sync scheduler: Skipping - not connected or no local node info');
+      }
+    }, intervalMs);
+  }
+
+  /**
+   * Sync the next eligible node's time
+   */
+  private async syncNextNodeTime(): Promise<void> {
+    if (!this.localNodeInfo) {
+      logger.debug('🕐 Time sync: No local node info');
+      return;
+    }
+
+    const targetNode = await databaseService.getNodeNeedingTimeSyncAsync();
+    if (!targetNode) {
+      logger.info('🕐 Time sync: No nodes available for syncing');
+      return;
+    }
+
+    // Skip if already being synced
+    if (this.pendingTimeSyncs.has(targetNode.nodeNum)) {
+      logger.debug(`🕐 Time sync: Node ${targetNode.nodeNum} already being synced`);
+      return;
+    }
+
+    const targetName = targetNode.longName || targetNode.nodeId;
+    logger.info(`🕐 Time sync: Syncing time to ${targetName} (${targetNode.nodeId})`);
+
+    this.pendingTimeSyncs.add(targetNode.nodeNum);
+
+    try {
+      await this.sendSetTimeCommand(targetNode.nodeNum);
+      await databaseService.updateNodeTimeSyncAsync(targetNode.nodeNum, Date.now());
+      logger.info(`🕐 Time sync: Successfully synced time to ${targetName}`);
+    } catch (error) {
+      logger.error(`🕐 Time sync: Failed to sync time to ${targetName}:`, error);
+    } finally {
+      this.pendingTimeSyncs.delete(targetNode.nodeNum);
+    }
   }
 
   /**
@@ -1065,12 +1357,18 @@ class MeshtasticManager {
       this.requestLocalStats().catch(error => {
         logger.error('❌ Error requesting initial LocalStats:', error);
       });
+      // Also save system node metrics on initial request
+      this.saveSystemNodeMetrics().catch(error => {
+        logger.error('❌ Error saving initial system node metrics:', error);
+      });
     }
 
     this.localStatsInterval = setInterval(async () => {
       if (this.isConnected && this.localNodeInfo) {
         try {
           await this.requestLocalStats();
+          // Save MeshMonitor's system node metrics alongside LocalStats
+          await this.saveSystemNodeMetrics();
         } catch (error) {
           logger.error('❌ Error in auto-LocalStats collection:', error);
         }
@@ -1088,6 +1386,55 @@ class MeshtasticManager {
       clearInterval(this.localStatsInterval);
       this.localStatsInterval = null;
       logger.debug('📊 LocalStats scheduler stopped');
+    }
+  }
+
+  private startTimeOffsetScheduler(): void {
+    if (this.timeOffsetInterval) {
+      clearInterval(this.timeOffsetInterval);
+      this.timeOffsetInterval = null;
+    }
+
+    const intervalMs = 5 * 60 * 1000; // 5 minutes
+    logger.debug('⏱️ Starting time-offset scheduler (5-minute interval)');
+
+    this.timeOffsetInterval = setInterval(async () => {
+      await this.flushTimeOffsetTelemetry();
+    }, intervalMs);
+  }
+
+  private stopTimeOffsetScheduler(): void {
+    if (this.timeOffsetInterval) {
+      clearInterval(this.timeOffsetInterval);
+      this.timeOffsetInterval = null;
+      logger.debug('⏱️ Time-offset scheduler stopped');
+    }
+  }
+
+  private async flushTimeOffsetTelemetry(): Promise<void> {
+    if (this.timeOffsetSamples.length === 0 || !this.localNodeInfo) {
+      return;
+    }
+
+    const sum = this.timeOffsetSamples.reduce((a, b) => a + b, 0);
+    const avg = sum / this.timeOffsetSamples.length;
+    const sampleCount = this.timeOffsetSamples.length;
+    this.timeOffsetSamples = [];
+
+    const now = Date.now();
+    try {
+      await databaseService.insertTelemetryAsync({
+        nodeId: this.localNodeInfo.nodeId,
+        nodeNum: this.localNodeInfo.nodeNum,
+        telemetryType: 'timeOffset',
+        timestamp: now,
+        value: Math.round(avg * 100) / 100,
+        unit: 's',
+        createdAt: now,
+      });
+      logger.debug(`⏱️ Saved time-offset telemetry: avg=${avg.toFixed(2)}s (${sampleCount} samples)`);
+    } catch (error) {
+      logger.error('❌ Error saving time-offset telemetry:', error);
     }
   }
 
@@ -1109,6 +1456,48 @@ class MeshtasticManager {
     // Restart scheduler with new interval if connected
     if (this.isConnected) {
       this.startLocalStatsScheduler();
+    }
+  }
+
+  /**
+   * Save MeshMonitor's system node metrics as telemetry
+   * This allows graphing the system's active node count over time
+   */
+  private async saveSystemNodeMetrics(): Promise<void> {
+    if (!this.localNodeInfo?.nodeId || !this.localNodeInfo?.nodeNum) {
+      logger.debug('📊 Cannot save system node metrics: no local node info');
+      return;
+    }
+
+    try {
+      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
+      const maxNodeAgeDays = maxNodeAgeHours / 24;
+      const nodes = databaseService.getActiveNodes(maxNodeAgeDays);
+      const nodeCount = nodes.length;
+      const directCount = nodes.filter((n: any) => n.hopsAway === 0).length;
+      const now = Date.now();
+
+      // Save as telemetry so it can be graphed over time
+      await databaseService.insertTelemetryAsync({
+        nodeId: this.localNodeInfo.nodeId,
+        nodeNum: this.localNodeInfo.nodeNum,
+        telemetryType: 'systemNodeCount',
+        timestamp: now,
+        value: nodeCount,
+        createdAt: now,
+      });
+      await databaseService.insertTelemetryAsync({
+        nodeId: this.localNodeInfo.nodeId,
+        nodeNum: this.localNodeInfo.nodeNum,
+        telemetryType: 'systemDirectNodeCount',
+        timestamp: now,
+        value: directCount,
+        createdAt: now,
+      });
+
+      logger.debug(`📊 Saved system node metrics: ${nodeCount} active nodes, ${directCount} direct nodes`);
+    } catch (error) {
+      logger.error('❌ Error saving system node metrics:', error);
     }
   }
 
@@ -1266,6 +1655,7 @@ class MeshtasticManager {
       cronExpression: string;
       responseType?: 'script' | 'text'; // 'script' (default) or 'text' message
       scriptPath?: string; // Path to script in /data/scripts/ (when responseType is 'script')
+      scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
       response?: string; // Text message with expansion tokens (when responseType is 'text')
       channel?: number; // Channel index (0-7) to send output to
       enabled: boolean;
@@ -1301,7 +1691,7 @@ class MeshtasticManager {
         if (responseType === 'text' && trigger.response?.trim()) {
           await this.executeTimerTextMessage(trigger.id, trigger.name, trigger.response, trigger.channel ?? 0);
         } else if (trigger.scriptPath) {
-          await this.executeTimerScript(trigger.id, trigger.name, trigger.scriptPath, trigger.channel ?? 0);
+          await this.executeTimerScript(trigger.id, trigger.name, trigger.scriptPath, trigger.channel ?? 0, trigger.scriptArgs);
         } else {
           logger.error(`⏱️ Timer "${trigger.name}" has no valid response configured`);
           this.updateTimerTriggerResult(trigger.id, 'error', 'No response configured');
@@ -1457,14 +1847,17 @@ class MeshtasticManager {
         const truncated = this.truncateMessageForMeshtastic(expanded, 200);
 
         const isDM = trigger.channel === 'dm';
-        logger.info(`📍 Geofence "${trigger.name}" sending text to ${isDM ? `DM (node ${nodeNum})` : `channel ${trigger.channel}`}`);
+        // For DMs: use 3 attempts if verifyResponse is enabled, otherwise just 1 attempt
+        const maxAttempts = isDM ? (trigger.verifyResponse ? 3 : 1) : 1;
+        logger.info(`📍 Geofence "${trigger.name}" sending text to ${isDM ? `DM (node ${nodeNum})` : `channel ${trigger.channel}`}${trigger.verifyResponse ? ' (with verification)' : ''}`);
         messageQueueService.enqueue(
           truncated,
           isDM ? nodeNum : 0,
           undefined,
           () => logger.info(`✅ Geofence "${trigger.name}" message delivered to ${isDM ? `DM (node ${nodeNum})` : `channel ${trigger.channel}`}`),
           (reason: string) => logger.warn(`❌ Geofence "${trigger.name}" message failed: ${reason}`),
-          isDM ? undefined : trigger.channel as number
+          isDM ? undefined : trigger.channel as number,
+          maxAttempts
         );
 
         this.updateGeofenceTriggerResult(trigger.id, 'success');
@@ -1513,12 +1906,15 @@ class MeshtasticManager {
 
     switch (ext) {
       case 'js': case 'mjs': interpreter = isDev ? 'node' : '/usr/local/bin/node'; break;
-      case 'py': interpreter = isDev ? 'python' : '/usr/bin/python'; break;
+      case 'py': interpreter = isDev ? 'python' : '/opt/apprise-venv/bin/python3'; break;
       case 'sh': interpreter = isDev ? 'sh' : '/bin/sh'; break;
       default:
         this.updateGeofenceTriggerResult(trigger.id, 'error', `Unsupported script extension: ${ext}`);
         return;
     }
+
+    const startTime = Date.now();
+    logger.info(`📍 Executing geofence script: "${trigger.name}" (${eventType}) -> ${scriptPath}`);
 
     try {
       const { execFile } = await import('child_process');
@@ -1528,6 +1924,7 @@ class MeshtasticManager {
       const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
       const node = databaseService.getNode(nodeNum);
       const dist = distanceToGeofenceCenter(lat, lng, trigger.shape);
+      const config = this.getScriptConnectionConfig();
 
       const scriptEnv: Record<string, string> = {
         ...process.env as Record<string, string>,
@@ -1539,6 +1936,8 @@ class MeshtasticManager {
         NODE_LAT: String(lat),
         NODE_LON: String(lng),
         DISTANCE_TO_CENTER: dist.toFixed(2),
+        MESHTASTIC_IP: config.nodeIp,
+        MESHTASTIC_PORT: String(config.tcpPort),
       };
 
       if (node?.longName) scriptEnv.NODE_LONG_NAME = node.longName;
@@ -1554,13 +1953,23 @@ class MeshtasticManager {
         }
       }
 
-      const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath], {
+      // Expand tokens in script args if provided
+      let scriptArgsList: string[] = [];
+      if (trigger.scriptArgs) {
+        const expandedArgs = await this.replaceGeofenceTokens(
+          trigger.scriptArgs, trigger, nodeNum, lat, lng, eventType
+        );
+        scriptArgsList = this.parseScriptArgs(expandedArgs);
+        logger.debug(`📍 Geofence script args expanded: ${trigger.scriptArgs} -> ${JSON.stringify(scriptArgsList)}`);
+      }
+
+      const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
         timeout: 30000,
         env: scriptEnv,
         maxBuffer: 1024 * 1024,
       });
 
-      if (stderr) logger.debug(`📍 Geofence script stderr: ${stderr}`);
+      if (stderr) logger.warn(`📍 Geofence script "${trigger.name}" stderr: ${stderr}`);
 
       // Parse JSON output and send messages (same format as timer scripts)
       if (stdout && stdout.trim()) {
@@ -1582,24 +1991,37 @@ class MeshtasticManager {
           return;
         }
 
-        const isDM = trigger.channel === 'dm';
-        for (const resp of scriptResponses) {
-          const truncated = this.truncateMessageForMeshtastic(resp, 200);
-          messageQueueService.enqueue(
-            truncated,
-            isDM ? nodeNum : 0,
-            undefined,
-            () => logger.info(`✅ Geofence "${trigger.name}" script response delivered`),
-            (reason: string) => logger.warn(`❌ Geofence "${trigger.name}" script response failed: ${reason}`),
-            isDM ? undefined : trigger.channel as number
-          );
+        // Skip sending if channel is 'none' (script handles its own output)
+        if (trigger.channel !== 'none') {
+          const isDM = trigger.channel === 'dm';
+          // For DMs: use 3 attempts if verifyResponse is enabled, otherwise just 1 attempt
+          const maxAttempts = isDM ? (trigger.verifyResponse ? 3 : 1) : 1;
+          for (const resp of scriptResponses) {
+            const truncated = this.truncateMessageForMeshtastic(resp, 200);
+            messageQueueService.enqueue(
+              truncated,
+              isDM ? nodeNum : 0,
+              undefined,
+              () => logger.info(`✅ Geofence "${trigger.name}" script response delivered`),
+              (reason: string) => logger.warn(`❌ Geofence "${trigger.name}" script response failed: ${reason}`),
+              isDM ? undefined : trigger.channel as number,
+              maxAttempts
+            );
+          }
+        } else {
+          logger.info(`📍 Geofence "${trigger.name}" script executed (channel=none, no mesh output)`);
         }
       }
 
+      const duration = Date.now() - startTime;
+      logger.info(`📍 Geofence "${trigger.name}" script completed successfully in ${duration}ms`);
       this.updateGeofenceTriggerResult(trigger.id, 'success');
     } catch (error: any) {
+      const duration = Date.now() - startTime;
       const errorMessage = error.message || 'Unknown error';
-      logger.error(`📍 Geofence "${trigger.name}" script failed: ${errorMessage}`);
+      logger.error(`📍 Geofence "${trigger.name}" script failed after ${duration}ms: ${errorMessage}`);
+      if (error.stderr) logger.error(`📍 Geofence script stderr: ${error.stderr}`);
+      if (error.stdout) logger.warn(`📍 Geofence script stdout before failure: ${error.stdout.substring(0, 200)}`);
       this.updateGeofenceTriggerResult(trigger.id, 'error', errorMessage);
     }
   }
@@ -1646,6 +2068,8 @@ class MeshtasticManager {
     const node = databaseService.getNode(nodeNum);
     const dist = distanceToGeofenceCenter(lat, lng, trigger.shape);
 
+    const config = this.getConfig();
+
     result = result.replace(/{GEOFENCE_NAME}/g, trigger.name);
     result = result.replace(/{NODE_LAT}/g, String(lat));
     result = result.replace(/{NODE_LON}/g, String(lng));
@@ -1655,6 +2079,7 @@ class MeshtasticManager {
     result = result.replace(/{SHORT_NAME}/g, node?.shortName || nodeId);
     result = result.replace(/{DISTANCE_TO_CENTER}/g, dist.toFixed(2));
     result = result.replace(/{EVENT}/g, eventType);
+    result = result.replace(/{IP}/g, config.nodeIp);
 
     return result;
   }
@@ -1698,7 +2123,7 @@ class MeshtasticManager {
   /**
    * Execute a timer trigger script and send output to specified channel
    */
-  private async executeTimerScript(triggerId: string, triggerName: string, scriptPath: string, channel: number): Promise<void> {
+  private async executeTimerScript(triggerId: string, triggerName: string, scriptPath: string, channel: number | 'none', scriptArgs?: string): Promise<void> {
     const startTime = Date.now();
 
     // Validate script path
@@ -1736,7 +2161,7 @@ class MeshtasticManager {
         interpreter = isDev ? 'node' : '/usr/local/bin/node';
         break;
       case 'py':
-        interpreter = isDev ? 'python' : '/usr/bin/python';
+        interpreter = isDev ? 'python' : '/opt/apprise-venv/bin/python3';
         break;
       case 'sh':
         interpreter = isDev ? 'sh' : '/bin/sh';
@@ -1753,11 +2178,14 @@ class MeshtasticManager {
       const execFileAsync = promisify(execFile);
 
       // Prepare environment variables for timer scripts
+      const config = this.getScriptConnectionConfig();
       const scriptEnv: Record<string, string> = {
         ...process.env as Record<string, string>,
         TIMER_NAME: triggerName,
         TIMER_ID: triggerId,
         TIMER_SCRIPT: scriptPath,
+        MESHTASTIC_IP: config.nodeIp,
+        MESHTASTIC_PORT: String(config.tcpPort),
       };
 
       // Add MeshMonitor node location if available
@@ -1770,15 +2198,23 @@ class MeshtasticManager {
         }
       }
 
+      // Expand tokens in script args if provided
+      let scriptArgsList: string[] = [];
+      if (scriptArgs) {
+        const expandedArgs = await this.replaceAnnouncementTokens(scriptArgs);
+        scriptArgsList = this.parseScriptArgs(expandedArgs);
+        logger.debug(`⏱️ Timer script args expanded: ${scriptArgs} -> ${JSON.stringify(scriptArgsList)}`);
+      }
+
       // Execute script with 30-second timeout (longer than auto-responder for scheduled tasks)
-      const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath], {
+      const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
         timeout: 30000,
         env: scriptEnv,
         maxBuffer: 1024 * 1024, // 1MB max output
       });
 
       if (stderr) {
-        logger.debug(`⏱️ Timer script stderr: ${stderr}`);
+        logger.warn(`⏱️ Timer script "${triggerName}" stderr: ${stderr}`);
       }
 
       const duration = Date.now() - startTime;
@@ -1819,25 +2255,30 @@ class MeshtasticManager {
           return;
         }
 
-        // Send each response to the specified channel
-        logger.info(`⏱️ Enqueueing ${scriptResponses.length} timer response(s) to channel ${channel}`);
+        // Skip sending if channel is 'none' (script handles its own output)
+        if (channel !== 'none') {
+          // Send each response to the specified channel
+          logger.info(`⏱️ Enqueueing ${scriptResponses.length} timer response(s) to channel ${channel}`);
 
-        scriptResponses.forEach((resp, index) => {
-          const truncated = this.truncateMessageForMeshtastic(resp, 200);
+          scriptResponses.forEach((resp, index) => {
+            const truncated = this.truncateMessageForMeshtastic(resp, 200);
 
-          messageQueueService.enqueue(
-            truncated,
-            0, // destination: 0 for channel broadcast
-            undefined, // no reply-to packet ID for timer messages
-            () => {
-              logger.info(`✅ Timer response ${index + 1}/${scriptResponses.length} delivered to channel ${channel}`);
-            },
-            (reason: string) => {
-              logger.warn(`❌ Timer response ${index + 1}/${scriptResponses.length} failed to channel ${channel}: ${reason}`);
-            },
-            channel // channel number
-          );
-        });
+            messageQueueService.enqueue(
+              truncated,
+              0, // destination: 0 for channel broadcast
+              undefined, // no reply-to packet ID for timer messages
+              () => {
+                logger.info(`✅ Timer response ${index + 1}/${scriptResponses.length} delivered to channel ${channel}`);
+              },
+              (reason: string) => {
+                logger.warn(`❌ Timer response ${index + 1}/${scriptResponses.length} failed to channel ${channel}: ${reason}`);
+              },
+              channel // channel number
+            );
+          });
+        } else {
+          logger.debug(`⏱️ Timer "${triggerName}" script executed (channel=none, no mesh output)`);
+        }
       }
 
       this.updateTimerTriggerResult(triggerId, 'success');
@@ -1846,6 +2287,8 @@ class MeshtasticManager {
       const duration = Date.now() - startTime;
       const errorMessage = error.message || 'Unknown error';
       logger.error(`⏱️ Timer "${triggerName}" failed after ${duration}ms: ${errorMessage}`);
+      if (error.stderr) logger.error(`⏱️ Timer script stderr: ${error.stderr}`);
+      if (error.stdout) logger.warn(`⏱️ Timer script stdout before failure: ${error.stdout.substring(0, 200)}`);
       this.updateTimerTriggerResult(triggerId, 'error', errorMessage);
     }
   }
@@ -1927,15 +2370,19 @@ class MeshtasticManager {
       const parsed = meshtasticProtobufService.parseIncomingData(data);
 
       // Broadcast to virtual node clients if virtual node server is enabled (unless explicitly skipped).
-      // Skip broadcasting 'channel' type FromRadio messages — these should only reach clients
-      // through the controlled sendInitialConfig() flow. Broadcasting raw FromRadio.channel
-      // messages during physical node reconnection causes Android/iOS clients to receive
-      // unsolicited channel updates with empty name fields, which the Meshtastic app displays
-      // as the placeholder text "Channel Name" (fixes #1567).
+      // Skip broadcasting 'channel' and 'configComplete' type FromRadio messages — these should
+      // only reach clients through the controlled sendInitialConfig() flow.
+      // - 'channel': Broadcasting raw FromRadio.channel messages during physical node reconnection
+      //   causes Android/iOS clients to receive unsolicited channel updates with empty name fields,
+      //   which the Meshtastic app displays as placeholder text "Channel Name" (fixes #1567).
+      // - 'configComplete': Broadcasting raw configComplete during physical node reconnection or
+      //   refreshNodeDatabase() causes clients to receive an unsolicited end-of-config signal.
+      //   Since no channels preceded it (they're filtered above), the Meshtastic app interprets
+      //   this as "config done with zero channels" and clears its channel list.
       // If parsing failed, still broadcast the raw data (clients may understand it even if
       // the server can't parse it).
       const shouldBroadcast = !context?.skipVirtualNodeBroadcast &&
-        (!parsed || parsed.type !== 'channel');
+        (!parsed || (parsed.type !== 'channel' && parsed.type !== 'configComplete'));
       if (shouldBroadcast) {
         const virtualNodeServer = (global as any).virtualNodeServer;
         if (virtualNodeServer) {
@@ -2211,6 +2658,9 @@ class MeshtasticManager {
             }
           }
           break;
+        default:
+          logger.debug(`⚠️ Unhandled message type: ${parsed.type}`);
+          break;
       }
 
       logger.debug(`✅ Processed message type: ${parsed.type}`);
@@ -2338,15 +2788,14 @@ class MeshtasticManager {
         isLocked: true  // Lock it to prevent overwrites
       } as any;
 
-      // Update rebootCount in the database since it changes over time
-      if (myNodeInfo.rebootCount !== undefined) {
-        databaseService.upsertNode({
-          nodeNum: nodeNum,
-          nodeId: nodeId,
-          rebootCount: myNodeInfo.rebootCount
-        });
-        logger.debug(`📱 Updated rebootCount to ${myNodeInfo.rebootCount} for local device: ${existingNode.longName} (${nodeId})`);
-      }
+      // Update rebootCount and ensure hasRemoteAdmin is set for local node
+      databaseService.upsertNode({
+        nodeNum: nodeNum,
+        nodeId: nodeId,
+        rebootCount: myNodeInfo.rebootCount !== undefined ? myNodeInfo.rebootCount : undefined,
+        hasRemoteAdmin: true  // Local node always has remote admin access
+      });
+      logger.debug(`📱 Updated local device: ${existingNode.longName} (${nodeId}), rebootCount: ${myNodeInfo.rebootCount}, hasRemoteAdmin: true`);
 
       logger.debug(`📱 Using existing node info for local device: ${existingNode.longName} (${nodeId}) - LOCKED, rebootCount: ${myNodeInfo.rebootCount}`);
     } else {
@@ -2356,6 +2805,7 @@ class MeshtasticManager {
         nodeId: nodeId,
         hwModel: myNodeInfo.hwModel || 0,
         rebootCount: myNodeInfo.rebootCount !== undefined ? myNodeInfo.rebootCount : undefined,
+        hasRemoteAdmin: true,  // Local node always has remote admin access
         lastHeard: Date.now() / 1000,
         createdAt: Date.now(),
         updatedAt: Date.now()
@@ -2434,7 +2884,7 @@ class MeshtasticManager {
   /**
    * Get the current device configuration
    */
-  getCurrentConfig(): { deviceConfig: any; moduleConfig: any; localNodeInfo: any } {
+  getCurrentConfig(): { deviceConfig: any; moduleConfig: any; localNodeInfo: any; supportedModules: { statusmessage: boolean; trafficManagement: boolean } } {
     logger.info(`[CONFIG] getCurrentConfig called - hopLimit=${this.actualDeviceConfig?.lora?.hopLimit}`);
 
     // Apply Proto3 defaults to device config if it exists
@@ -2505,7 +2955,10 @@ class MeshtasticManager {
         // IMPORTANT: Proto3 omits boolean false values from JSON serialization
         enabled: moduleConfig.mqtt.enabled !== undefined ? moduleConfig.mqtt.enabled : false,
         encryptionEnabled: moduleConfig.mqtt.encryptionEnabled !== undefined ? moduleConfig.mqtt.encryptionEnabled : false,
-        jsonEnabled: moduleConfig.mqtt.jsonEnabled !== undefined ? moduleConfig.mqtt.jsonEnabled : false
+        jsonEnabled: moduleConfig.mqtt.jsonEnabled !== undefined ? moduleConfig.mqtt.jsonEnabled : false,
+        tlsEnabled: moduleConfig.mqtt.tlsEnabled !== undefined ? moduleConfig.mqtt.tlsEnabled : false,
+        proxyToClientEnabled: moduleConfig.mqtt.proxyToClientEnabled !== undefined ? moduleConfig.mqtt.proxyToClientEnabled : false,
+        mapReportingEnabled: moduleConfig.mqtt.mapReportingEnabled !== undefined ? moduleConfig.mqtt.mapReportingEnabled : false
       };
 
       moduleConfig = {
@@ -2534,6 +2987,35 @@ class MeshtasticManager {
       logger.info(`[CONFIG] Returning NeighborInfo config with enabled=${neighborInfoConfigWithDefaults.enabled}, updateInterval=${neighborInfoConfigWithDefaults.updateInterval}, transmitOverLora=${neighborInfoConfigWithDefaults.transmitOverLora}`);
     }
 
+    // Apply Proto3 defaults to Telemetry module config
+    if (moduleConfig.telemetry) {
+      const telemetryConfigWithDefaults = {
+        ...moduleConfig.telemetry,
+        // IMPORTANT: Proto3 omits boolean false and numeric 0 values from JSON serialization
+        deviceUpdateInterval: moduleConfig.telemetry.deviceUpdateInterval !== undefined ? moduleConfig.telemetry.deviceUpdateInterval : 0,
+        deviceTelemetryEnabled: moduleConfig.telemetry.deviceTelemetryEnabled !== undefined ? moduleConfig.telemetry.deviceTelemetryEnabled : false,
+        environmentUpdateInterval: moduleConfig.telemetry.environmentUpdateInterval !== undefined ? moduleConfig.telemetry.environmentUpdateInterval : 0,
+        environmentMeasurementEnabled: moduleConfig.telemetry.environmentMeasurementEnabled !== undefined ? moduleConfig.telemetry.environmentMeasurementEnabled : false,
+        environmentScreenEnabled: moduleConfig.telemetry.environmentScreenEnabled !== undefined ? moduleConfig.telemetry.environmentScreenEnabled : false,
+        environmentDisplayFahrenheit: moduleConfig.telemetry.environmentDisplayFahrenheit !== undefined ? moduleConfig.telemetry.environmentDisplayFahrenheit : false,
+        airQualityEnabled: moduleConfig.telemetry.airQualityEnabled !== undefined ? moduleConfig.telemetry.airQualityEnabled : false,
+        airQualityInterval: moduleConfig.telemetry.airQualityInterval !== undefined ? moduleConfig.telemetry.airQualityInterval : 0,
+        powerMeasurementEnabled: moduleConfig.telemetry.powerMeasurementEnabled !== undefined ? moduleConfig.telemetry.powerMeasurementEnabled : false,
+        powerUpdateInterval: moduleConfig.telemetry.powerUpdateInterval !== undefined ? moduleConfig.telemetry.powerUpdateInterval : 0,
+        powerScreenEnabled: moduleConfig.telemetry.powerScreenEnabled !== undefined ? moduleConfig.telemetry.powerScreenEnabled : false,
+        healthMeasurementEnabled: moduleConfig.telemetry.healthMeasurementEnabled !== undefined ? moduleConfig.telemetry.healthMeasurementEnabled : false,
+        healthUpdateInterval: moduleConfig.telemetry.healthUpdateInterval !== undefined ? moduleConfig.telemetry.healthUpdateInterval : 0,
+        healthScreenEnabled: moduleConfig.telemetry.healthScreenEnabled !== undefined ? moduleConfig.telemetry.healthScreenEnabled : false
+      };
+
+      moduleConfig = {
+        ...moduleConfig,
+        telemetry: telemetryConfigWithDefaults
+      };
+
+      logger.info(`[CONFIG] Returning Telemetry config with deviceTelemetryEnabled=${telemetryConfigWithDefaults.deviceTelemetryEnabled}, healthMeasurementEnabled=${telemetryConfigWithDefaults.healthMeasurementEnabled}`);
+    }
+
     // Convert network config IP addresses from uint32 to string format for frontend
     if (deviceConfig.network) {
       const networkConfigWithConvertedIps = {
@@ -2552,10 +3034,57 @@ class MeshtasticManager {
       logger.debug(`[CONFIG] Converted network config IP addresses to strings`);
     }
 
+    // Apply Proto3 defaults to StatusMessage module config
+    if (moduleConfig.statusmessage) {
+      const statusMessageConfigWithDefaults = {
+        ...moduleConfig.statusmessage,
+        nodeStatus: moduleConfig.statusmessage.nodeStatus !== undefined ? moduleConfig.statusmessage.nodeStatus : ''
+      };
+
+      moduleConfig = {
+        ...moduleConfig,
+        statusmessage: statusMessageConfigWithDefaults
+      };
+
+      logger.info(`[CONFIG] Returning StatusMessage config with nodeStatus="${statusMessageConfigWithDefaults.nodeStatus}"`);
+    }
+
+    // Apply Proto3 defaults to TrafficManagement module config
+    if (moduleConfig.trafficManagement) {
+      const trafficManagementConfigWithDefaults = {
+        ...moduleConfig.trafficManagement,
+        enabled: moduleConfig.trafficManagement.enabled !== undefined ? moduleConfig.trafficManagement.enabled : false,
+        positionDedupEnabled: moduleConfig.trafficManagement.positionDedupEnabled !== undefined ? moduleConfig.trafficManagement.positionDedupEnabled : false,
+        positionDedupTimeSecs: moduleConfig.trafficManagement.positionDedupTimeSecs !== undefined ? moduleConfig.trafficManagement.positionDedupTimeSecs : 0,
+        positionDedupDistanceMeters: moduleConfig.trafficManagement.positionDedupDistanceMeters !== undefined ? moduleConfig.trafficManagement.positionDedupDistanceMeters : 0,
+        nodeinfoDirectResponseEnabled: moduleConfig.trafficManagement.nodeinfoDirectResponseEnabled !== undefined ? moduleConfig.trafficManagement.nodeinfoDirectResponseEnabled : false,
+        nodeinfoDirectResponseMyNodeOnly: moduleConfig.trafficManagement.nodeinfoDirectResponseMyNodeOnly !== undefined ? moduleConfig.trafficManagement.nodeinfoDirectResponseMyNodeOnly : false,
+        rateLimitEnabled: moduleConfig.trafficManagement.rateLimitEnabled !== undefined ? moduleConfig.trafficManagement.rateLimitEnabled : false,
+        rateLimitMaxPerNode: moduleConfig.trafficManagement.rateLimitMaxPerNode !== undefined ? moduleConfig.trafficManagement.rateLimitMaxPerNode : 0,
+        rateLimitWindowSecs: moduleConfig.trafficManagement.rateLimitWindowSecs !== undefined ? moduleConfig.trafficManagement.rateLimitWindowSecs : 0,
+        unknownPacketDropEnabled: moduleConfig.trafficManagement.unknownPacketDropEnabled !== undefined ? moduleConfig.trafficManagement.unknownPacketDropEnabled : false,
+        unknownPacketGracePeriodSecs: moduleConfig.trafficManagement.unknownPacketGracePeriodSecs !== undefined ? moduleConfig.trafficManagement.unknownPacketGracePeriodSecs : 0,
+        hopExhaustionEnabled: moduleConfig.trafficManagement.hopExhaustionEnabled !== undefined ? moduleConfig.trafficManagement.hopExhaustionEnabled : false,
+        hopExhaustionMinHops: moduleConfig.trafficManagement.hopExhaustionMinHops !== undefined ? moduleConfig.trafficManagement.hopExhaustionMinHops : 0,
+        hopExhaustionMaxHops: moduleConfig.trafficManagement.hopExhaustionMaxHops !== undefined ? moduleConfig.trafficManagement.hopExhaustionMaxHops : 0
+      };
+
+      moduleConfig = {
+        ...moduleConfig,
+        trafficManagement: trafficManagementConfigWithDefaults
+      };
+
+      logger.info(`[CONFIG] Returning TrafficManagement config with enabled=${trafficManagementConfigWithDefaults.enabled}`);
+    }
+
     return {
       deviceConfig,
       moduleConfig,
-      localNodeInfo: this.localNodeInfo
+      localNodeInfo: this.localNodeInfo,
+      supportedModules: {
+        statusmessage: !!moduleConfig.statusmessage,
+        trafficManagement: !!moduleConfig.trafficManagement
+      }
     };
   }
 
@@ -2695,7 +3224,8 @@ class MeshtasticManager {
         const decryptionResult = await channelDecryptionService.tryDecrypt(
           meshPacket.encrypted,
           packetId,
-          fromNum
+          fromNum,
+          meshPacket.channel
         );
 
         if (decryptionResult.success) {
@@ -2733,8 +3263,10 @@ class MeshtasticManager {
 
         // Skip logging for local internal packets (ADMIN_APP and ROUTING_APP)
         // These are management packets between MeshMonitor and the local node, not actual mesh traffic
-        if (shouldExcludeFromPacketLog(fromNum, toNum, portnum, this.localNodeInfo?.nodeNum ?? null)) {
-          // Skip logging - these are internal management packets
+        // Also skip "phantom" internal state updates from the device that aren't actual RF transmissions
+        if (shouldExcludeFromPacketLog(fromNum, toNum, portnum, this.localNodeInfo?.nodeNum ?? null) ||
+            isPhantomInternalPacket(fromNum, this.localNodeInfo?.nodeNum ?? null, meshPacket.transportMechanism, meshPacket.hopStart)) {
+          // Skip logging - these are internal packets, not actual mesh traffic
         } else {
 
         // Generate payload preview and store decoded payload
@@ -2887,7 +3419,7 @@ class MeshtasticManager {
       // Only set default name if this is a brand new node
       if (!existingNode) {
         nodeData.longName = `Node ${nodeId}`;
-        nodeData.shortName = nodeId.substring(1, 5);
+        nodeData.shortName = nodeId.slice(-4);
       }
 
       // Only include SNR/RSSI if they have valid values
@@ -2898,6 +3430,14 @@ class MeshtasticManager {
         nodeData.rssi = meshPacket.rxRssi;
       }
       databaseService.upsertNode(nodeData);
+
+      // Capture server-vs-node clock offset for time-offset telemetry
+      if (meshPacket.rxTime && Number(meshPacket.rxTime) > 1600000000) {
+        const offset = Date.now() / 1000 - Number(meshPacket.rxTime);
+        if (Math.abs(offset) < 86400) {
+          this.timeOffsetSamples.push(offset);
+        }
+      }
 
       // Track message hops (hopStart - hopLimit) for "All messages" hop calculation mode
       const hopStart = meshPacket.hopStart ?? meshPacket.hop_start;
@@ -2917,6 +3457,7 @@ class MeshtasticManager {
           value: messageHops,
           unit: 'hops',
           createdAt: Date.now(),
+          packetId: meshPacket.id ? Number(meshPacket.id) : undefined,
         });
 
         // Update Link Quality based on hop count comparison
@@ -2997,7 +3538,7 @@ class MeshtasticManager {
             nodeNum: fromNum,
             nodeId: fromNodeId,
             longName: `Node ${fromNodeId}`,
-            shortName: fromNodeId.substring(1, 5),
+            shortName: fromNodeId.slice(-4),
             lastHeard: Date.now() / 1000,
             createdAt: Date.now(),
             updatedAt: Date.now()
@@ -3111,6 +3652,9 @@ class MeshtasticManager {
         // Auto-acknowledge matching messages
         await this.checkAutoAcknowledge(message, messageText, channelIndex, isDirectMessage, fromNum, meshPacket.id, meshPacket.rxSnr, meshPacket.rxRssi);
 
+        // Check for auto-ping DM command (before auto-responder so it takes priority)
+        if (await this.handleAutoPingCommand(message, isDirectMessage)) return;
+
         // Auto-respond to matching messages
         await this.checkAutoResponder(message, isDirectMessage, meshPacket.id);
       }
@@ -3173,6 +3717,7 @@ class MeshtasticManager {
         const timestamp = now; // Store in milliseconds (Unix timestamp in ms)
         // Preserve the original packet timestamp for analysis (may be inaccurate if node has wrong time)
         const packetTimestamp = position.time ? Number(position.time) * 1000 : undefined;
+        const packetId = meshPacket.id ? Number(meshPacket.id) : undefined;
 
         // Extract position precision metadata
         const channelIndex = meshPacket.channel !== undefined ? meshPacket.channel : 0;
@@ -3236,6 +3781,59 @@ class MeshtasticManager {
           }
         }
 
+        // Always save position to telemetry table for historical tracking
+        // This ensures position history is complete regardless of precision changes
+        databaseService.insertTelemetry({
+          nodeId, nodeNum: fromNum, telemetryType: 'latitude',
+          timestamp, value: coords.latitude, unit: '°', createdAt: now, packetTimestamp, packetId,
+          channel: channelIndex, precisionBits, gpsAccuracy
+        });
+        databaseService.insertTelemetry({
+          nodeId, nodeNum: fromNum, telemetryType: 'longitude',
+          timestamp, value: coords.longitude, unit: '°', createdAt: now, packetTimestamp, packetId,
+          channel: channelIndex, precisionBits, gpsAccuracy
+        });
+        if (position.altitude !== undefined && position.altitude !== null) {
+          databaseService.insertTelemetry({
+            nodeId, nodeNum: fromNum, telemetryType: 'altitude',
+            timestamp, value: position.altitude, unit: 'm', createdAt: now, packetTimestamp, packetId,
+            channel: channelIndex
+          });
+        }
+
+        // Store satellites in view for GPS accuracy tracking
+        const satsInView = position.satsInView ?? position.sats_in_view;
+        if (satsInView !== undefined && satsInView > 0) {
+          databaseService.insertTelemetry({
+            nodeId, nodeNum: fromNum, telemetryType: 'sats_in_view',
+            timestamp, value: satsInView, unit: 'sats', createdAt: now, packetTimestamp, packetId,
+            channel: channelIndex
+          });
+        }
+
+        // Store ground speed if available (in m/s)
+        const groundSpeed = position.groundSpeed ?? position.ground_speed;
+        if (groundSpeed !== undefined && groundSpeed > 0) {
+          databaseService.insertTelemetry({
+            nodeId, nodeNum: fromNum, telemetryType: 'ground_speed',
+            timestamp, value: groundSpeed, unit: 'm/s', createdAt: now, packetTimestamp, packetId,
+            channel: channelIndex
+          });
+        }
+
+        // Store ground track/heading if available (in 1/100 degrees, convert to degrees)
+        const groundTrack = position.groundTrack ?? position.ground_track;
+        if (groundTrack !== undefined && groundTrack > 0) {
+          // groundTrack is in 1/100 degrees per protobuf spec, convert to degrees
+          const headingDegrees = groundTrack / 100;
+          databaseService.insertTelemetry({
+            nodeId, nodeNum: fromNum, telemetryType: 'ground_track',
+            timestamp, value: headingDegrees, unit: '°', createdAt: now, packetTimestamp, packetId,
+            channel: channelIndex
+          });
+        }
+
+        // Only update node's current position if precision check passes
         if (shouldUpdatePosition) {
           const nodeData: any = {
             nodeNum: fromNum,
@@ -3266,37 +3864,10 @@ class MeshtasticManager {
           // Emit node update event to notify frontend via WebSocket
           dataEventEmitter.emitNodeUpdate(fromNum, nodeData);
 
-          // Save position to telemetry table (historical tracking with precision metadata)
-          databaseService.insertTelemetry({
-            nodeId, nodeNum: fromNum, telemetryType: 'latitude',
-            timestamp, value: coords.latitude, unit: '°', createdAt: now, packetTimestamp,
-            channel: channelIndex, precisionBits, gpsAccuracy
-          });
-          databaseService.insertTelemetry({
-            nodeId, nodeNum: fromNum, telemetryType: 'longitude',
-            timestamp, value: coords.longitude, unit: '°', createdAt: now, packetTimestamp,
-            channel: channelIndex, precisionBits, gpsAccuracy
-          });
-          if (position.altitude !== undefined && position.altitude !== null) {
-            databaseService.insertTelemetry({
-              nodeId, nodeNum: fromNum, telemetryType: 'altitude',
-              timestamp, value: position.altitude, unit: 'm', createdAt: now, packetTimestamp,
-              channel: channelIndex
-            });
-          }
-
-          // Store satellites in view for GPS accuracy tracking
-          const satsInView = position.satsInView ?? position.sats_in_view;
-          if (satsInView !== undefined && satsInView > 0) {
-            databaseService.insertTelemetry({
-              nodeId, nodeNum: fromNum, telemetryType: 'sats_in_view',
-              timestamp, value: satsInView, unit: 'sats', createdAt: now, packetTimestamp,
-              channel: channelIndex
-            });
-          }
-
-          // Update mobility detection for this node
-          databaseService.updateNodeMobility(nodeId);
+          // Update mobility detection for this node (fire and forget)
+          databaseService.updateNodeMobilityAsync(nodeId).catch(err =>
+            logger.error(`Failed to update mobility for ${nodeId}:`, err)
+          );
 
           // Check geofence triggers for this node's new position
           this.checkGeofencesForNode(fromNum, coords.latitude, coords.longitude);
@@ -3338,6 +3909,7 @@ class MeshtasticManager {
       const fromNum = Number(meshPacket.from);
       const nodeId = `!${fromNum.toString(16).padStart(8, '0')}`;
       const timestamp = Date.now();
+      const packetId = meshPacket.id ? Number(meshPacket.id) : undefined;
       // Extract channel from mesh packet - this tells us which channel the node was heard on
       const channelIndex = meshPacket.channel !== undefined ? meshPacket.channel : undefined;
       const nodeData: any = {
@@ -3431,7 +4003,8 @@ class MeshtasticManager {
             timestamp,
             value: meshPacket.rxSnr,
             unit: 'dB',
-            createdAt: timestamp
+            createdAt: timestamp,
+            packetId
           });
           const reason = !latestSnrTelemetry ? 'initial' :
                         latestSnrTelemetry.value !== meshPacket.rxSnr ? 'changed' : 'periodic';
@@ -3457,7 +4030,8 @@ class MeshtasticManager {
             timestamp,
             value: meshPacket.rxRssi,
             unit: 'dBm',
-            createdAt: timestamp
+            createdAt: timestamp,
+            packetId
           });
           const reason = !latestRssiTelemetry ? 'initial' :
                         latestRssiTelemetry.value !== meshPacket.rxRssi ? 'changed' : 'periodic';
@@ -3494,6 +4068,7 @@ class MeshtasticManager {
       const timestamp = now; // Store in milliseconds (Unix timestamp in ms)
       // Preserve the original packet timestamp for analysis (may be inaccurate if node has wrong time)
       const packetTimestamp = telemetry.time ? Number(telemetry.time) * 1000 : undefined;
+      const packetId = meshPacket.id ? Number(meshPacket.id) : undefined;
 
       // Track PKI encryption
       this.trackPKIEncryption(meshPacket, fromNum);
@@ -3528,31 +4103,31 @@ class MeshtasticManager {
         if (deviceMetrics.batteryLevel !== undefined && deviceMetrics.batteryLevel !== null && !isNaN(deviceMetrics.batteryLevel)) {
           databaseService.insertTelemetry({
             nodeId, nodeNum: fromNum, telemetryType: 'batteryLevel',
-            timestamp, value: deviceMetrics.batteryLevel, unit: '%', createdAt: now, packetTimestamp
+            timestamp, value: deviceMetrics.batteryLevel, unit: '%', createdAt: now, packetTimestamp, packetId
           });
         }
         if (deviceMetrics.voltage !== undefined && deviceMetrics.voltage !== null && !isNaN(deviceMetrics.voltage)) {
           databaseService.insertTelemetry({
             nodeId, nodeNum: fromNum, telemetryType: 'voltage',
-            timestamp, value: deviceMetrics.voltage, unit: 'V', createdAt: now, packetTimestamp
+            timestamp, value: deviceMetrics.voltage, unit: 'V', createdAt: now, packetTimestamp, packetId
           });
         }
         if (deviceMetrics.channelUtilization !== undefined && deviceMetrics.channelUtilization !== null && !isNaN(deviceMetrics.channelUtilization)) {
           databaseService.insertTelemetry({
             nodeId, nodeNum: fromNum, telemetryType: 'channelUtilization',
-            timestamp, value: deviceMetrics.channelUtilization, unit: '%', createdAt: now, packetTimestamp
+            timestamp, value: deviceMetrics.channelUtilization, unit: '%', createdAt: now, packetTimestamp, packetId
           });
         }
         if (deviceMetrics.airUtilTx !== undefined && deviceMetrics.airUtilTx !== null && !isNaN(deviceMetrics.airUtilTx)) {
           databaseService.insertTelemetry({
             nodeId, nodeNum: fromNum, telemetryType: 'airUtilTx',
-            timestamp, value: deviceMetrics.airUtilTx, unit: '%', createdAt: now, packetTimestamp
+            timestamp, value: deviceMetrics.airUtilTx, unit: '%', createdAt: now, packetTimestamp, packetId
           });
         }
         if (deviceMetrics.uptimeSeconds !== undefined && deviceMetrics.uptimeSeconds !== null && !isNaN(deviceMetrics.uptimeSeconds)) {
           databaseService.insertTelemetry({
             nodeId, nodeNum: fromNum, telemetryType: 'uptimeSeconds',
-            timestamp, value: deviceMetrics.uptimeSeconds, unit: 's', createdAt: now, packetTimestamp
+            timestamp, value: deviceMetrics.uptimeSeconds, unit: 's', createdAt: now, packetTimestamp, packetId
           });
         }
       } else if (telemetry.environmentMetrics) {
@@ -3591,7 +4166,7 @@ class MeshtasticManager {
           // Deprecated but still supported (use PowerMetrics for new implementations)
           { type: 'envVoltage', value: envMetrics.voltage, unit: 'V' },
           { type: 'envCurrent', value: envMetrics.current, unit: 'A' }
-        ], nodeId, fromNum, timestamp, packetTimestamp);
+        ], nodeId, fromNum, timestamp, packetTimestamp, packetId);
       } else if (telemetry.powerMetrics) {
         const powerMetrics = telemetry.powerMetrics;
 
@@ -3616,7 +4191,7 @@ class MeshtasticManager {
           if (voltage !== undefined && voltage !== null && !isNaN(Number(voltage))) {
             databaseService.insertTelemetry({
               nodeId, nodeNum: fromNum, telemetryType: String(voltageKey),
-              timestamp, value: Number(voltage), unit: 'V', createdAt: now, packetTimestamp
+              timestamp, value: Number(voltage), unit: 'V', createdAt: now, packetTimestamp, packetId
             });
           }
 
@@ -3625,7 +4200,7 @@ class MeshtasticManager {
           if (current !== undefined && current !== null && !isNaN(Number(current))) {
             databaseService.insertTelemetry({
               nodeId, nodeNum: fromNum, telemetryType: String(currentKey),
-              timestamp, value: Number(current), unit: 'mA', createdAt: now, packetTimestamp
+              timestamp, value: Number(current), unit: 'mA', createdAt: now, packetTimestamp, packetId
             });
           }
         }
@@ -3654,7 +4229,7 @@ class MeshtasticManager {
           { type: 'co2', value: aqMetrics.co2, unit: 'ppm' },
           { type: 'co2Temperature', value: aqMetrics.co2Temperature, unit: '°C' },
           { type: 'co2Humidity', value: aqMetrics.co2Humidity, unit: '%' }
-        ], nodeId, fromNum, timestamp, packetTimestamp);
+        ], nodeId, fromNum, timestamp, packetTimestamp, packetId);
       } else if (telemetry.localStats) {
         const localStats = telemetry.localStats;
         logger.debug(`📊 LocalStats telemetry: uptime=${localStats.uptimeSeconds}s, heap_free=${localStats.heapFreeBytes}B`);
@@ -3675,7 +4250,7 @@ class MeshtasticManager {
           { type: 'heapTotalBytes', value: localStats.heapTotalBytes, unit: 'bytes' },
           { type: 'heapFreeBytes', value: localStats.heapFreeBytes, unit: 'bytes' },
           { type: 'numTxDropped', value: localStats.numTxDropped, unit: 'packets' }
-        ], nodeId, fromNum, timestamp, packetTimestamp);
+        ], nodeId, fromNum, timestamp, packetTimestamp, packetId);
       } else if (telemetry.hostMetrics) {
         const hostMetrics = telemetry.hostMetrics;
         logger.debug(`🖥️ HostMetrics telemetry: uptime=${hostMetrics.uptimeSeconds}s, freemem=${hostMetrics.freememBytes}B`);
@@ -3690,7 +4265,7 @@ class MeshtasticManager {
           { type: 'hostLoad1', value: hostMetrics.load1, unit: 'load' },
           { type: 'hostLoad5', value: hostMetrics.load5, unit: 'load' },
           { type: 'hostLoad15', value: hostMetrics.load15, unit: 'load' }
-        ], nodeId, fromNum, timestamp, packetTimestamp);
+        ], nodeId, fromNum, timestamp, packetTimestamp, packetId);
       }
 
       databaseService.upsertNode(nodeData);
@@ -3713,6 +4288,7 @@ class MeshtasticManager {
       // Use server receive time instead of packet time to avoid issues with nodes having incorrect time offsets
       const now = Date.now();
       const timestamp = now; // Store in milliseconds (Unix timestamp in ms)
+      const packetId = meshPacket.id ? Number(meshPacket.id) : undefined;
 
       // Track PKI encryption
       this.trackPKIEncryption(meshPacket, fromNum);
@@ -3738,19 +4314,19 @@ class MeshtasticManager {
       if (paxcount.wifi !== undefined && paxcount.wifi !== null && !isNaN(paxcount.wifi)) {
         databaseService.insertTelemetry({
           nodeId, nodeNum: fromNum, telemetryType: 'paxcounterWifi',
-          timestamp, value: paxcount.wifi, unit: 'devices', createdAt: now
+          timestamp, value: paxcount.wifi, unit: 'devices', createdAt: now, packetId
         });
       }
       if (paxcount.ble !== undefined && paxcount.ble !== null && !isNaN(paxcount.ble)) {
         databaseService.insertTelemetry({
           nodeId, nodeNum: fromNum, telemetryType: 'paxcounterBle',
-          timestamp, value: paxcount.ble, unit: 'devices', createdAt: now
+          timestamp, value: paxcount.ble, unit: 'devices', createdAt: now, packetId
         });
       }
       if (paxcount.uptime !== undefined && paxcount.uptime !== null && !isNaN(paxcount.uptime)) {
         databaseService.insertTelemetry({
           nodeId, nodeNum: fromNum, telemetryType: 'paxcounterUptime',
-          timestamp, value: paxcount.uptime, unit: 's', createdAt: now
+          timestamp, value: paxcount.uptime, unit: 's', createdAt: now, packetId
         });
       }
 
@@ -3789,7 +4365,7 @@ class MeshtasticManager {
           nodeNum: fromNum,
           nodeId: fromNodeId,
           longName: `Node ${fromNodeId}`,
-          shortName: fromNodeId.substring(1, 5),
+          shortName: fromNodeId.slice(-4),
           lastHeard: Date.now() / 1000
         });
       } else {
@@ -3808,7 +4384,7 @@ class MeshtasticManager {
           nodeNum: toNum,
           nodeId: toNodeId,
           longName: `Node ${toNodeId}`,
-          shortName: toNodeId.substring(1, 5),
+          shortName: toNodeId.slice(-4),
           lastHeard: Date.now() / 1000
         });
       } else {
@@ -4086,6 +4662,25 @@ class MeshtasticManager {
 
       logger.debug(`💾 Saved traceroute result from ${fromNodeId} (channel: ${channelIndex})`);
 
+      // Build position snapshot for all nodes in the traceroute path (Issue #1862)
+      // This captures where each node was at traceroute time so historical traceroutes
+      // render correctly even when nodes move
+      const routePositions: Record<number, { lat: number; lng: number; alt?: number }> = {};
+      const allPathNodes = [toNum, ...route, fromNum];
+      const allBackNodes = routeBack || [];
+      const allUniqueNodes = [...new Set([...allPathNodes, ...allBackNodes])];
+
+      for (const nodeNum of allUniqueNodes) {
+        const node = databaseService.getNode(nodeNum);
+        if (node?.latitude && node?.longitude) {
+          routePositions[nodeNum] = {
+            lat: node.latitude,
+            lng: node.longitude,
+            ...(node.altitude ? { alt: node.altitude } : {}),
+          };
+        }
+      }
+
       // Save to traceroutes table (save raw data including broadcast addresses)
       // Store traceroute data exactly as Meshtastic provides it (no transformations)
       // fromNodeNum = responder (remote), toNodeNum = requester (local)
@@ -4100,6 +4695,7 @@ class MeshtasticManager {
         routeBack: JSON.stringify(routeBack),
         snrTowards: JSON.stringify(snrTowards),
         snrBack: JSON.stringify(snrBack),
+        routePositions: JSON.stringify(routePositions),
         timestamp: timestamp,
         createdAt: Date.now()
       };
@@ -4117,6 +4713,7 @@ class MeshtasticManager {
         value: tracerouteHops,
         unit: 'hops',
         createdAt: Date.now(),
+        packetId: meshPacket.id ? Number(meshPacket.id) : undefined,
       });
 
       // Emit WebSocket event for traceroute completion
@@ -4163,7 +4760,7 @@ class MeshtasticManager {
             const node1Id = `!${node1Num.toString(16).padStart(8, '0')}`;
             const node2Id = `!${node2Num.toString(16).padStart(8, '0')}`;
 
-            // Store the segment
+            // Store the segment with position snapshot (Issue #1862)
             const segment = {
               fromNodeNum: node1Num,
               toNodeNum: node2Num,
@@ -4171,6 +4768,10 @@ class MeshtasticManager {
               toNodeId: node2Id,
               distanceKm: distanceKm,
               isRecordHolder: false,
+              fromLatitude: node1.latitude,
+              fromLongitude: node1.longitude,
+              toLatitude: node2.latitude,
+              toLongitude: node2.longitude,
               timestamp: timestamp,
               createdAt: Date.now()
             };
@@ -4214,6 +4815,15 @@ class MeshtasticManager {
 
       const errorName = getRoutingErrorName(errorReason);
 
+      // Check if this routing update is for an auto-ping session
+      if (requestId) {
+        if (errorReason === 0) {
+          this.handleAutoPingResponse(requestId, 'ack');
+        } else {
+          this.handleAutoPingResponse(requestId, 'nak');
+        }
+      }
+
       // Handle successful ACKs (error_reason = 0 means success)
       if (errorReason === 0 && requestId) {
         // Look up the original message to check if this ACK is from the intended recipient
@@ -4230,6 +4840,13 @@ class MeshtasticManager {
             const updated = databaseService.updateMessageDeliveryState(requestId, 'delivered');
             if (updated) {
               logger.debug(`💾 Marked message ${requestId} as delivered (transmitted)`);
+              // Update message timestamps to node time so outgoing messages sort correctly
+              // relative to incoming messages (which use node rxTime)
+              const ackRxTime = Number(meshPacket.rxTime);
+              if (ackRxTime > 0) {
+                databaseService.updateMessageTimestamps(requestId, ackRxTime * 1000);
+                logger.debug(`🕐 Updated message ${requestId} timestamps to node time: ${ackRxTime}`);
+              }
               // Emit WebSocket event for real-time delivery status update
               dataEventEmitter.emitRoutingUpdate({ requestId, status: 'ack' });
             }
@@ -4371,7 +4988,7 @@ class MeshtasticManager {
             nodeNum,
             nodeId,
             longName: `Node ${nodeId}`,
-            shortName: nodeId.substring(1, 5),
+            shortName: nodeId.slice(-4),
             lastHeard: Date.now() / 1000
           });
           node = databaseService.getNode(nodeNum);
@@ -4517,7 +5134,7 @@ class MeshtasticManager {
           nodeNum: fromNum,
           nodeId: fromNodeId,
           longName: `Node ${fromNodeId}`,
-          shortName: fromNodeId.substring(1, 5),
+          shortName: fromNodeId.slice(-4),
           lastHeard: Date.now() / 1000
         });
         senderNode = databaseService.getNode(fromNum);
@@ -4545,7 +5162,7 @@ class MeshtasticManager {
               nodeNum: neighborNodeNum,
               nodeId: neighborNodeId,
               longName: `Node ${neighborNodeId}`,
-              shortName: neighborNodeId.substring(1, 5),
+              shortName: neighborNodeId.slice(-4),
               hopsAway: senderHopsAway + 1,
               lastHeard: Date.now() / 1000
             });
@@ -4585,10 +5202,26 @@ class MeshtasticManager {
       // Check if node already exists to determine if we should set isFavorite
       const existingNode = databaseService.getNode(Number(nodeInfo.num));
 
+      // Determine lastHeard value carefully to avoid incorrectly updating timestamps
+      // during config sync. Only update lastHeard if:
+      // 1. The device provides a valid lastHeard value, AND
+      // 2. Either the node is new OR the incoming value is newer than existing
+      // This fixes #1706 where config sync was resetting lastHeard for all nodes
+      let lastHeardValue: number | undefined = undefined;
+      if (nodeInfo.lastHeard && nodeInfo.lastHeard > 0) {
+        // Device provided a valid lastHeard - cap at current time to prevent future timestamps
+        const incomingLastHeard = Math.min(Number(nodeInfo.lastHeard), Date.now() / 1000);
+        if (!existingNode || !existingNode.lastHeard || incomingLastHeard > existingNode.lastHeard) {
+          lastHeardValue = incomingLastHeard;
+        }
+        // If existing node has a more recent lastHeard, keep it (don't include in nodeData)
+      }
+      // If device didn't provide lastHeard, don't update it at all - preserve existing value
+
       const nodeData: any = {
         nodeNum: Number(nodeInfo.num),
         nodeId: nodeId,
-        lastHeard: Math.min(nodeInfo.lastHeard || (Date.now() / 1000), Date.now() / 1000), // Cap at current time to prevent future timestamps
+        ...(lastHeardValue !== undefined && { lastHeard: lastHeardValue }),
         snr: nodeInfo.snr,
         // Note: NodeInfo protobuf doesn't include RSSI, only MeshPacket does
         // RSSI will be updated from mesh packet if available
@@ -4658,7 +5291,7 @@ class MeshtasticManager {
       }
 
       // Add position information if available
-      let positionTelemetryData: { timestamp: number; latitude: number; longitude: number; altitude?: number; precisionBits?: number; channel?: number } | null = null;
+      let positionTelemetryData: { timestamp: number; latitude: number; longitude: number; altitude?: number; precisionBits?: number; channel?: number; groundSpeed?: number; groundTrack?: number } | null = null;
       if (nodeInfo.position && (nodeInfo.position.latitudeI || nodeInfo.position.longitudeI)) {
         const coords = meshtasticProtobufService.convertCoordinates(
           nodeInfo.position.latitudeI,
@@ -4702,7 +5335,9 @@ class MeshtasticManager {
             longitude: coords.longitude,
             altitude: nodeInfo.position.altitude,
             precisionBits,
-            channel: channelIndex
+            channel: channelIndex,
+            groundSpeed: nodeInfo.position.groundSpeed ?? nodeInfo.position.ground_speed,
+            groundTrack: nodeInfo.position.groundTrack ?? nodeInfo.position.ground_track
           };
         } else {
           logger.warn(`⚠️ Invalid position coordinates for node ${nodeId}: lat=${coords.latitude}, lon=${coords.longitude}. Skipping position save.`);
@@ -4769,9 +5404,28 @@ class MeshtasticManager {
             channel: positionTelemetryData.channel, precisionBits: positionTelemetryData.precisionBits
           });
         }
+        // Store ground speed if available (in m/s)
+        if (positionTelemetryData.groundSpeed !== undefined && positionTelemetryData.groundSpeed > 0) {
+          databaseService.insertTelemetry({
+            nodeId, nodeNum: Number(nodeInfo.num), telemetryType: 'ground_speed',
+            timestamp: positionTelemetryData.timestamp, value: positionTelemetryData.groundSpeed, unit: 'm/s', createdAt: now,
+            channel: positionTelemetryData.channel
+          });
+        }
+        // Store ground track/heading if available (in 1/100 degrees, convert to degrees)
+        if (positionTelemetryData.groundTrack !== undefined && positionTelemetryData.groundTrack > 0) {
+          const headingDegrees = positionTelemetryData.groundTrack / 100;
+          databaseService.insertTelemetry({
+            nodeId, nodeNum: Number(nodeInfo.num), telemetryType: 'ground_track',
+            timestamp: positionTelemetryData.timestamp, value: headingDegrees, unit: '°', createdAt: now,
+            channel: positionTelemetryData.channel
+          });
+        }
 
-        // Update mobility detection for this node
-        databaseService.updateNodeMobility(nodeId);
+        // Update mobility detection for this node (fire and forget)
+        databaseService.updateNodeMobilityAsync(nodeId).catch(err =>
+          logger.error(`Failed to update mobility for ${nodeId}:`, err)
+        );
       }
 
       // Insert device metrics telemetry if we have it (after node exists in database)
@@ -4940,7 +5594,7 @@ class MeshtasticManager {
           nodeNum: nodeNum,
           nodeId: nodeId,
           longName: possibleName.longName || `Node ${nodeId}`,
-          shortName: possibleName.shortName || nodeId.substring(1, 5),
+          shortName: possibleName.shortName || nodeId.slice(-4),
           hwModel: possibleName.hwModel || 0,
           lastHeard: Date.now() / 1000,
           snr: possibleName.snr,
@@ -5912,7 +6566,7 @@ class MeshtasticManager {
           nodeNum: fromNodeNum,
           nodeId: fromNodeId,
           longName: fromNodeId === 'unknown' ? 'Unknown Node' : fromNodeId,
-          shortName: fromNodeId === 'unknown' ? 'UNK' : fromNodeId.substring(1, 5),
+          shortName: fromNodeId === 'unknown' ? 'UNK' : fromNodeId.slice(-4),
           hwModel: 0,
           lastHeard: Date.now() / 1000,
           createdAt: Date.now(),
@@ -5939,7 +6593,7 @@ class MeshtasticManager {
           nodeNum: toNodeNum,
           nodeId: toNodeId,
           longName: toNodeId === '!ffffffff' ? 'Broadcast' : toNodeId,
-          shortName: toNodeId === '!ffffffff' ? 'BCST' : toNodeId.substring(1, 5),
+          shortName: toNodeId === '!ffffffff' ? 'BCST' : toNodeId.slice(-4),
           hwModel: 0,
           lastHeard: Date.now() / 1000,
           createdAt: Date.now(),
@@ -5990,7 +6644,20 @@ class MeshtasticManager {
 
   // @ts-ignore - Legacy function kept for backward compatibility
   private async processNodeInfo(nodeInfo: any): Promise<void> {
-    const nodeData = {
+    // Check existing node to avoid overwriting lastHeard with stale/default values
+    const existingNode = databaseService.getNode(Number(nodeInfo.num));
+
+    // Only update lastHeard if device provides a valid value that's newer than existing
+    // This fixes #1706 where config sync was resetting lastHeard for all nodes
+    let lastHeardValue: number | undefined = undefined;
+    if (nodeInfo.lastHeard && nodeInfo.lastHeard > 0) {
+      const incomingLastHeard = Math.min(Math.floor(Number(nodeInfo.lastHeard)), Math.floor(Date.now() / 1000));
+      if (!existingNode || !existingNode.lastHeard || incomingLastHeard > existingNode.lastHeard) {
+        lastHeardValue = incomingLastHeard;
+      }
+    }
+
+    const nodeData: any = {
       nodeNum: nodeInfo.num,
       nodeId: nodeInfo.user?.id || nodeInfo.num.toString(),
       longName: nodeInfo.user?.longName,
@@ -6002,7 +6669,7 @@ class MeshtasticManager {
       altitude: nodeInfo.position?.altitude,
       // Note: Telemetry data (batteryLevel, voltage, etc.) is NOT saved from NodeInfo packets
       // It is only saved from actual TELEMETRY_APP packets in processTelemetryMessageProtobuf()
-      lastHeard: Math.min(nodeInfo.lastHeard || Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000)), // Cap at current time to prevent future timestamps
+      ...(lastHeardValue !== undefined && { lastHeard: lastHeardValue }),
       snr: nodeInfo.snr,
       rssi: nodeInfo.rssi
     };
@@ -6081,7 +6748,9 @@ class MeshtasticManager {
       enabled: mqttConfig.enabled !== undefined ? mqttConfig.enabled : false,
       encryptionEnabled: mqttConfig.encryptionEnabled !== undefined ? mqttConfig.encryptionEnabled : false,
       jsonEnabled: mqttConfig.jsonEnabled !== undefined ? mqttConfig.jsonEnabled : false,
-      tlsEnabled: mqttConfig.tlsEnabled !== undefined ? mqttConfig.tlsEnabled : false
+      tlsEnabled: mqttConfig.tlsEnabled !== undefined ? mqttConfig.tlsEnabled : false,
+      proxyToClientEnabled: mqttConfig.proxyToClientEnabled !== undefined ? mqttConfig.proxyToClientEnabled : false,
+      mapReportingEnabled: mqttConfig.mapReportingEnabled !== undefined ? mqttConfig.mapReportingEnabled : false
     };
 
     logger.debug('🔍 loraConfig being used:', JSON.stringify(loraConfigWithDefaults, null, 2));
@@ -6248,6 +6917,29 @@ class MeshtasticManager {
         }
       }
 
+      // Broadcast outgoing text message to virtual node clients as a proper FromRadio
+      const virtualNodeServer = (global as any).virtualNodeServer;
+      if (virtualNodeServer && localNodeNum) {
+        try {
+          const fromRadioData = await meshtasticProtobufService.createFromRadioTextMessage({
+            fromNodeNum: parseInt(localNodeNum),
+            toNodeNum: destination || 0xffffffff,
+            text: text,
+            channel: destination ? -1 : channel,
+            timestamp: Date.now(),
+            requestId: messageId,
+            replyId: replyId || null,
+            emoji: emoji || null,
+          });
+          if (fromRadioData) {
+            await virtualNodeServer.broadcastToClients(fromRadioData);
+            logger.debug(`📡 Broadcasted outgoing text message to virtual node clients`);
+          }
+        } catch (error) {
+          logger.error('Virtual node: Failed to broadcast outgoing text message:', error);
+        }
+      }
+
       return messageId;
     } catch (error) {
       logger.error('Error sending message:', error);
@@ -6313,13 +7005,26 @@ class MeshtasticManager {
     }
 
     try {
-      // Get local node's position from database for position exchange
-      const localNode = databaseService.getNode(this.localNodeInfo.nodeNum);
-      const localPosition = (localNode?.latitude && localNode?.longitude) ? {
-        latitude: localNode.latitude,
-        longitude: localNode.longitude,
-        altitude: localNode.altitude
-      } : undefined;
+      // Check if the local node has a valid position source
+      // GpsMode enum: 0 = DISABLED, 1 = ENABLED, 2 = NOT_PRESENT
+      const positionConfig = this.actualDeviceConfig?.position;
+      const hasFixedPosition = positionConfig?.fixedPosition === true;
+      const hasGpsEnabled = positionConfig?.gpsMode === 1; // GpsMode.ENABLED
+      const hasValidPositionSource = hasFixedPosition || hasGpsEnabled;
+
+      let localPosition: { latitude: number; longitude: number; altitude?: number | null } | undefined;
+
+      // Only include position data if the node has a valid position source
+      if (hasValidPositionSource) {
+        const localNode = databaseService.getNode(this.localNodeInfo.nodeNum);
+        localPosition = (localNode?.latitude && localNode?.longitude) ? {
+          latitude: localNode.latitude,
+          longitude: localNode.longitude,
+          altitude: localNode.altitude
+        } : undefined;
+      }
+
+      logger.info(`📍 Position exchange: fixedPosition=${hasFixedPosition}, gpsMode=${positionConfig?.gpsMode}, hasValidPositionSource=${hasValidPositionSource}, willSendPosition=${!!localPosition}`);
 
       const { data: positionRequestData, packetId, requestId } = meshtasticProtobufService.createPositionRequestMessage(
         destination,
@@ -6845,13 +7550,31 @@ class MeshtasticManager {
           ? message.hopStart - message.hopLimit
           : 0;
 
-      // Get response type settings
-      const autoAckTapbackEnabled = databaseService.getSetting('autoAckTapbackEnabled') === 'true';
-      const autoAckReplyEnabled = databaseService.getSetting('autoAckReplyEnabled') !== 'false'; // Default true for backward compatibility
+      // Determine if this is a direct message (0 hops) or multi-hop
+      const isDirect = hopsTraveled === 0;
 
-      // If neither tapback nor reply is enabled, skip
+      // Check if this message type is enabled
+      const typeEnabled = isDirect
+        ? databaseService.getSetting('autoAckDirectEnabled') !== 'false'
+        : databaseService.getSetting('autoAckMultihopEnabled') !== 'false';
+
+      if (!typeEnabled) {
+        logger.debug(`⏭️ Skipping auto-acknowledge: ${isDirect ? 'direct' : 'multihop'} messages disabled`);
+        return;
+      }
+
+      // Get tapback/reply settings for this message type
+      const autoAckTapbackEnabled = isDirect
+        ? databaseService.getSetting('autoAckDirectTapbackEnabled') !== 'false'
+        : databaseService.getSetting('autoAckMultihopTapbackEnabled') !== 'false';
+
+      const autoAckReplyEnabled = isDirect
+        ? databaseService.getSetting('autoAckDirectReplyEnabled') !== 'false'
+        : databaseService.getSetting('autoAckMultihopReplyEnabled') !== 'false';
+
+      // If neither tapback nor reply is enabled for this type, skip
       if (!autoAckTapbackEnabled && !autoAckReplyEnabled) {
-        logger.debug('⏭️  Skipping auto-acknowledge: both tapback and reply are disabled');
+        logger.debug(`⏭️ Skipping auto-acknowledge: both tapback and reply are disabled for ${isDirect ? 'direct' : 'multihop'} messages`);
         return;
       }
 
@@ -6874,17 +7597,18 @@ class MeshtasticManager {
 
         logger.debug(`🤖 Auto-acknowledging with tapback ${hopEmoji} (${hopsTraveled} hops) to ${target}`);
 
-        // Send tapback reaction using sendTextMessage with emoji flag
-        // Use same routing logic as message reply: respect alwaysUseDM flag
+        // Tapbacks always reply on the original channel (not affected by alwaysUseDM)
         try {
           await this.sendTextMessage(
             hopEmoji,
-            (alwaysUseDM || isDirectMessage) ? 0 : channelIndex,
-            (alwaysUseDM || isDirectMessage) ? fromNum : undefined,
+            isDirectMessage ? 0 : channelIndex,
+            isDirectMessage ? fromNum : undefined,
             packetId, // replyId - react to the original message
             1 // emoji flag = 1 for tapback/reaction
           );
           logger.info(`✅ Auto-acknowledge tapback ${hopEmoji} delivered to ${target}`);
+          // Record the send so that the message reply respects the 30s rate limit
+          messageQueueService.recordExternalSend();
         } catch (error) {
           logger.warn(`❌ Auto-acknowledge tapback failed to ${target}:`, error);
         }
@@ -6986,6 +7710,361 @@ class MeshtasticManager {
     logger.debug(`📂 Resolved script path: ${scriptPath} -> ${normalizedResolved} (exists: ${fs.existsSync(normalizedResolved)})`);
     
     return normalizedResolved;
+  }
+
+  // ==========================================
+  // Auto-Ping Methods
+  // ==========================================
+
+  /**
+   * Handle auto-ping DM commands: "ping N" to start, "ping stop" to cancel
+   * Returns true if the command was handled, false otherwise
+   */
+  async handleAutoPingCommand(message: TextMessage, isDirectMessage: boolean): Promise<boolean> {
+    // Only handle DMs
+    if (!isDirectMessage) return false;
+
+    const text = (message.text || '').trim().toLowerCase();
+
+    // Check if this matches a ping command
+    const pingStartMatch = text.match(/^ping\s+(\d+)$/);
+    const pingStopMatch = text.match(/^ping\s+stop$/);
+
+    if (!pingStartMatch && !pingStopMatch) return false;
+
+    // Check if auto-ping is enabled
+    const autoPingEnabled = databaseService.getSetting('autoPingEnabled');
+    if (autoPingEnabled !== 'true') {
+      logger.debug('⏭️  Auto-ping command received but feature is disabled');
+      return false;
+    }
+
+    const fromNum = message.fromNodeNum;
+    const channelIndex = message.channel ?? 0;
+
+    if (pingStopMatch) {
+      // Handle "ping stop"
+      const session = this.autoPingSessions.get(fromNum);
+      if (session) {
+        logger.info(`🛑 Auto-ping stop requested by !${fromNum.toString(16).padStart(8, '0')}`);
+        this.stopAutoPingSession(fromNum, 'cancelled');
+      } else {
+        await this.sendTextMessage('No active ping session to stop.', 0, fromNum);
+        messageQueueService.recordExternalSend();
+      }
+      return true;
+    }
+
+    if (pingStartMatch) {
+      const count = parseInt(pingStartMatch[1], 10);
+      const maxPings = parseInt(databaseService.getSetting('autoPingMaxPings') || '20', 10);
+      const intervalSeconds = parseInt(databaseService.getSetting('autoPingIntervalSeconds') || '30', 10);
+
+      // Validate count
+      if (count <= 0) {
+        await this.sendTextMessage('Ping count must be at least 1.', 0, fromNum);
+        messageQueueService.recordExternalSend();
+        return true;
+      }
+
+      const actualCount = Math.min(count, maxPings);
+
+      // Check for existing session
+      if (this.autoPingSessions.has(fromNum)) {
+        await this.sendTextMessage(`You already have an active ping session. Send "ping stop" to cancel it first.`, 0, fromNum);
+        messageQueueService.recordExternalSend();
+        return true;
+      }
+
+      // Create session
+      const session: AutoPingSession = {
+        requestedBy: fromNum,
+        channel: channelIndex,
+        totalPings: actualCount,
+        completedPings: 0,
+        successfulPings: 0,
+        failedPings: 0,
+        intervalMs: intervalSeconds * 1000,
+        timer: null,
+        pendingRequestId: null,
+        pendingTimeout: null,
+        startTime: Date.now(),
+        lastPingSentAt: 0,
+        results: [],
+      };
+
+      this.autoPingSessions.set(fromNum, session);
+
+      const cappedMsg = count > maxPings ? ` (capped to ${maxPings})` : '';
+      await this.sendTextMessage(
+        `Starting ${actualCount} pings every ${intervalSeconds}s${cappedMsg}. Send "ping stop" to cancel.`,
+        0, fromNum
+      );
+      messageQueueService.recordExternalSend();
+
+      logger.info(`📡 Auto-ping session started for !${fromNum.toString(16).padStart(8, '0')}: ${actualCount} pings every ${intervalSeconds}s`);
+
+      // Emit session started event
+      this.emitAutoPingUpdate(session, 'started');
+
+      // Start pinging
+      this.startAutoPingSession(session);
+
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Start the auto-ping session — waits one full interval before the first ping
+   */
+  private startAutoPingSession(session: AutoPingSession): void {
+    session.timer = setInterval(() => {
+      this.sendNextAutoPing(session);
+    }, session.intervalMs);
+  }
+
+  /**
+   * Send the next ping in the auto-ping session
+   */
+  private async sendNextAutoPing(session: AutoPingSession): Promise<void> {
+    // Check if session is complete — send summary as the final message
+    if (session.completedPings >= session.totalPings) {
+      this.finalizeAutoPingSession(session.requestedBy);
+      return;
+    }
+
+    // Don't send another ping if one is still pending
+    if (session.pendingRequestId !== null) {
+      return;
+    }
+
+    try {
+      const pingNum = session.completedPings + 1;
+      const pingMessage = `Ping ${pingNum}/${session.totalPings}`;
+
+      const requestId = await this.sendTextMessage(pingMessage, 0, session.requestedBy);
+      messageQueueService.recordExternalSend();
+      session.pendingRequestId = requestId;
+      session.lastPingSentAt = Date.now();
+
+      logger.debug(`📡 Auto-ping ${pingNum}/${session.totalPings} sent to !${session.requestedBy.toString(16).padStart(8, '0')} (requestId: ${requestId})`);
+
+      // Set timeout for this ping
+      const timeoutSeconds = parseInt(databaseService.getSetting('autoPingTimeoutSeconds') || '60', 10);
+      session.pendingTimeout = setTimeout(() => {
+        this.handleAutoPingTimeout(session);
+      }, timeoutSeconds * 1000);
+    } catch (error) {
+      logger.error(`❌ Auto-ping failed to send to !${session.requestedBy.toString(16).padStart(8, '0')}:`, error);
+      // Record as failed
+      session.results.push({
+        pingNum: session.completedPings + 1,
+        status: 'timeout',
+        sentAt: Date.now(),
+      });
+      session.completedPings++;
+      session.failedPings++;
+      this.emitAutoPingUpdate(session, 'ping_result');
+
+      // Session completion is handled by the next interval tick
+    }
+  }
+
+  /**
+   * Handle an ACK or NAK response for a pending auto-ping
+   */
+  handleAutoPingResponse(requestId: number, status: 'ack' | 'nak'): void {
+    // Find session with matching pendingRequestId
+    for (const [nodeNum, session] of this.autoPingSessions) {
+      if (session.pendingRequestId === requestId) {
+        // Clear the timeout
+        if (session.pendingTimeout) {
+          clearTimeout(session.pendingTimeout);
+          session.pendingTimeout = null;
+        }
+
+        const durationMs = Date.now() - session.lastPingSentAt;
+        session.results.push({
+          pingNum: session.completedPings + 1,
+          status,
+          durationMs,
+          sentAt: session.lastPingSentAt,
+        });
+
+        session.completedPings++;
+        if (status === 'ack') {
+          session.successfulPings++;
+        } else {
+          session.failedPings++;
+        }
+        session.pendingRequestId = null;
+
+        logger.info(`📡 Auto-ping ${session.completedPings}/${session.totalPings} ${status.toUpperCase()} from !${nodeNum.toString(16).padStart(8, '0')} (${durationMs}ms)`);
+
+        this.emitAutoPingUpdate(session, 'ping_result');
+
+        // Session completion is handled by the next interval tick in sendNextAutoPing
+        return;
+      }
+    }
+  }
+
+  /**
+   * Handle a timeout for a pending auto-ping (no response received in time)
+   */
+  private handleAutoPingTimeout(session: AutoPingSession): void {
+    if (session.pendingRequestId === null) return;
+
+    session.results.push({
+      pingNum: session.completedPings + 1,
+      status: 'timeout',
+      sentAt: session.lastPingSentAt,
+    });
+
+    session.completedPings++;
+    session.failedPings++;
+    session.pendingRequestId = null;
+    session.pendingTimeout = null;
+
+    logger.info(`⏰ Auto-ping ${session.completedPings}/${session.totalPings} TIMEOUT for !${session.requestedBy.toString(16).padStart(8, '0')}`);
+
+    this.emitAutoPingUpdate(session, 'ping_result');
+
+    // Session completion is handled by the next interval tick in sendNextAutoPing
+  }
+
+  /**
+   * Finalize an auto-ping session (all pings completed)
+   */
+  private async finalizeAutoPingSession(requestedBy: number): Promise<void> {
+    const session = this.autoPingSessions.get(requestedBy);
+    if (!session) return;
+
+    // Remove from map immediately to prevent double-finalize
+    this.autoPingSessions.delete(requestedBy);
+
+    // Clear timers
+    if (session.timer) {
+      clearInterval(session.timer);
+      session.timer = null;
+    }
+    if (session.pendingTimeout) {
+      clearTimeout(session.pendingTimeout);
+      session.pendingTimeout = null;
+    }
+
+    // Build summary with statistics
+    const ackDurations = session.results
+      .filter(r => r.status === 'ack' && r.durationMs)
+      .map(r => r.durationMs!);
+    const timeouts = session.results.filter(r => r.status === 'timeout').length;
+    const naks = session.results.filter(r => r.status === 'nak').length;
+
+    let summary = `Auto-ping done: ${session.successfulPings}/${session.totalPings} ok`;
+    if (ackDurations.length > 0) {
+      const min = Math.min(...ackDurations);
+      const max = Math.max(...ackDurations);
+      const avg = Math.round(ackDurations.reduce((a, b) => a + b, 0) / ackDurations.length);
+      summary += `\nMin/Avg/Max: ${min}/${avg}/${max}ms`;
+    }
+    if (timeouts > 0) {
+      summary += `\nTimeouts: ${timeouts}`;
+    }
+    if (naks > 0) {
+      summary += `\nFailed: ${naks}`;
+    }
+
+    try {
+      await this.sendTextMessage(summary, 0, requestedBy);
+      messageQueueService.recordExternalSend();
+    } catch (error) {
+      logger.error(`❌ Failed to send auto-ping summary to !${requestedBy.toString(16).padStart(8, '0')}:`, error);
+    }
+
+    this.emitAutoPingUpdate(session, 'completed');
+
+    logger.info(`✅ Auto-ping session completed for !${requestedBy.toString(16).padStart(8, '0')}: ${session.successfulPings}/${session.totalPings} successful`);
+  }
+
+  /**
+   * Stop an auto-ping session (user cancelled or force-stopped from UI)
+   */
+  stopAutoPingSession(requestedBy: number, reason: 'cancelled' | 'force_stopped' = 'cancelled'): void {
+    const session = this.autoPingSessions.get(requestedBy);
+    if (!session) return;
+
+    // Clear timers
+    if (session.timer) {
+      clearInterval(session.timer);
+      session.timer = null;
+    }
+    if (session.pendingTimeout) {
+      clearTimeout(session.pendingTimeout);
+      session.pendingTimeout = null;
+    }
+
+    const summary = `Auto-ping ${reason}: ${session.successfulPings}/${session.completedPings} successful out of ${session.totalPings} planned.`;
+
+    this.sendTextMessage(summary, 0, requestedBy).then(() => {
+      messageQueueService.recordExternalSend();
+    }).catch(error => {
+      logger.error(`❌ Failed to send auto-ping cancellation to !${requestedBy.toString(16).padStart(8, '0')}:`, error);
+    });
+
+    this.emitAutoPingUpdate(session, 'cancelled');
+    this.autoPingSessions.delete(requestedBy);
+
+    logger.info(`🛑 Auto-ping session ${reason} for !${requestedBy.toString(16).padStart(8, '0')}`);
+  }
+
+  /**
+   * Get all active auto-ping sessions (for API)
+   */
+  getAutoPingSessions(): Array<{
+    requestedBy: number;
+    requestedByName: string;
+    totalPings: number;
+    completedPings: number;
+    successfulPings: number;
+    failedPings: number;
+    startTime: number;
+    results: AutoPingSession['results'];
+  }> {
+    const sessions: Array<any> = [];
+    for (const [nodeNum, session] of this.autoPingSessions) {
+      const node = databaseService.getNode(nodeNum);
+      sessions.push({
+        requestedBy: nodeNum,
+        requestedByName: node?.longName || node?.shortName || `!${nodeNum.toString(16).padStart(8, '0')}`,
+        totalPings: session.totalPings,
+        completedPings: session.completedPings,
+        successfulPings: session.successfulPings,
+        failedPings: session.failedPings,
+        startTime: session.startTime,
+        results: session.results,
+      });
+    }
+    return sessions;
+  }
+
+  /**
+   * Emit an auto-ping update via WebSocket
+   */
+  private emitAutoPingUpdate(session: AutoPingSession, status: 'started' | 'ping_result' | 'completed' | 'cancelled'): void {
+    const node = databaseService.getNode(session.requestedBy);
+    dataEventEmitter.emitAutoPingUpdate({
+      requestedBy: session.requestedBy,
+      requestedByName: node?.longName || node?.shortName || `!${session.requestedBy.toString(16).padStart(8, '0')}`,
+      totalPings: session.totalPings,
+      completedPings: session.completedPings,
+      successfulPings: session.successfulPings,
+      failedPings: session.failedPings,
+      startTime: session.startTime,
+      status,
+      results: session.results,
+    });
   }
 
   private async checkAutoResponder(message: TextMessage, isDirectMessage: boolean, packetId?: number): Promise<void> {
@@ -7219,6 +8298,13 @@ class MeshtasticManager {
               url = url.replace(new RegExp(`\\{${key}\\}`, 'g'), encodeURIComponent(value));
             });
 
+            // Replace acknowledgement/announcement tokens in URL (URI-encoded) - Issue #1865
+            url = await this.replaceAcknowledgementTokens(
+              url, nodeId, message.fromNodeNum, hopsTraveled,
+              receivedDate, receivedTime, message.channel, isDirectMessage,
+              message.rxSnr, message.rxRssi, message.viaMqtt, true
+            );
+
             logger.debug(`🌐 Fetching HTTP response from: ${url}`);
 
             try {
@@ -7280,23 +8366,25 @@ class MeshtasticManager {
               return;
             }
 
-            logger.info(`🔧 Executing script: ${scriptPath} -> ${resolvedPath}`);
+            const scriptStartTime = Date.now();
+            const triggerPattern = Array.isArray(trigger.trigger) ? trigger.trigger[0] : trigger.trigger;
+            logger.info(`🔧 Executing auto-responder script for pattern "${triggerPattern}" -> ${scriptPath}`);
 
             // Determine interpreter based on file extension
             const ext = scriptPath.split('.').pop()?.toLowerCase();
             let interpreter: string;
-            
+
             // In development, use system interpreters (node, python, sh)
             // In production, use absolute paths
             const isDev = process.env.NODE_ENV !== 'production';
-            
+
             switch (ext) {
               case 'js':
               case 'mjs':
                 interpreter = isDev ? 'node' : '/usr/local/bin/node';
                 break;
               case 'py':
-                interpreter = isDev ? 'python' : '/usr/bin/python';
+                interpreter = isDev ? 'python' : '/opt/apprise-venv/bin/python3';
                 break;
               case 'sh':
                 interpreter = isDev ? 'sh' : '/bin/sh';
@@ -7313,16 +8401,28 @@ class MeshtasticManager {
 
               const scriptEnv = this.createScriptEnvVariables(message, matchedPattern, extractedParams, trigger, packetId);
 
-              // Execute script with 10-second timeout
+              // Expand tokens in script args if provided
+              let scriptArgsList: string[] = [];
+              if (trigger.scriptArgs) {
+                const expandedArgs = await this.replaceAcknowledgementTokens(
+                  trigger.scriptArgs, nodeId, message.fromNodeNum, hopsTraveled,
+                  receivedDate, receivedTime, message.channel, isDirectMessage,
+                  message.rxSnr, message.rxRssi, message.viaMqtt
+                );
+                scriptArgsList = this.parseScriptArgs(expandedArgs);
+                logger.debug(`🤖 Script args expanded: ${trigger.scriptArgs} -> ${JSON.stringify(scriptArgsList)}`);
+              }
+
+              // Execute script with 30-second timeout
               // Use resolvedPath (actual file path) instead of scriptPath (API format)
-              const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath], {
-                timeout: 10000,
+              const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
+                timeout: 30000,
                 env: scriptEnv,
                 maxBuffer: 1024 * 1024, // 1MB max output
               });
 
               if (stderr) {
-                logger.debug(`📋 Script stderr: ${stderr}`);
+                logger.warn(`🔧 Auto-responder script for "${triggerPattern}" stderr: ${stderr}`);
               }
 
               // Parse JSON output
@@ -7355,8 +8455,19 @@ class MeshtasticManager {
 
               // For scripts with multiple responses, send each one
               const triggerChannel = trigger.channel ?? 'dm';
-              const target = triggerChannel === 'dm' ? `!${message.fromNodeNum.toString(16).padStart(8, '0')}` : `channel ${triggerChannel}`;
-              logger.debug(`🤖 Enqueueing ${scriptResponses.length} script response(s) to ${target}`);
+
+              // Skip sending if channel is 'none' (script handles its own output)
+              if (triggerChannel === 'none') {
+                const scriptDuration = Date.now() - scriptStartTime;
+                logger.info(`🔧 Auto-responder script for "${triggerPattern}" completed in ${scriptDuration}ms (channel=none, no mesh output)`);
+                return;
+              }
+
+              const isDM = triggerChannel === 'dm';
+              // For DMs: use 3 attempts if verifyResponse is enabled, otherwise just 1 attempt
+              const maxAttempts = isDM ? (trigger.verifyResponse ? 3 : 1) : 1;
+              const target = isDM ? `!${message.fromNodeNum.toString(16).padStart(8, '0')}` : `channel ${triggerChannel}`;
+              logger.debug(`🤖 Enqueueing ${scriptResponses.length} script response(s) to ${target}${trigger.verifyResponse ? ' (with verification)' : ''}`);
 
               scriptResponses.forEach((resp, index) => {
                 const truncated = this.truncateMessageForMeshtastic(resp, 200);
@@ -7364,7 +8475,7 @@ class MeshtasticManager {
 
                 messageQueueService.enqueue(
                   truncated,
-                  triggerChannel === 'dm' ? message.fromNodeNum : 0, // destination: node number for DM, 0 for channel
+                  isDM ? message.fromNodeNum : 0, // destination: node number for DM, 0 for channel
                   isFirstMessage ? packetId : undefined, // Reply to original message for first response
                   () => {
                     logger.info(`✅ Script response ${index + 1}/${scriptResponses.length} delivered to ${target}`);
@@ -7372,21 +8483,27 @@ class MeshtasticManager {
                   (reason: string) => {
                     logger.warn(`❌ Script response ${index + 1}/${scriptResponses.length} failed to ${target}: ${reason}`);
                   },
-                  triggerChannel === 'dm' ? undefined : triggerChannel as number // channel: undefined for DM, channel number for channel
+                  isDM ? undefined : triggerChannel as number, // channel: undefined for DM, channel number for channel
+                  maxAttempts
                 );
               });
 
-              // Script responses queued, return early
+              // Script responses queued
+              const scriptDuration = Date.now() - scriptStartTime;
+              logger.info(`🔧 Auto-responder script for "${triggerPattern}" completed in ${scriptDuration}ms, ${scriptResponses.length} response(s) queued to ${target}`);
               return;
 
             } catch (error: any) {
+              const scriptDuration = Date.now() - scriptStartTime;
               if (error.killed && error.signal === 'SIGTERM') {
-                logger.error('⏭️  Script execution timed out after 10 seconds');
+                logger.error(`🔧 Auto-responder script for "${triggerPattern}" timed out after ${scriptDuration}ms (10s limit)`);
               } else if (error.code === 'ENOENT') {
-                logger.error(`⏭️  Script not found: ${scriptPath}`);
+                logger.error(`🔧 Auto-responder script for "${triggerPattern}" not found: ${scriptPath}`);
               } else {
-                logger.error('⏭️  Script execution failed:', error.message);
+                logger.error(`🔧 Auto-responder script for "${triggerPattern}" failed after ${scriptDuration}ms: ${error.message}`);
               }
+              if (error.stderr) logger.error(`🔧 Script stderr: ${error.stderr}`);
+              if (error.stdout) logger.warn(`🔧 Script stdout before failure: ${error.stdout.substring(0, 200)}`);
               return;
             }
 
@@ -7424,14 +8541,17 @@ class MeshtasticManager {
 
           // Enqueue all messages for delivery with retry logic
           const triggerChannel = trigger.channel ?? 'dm';
-          const target = triggerChannel === 'dm' ? `!${message.fromNodeNum.toString(16).padStart(8, '0')}` : `channel ${triggerChannel}`;
-          logger.debug(`🤖 Enqueueing ${messagesToSend.length} auto-response message(s) to ${target}`);
+          const isDM = triggerChannel === 'dm';
+          // For DMs: use 3 attempts if verifyResponse is enabled, otherwise just 1 attempt
+          const maxAttempts = isDM ? (trigger.verifyResponse ? 3 : 1) : 1;
+          const target = isDM ? `!${message.fromNodeNum.toString(16).padStart(8, '0')}` : `channel ${triggerChannel}`;
+          logger.debug(`🤖 Enqueueing ${messagesToSend.length} auto-response message(s) to ${target}${trigger.verifyResponse ? ' (with verification)' : ''}`);
 
           messagesToSend.forEach((msg, index) => {
             const isFirstMessage = index === 0;
             messageQueueService.enqueue(
               msg,
-              triggerChannel === 'dm' ? message.fromNodeNum : 0, // destination: node number for DM, 0 for channel
+              isDM ? message.fromNodeNum : 0, // destination: node number for DM, 0 for channel
               isFirstMessage ? packetId : undefined, // Reply to original message for first response
               () => {
                 logger.info(`✅ Auto-response ${index + 1}/${messagesToSend.length} delivered to ${target}`);
@@ -7439,7 +8559,8 @@ class MeshtasticManager {
               (reason: string) => {
                 logger.warn(`❌ Auto-response ${index + 1}/${messagesToSend.length} failed to ${target}: ${reason}`);
               },
-              triggerChannel === 'dm' ? undefined : triggerChannel as number // channel: undefined for DM, channel number for channel
+              isDM ? undefined : triggerChannel as number, // channel: undefined for DM, channel number for channel
+              maxAttempts
             );
           });
 
@@ -7462,6 +8583,8 @@ class MeshtasticManager {
    * - PACKET_ID: The packet ID (empty string if undefined)
    * - TRIGGER: The matched trigger pattern(s)
    * - MATCHED_PATTERN: The specific pattern that matched
+   * - MESHTASTIC_IP: IP address of the connected Meshtastic node
+   * - MESHTASTIC_PORT: TCP port of the connected Meshtastic node
    * - FROM_SHORT_NAME, FROM_LONG_NAME: Sender's node names
    * - FROM_LAT, FROM_LON: Sender's location (if available)
    * - MM_LAT, MM_LON: MeshMonitor node location (if available)
@@ -7469,6 +8592,7 @@ class MeshtasticManager {
    * - PARAM_*: Extracted parameters from trigger pattern
    */
   private createScriptEnvVariables(message: TextMessage, matchedPattern: string, extractedParams: Record<string, string>, trigger: AutoResponderTrigger, packetId?: number) {
+    const config = this.getScriptConnectionConfig();
     const scriptEnv: Record<string, string> = {
       ...process.env as Record<string, string>,
       MESSAGE: message.text,
@@ -7476,6 +8600,8 @@ class MeshtasticManager {
       PACKET_ID: packetId !== undefined ? String(packetId) : '',
       TRIGGER: Array.isArray(trigger.trigger) ? trigger.trigger.join(', ') : trigger.trigger,
       MATCHED_PATTERN: matchedPattern || '',
+      MESHTASTIC_IP: config.nodeIp,
+      MESHTASTIC_PORT: String(config.tcpPort),
     };
 
     // Add sender node information environment variables
@@ -7522,7 +8648,15 @@ class MeshtasticManager {
    * Split message into chunks that fit within Meshtastic's character limit
    * Tries to split on line breaks first, then spaces/punctuation, then anywhere
    */
-  private splitMessageForMeshtastic(text: string, maxChars: number): string[] {
+  /**
+   * Split message into chunks that fit within Meshtastic's character limit.
+   * This is used by auto-responders and can be used by the API for long messages.
+   * Tries to split on line breaks first, then spaces/punctuation, then anywhere.
+   * @param text The text to split
+   * @param maxChars Maximum bytes per message (default 200 for Meshtastic)
+   * @returns Array of message chunks
+   */
+  public splitMessageForMeshtastic(text: string, maxChars: number): string[] {
     const encoder = new TextEncoder();
     const messages: string[] = [];
     let remaining = text;
@@ -7699,7 +8833,7 @@ class MeshtasticManager {
           logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - waiting for proper name (current: ${node.longName})`);
           return;
         }
-        if (!node.shortName || node.shortName === nodeId.substring(1, 5)) {
+        if (!node.shortName || node.shortName === nodeId.slice(-4)) {
           logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - waiting for proper short name (current: ${node.shortName})`);
           return;
         }
@@ -7834,6 +8968,58 @@ class MeshtasticManager {
         features.push('👋');
       }
 
+      // Check auto-ping
+      const autoPingEnabled = databaseService.getSetting('autoPingEnabled');
+      if (autoPingEnabled === 'true') {
+        features.push('🏓');
+      }
+
+      // Check auto-key management
+      const autoKeyManagementEnabled = databaseService.getSetting('autoKeyManagementEnabled');
+      if (autoKeyManagementEnabled === 'true') {
+        features.push('🔑');
+      }
+
+      // Check auto-responder
+      const autoResponderEnabled = databaseService.getSetting('autoResponderEnabled');
+      if (autoResponderEnabled === 'true') {
+        features.push('💬');
+      }
+
+      // Check timed triggers (any enabled trigger)
+      const timerTriggersJson = databaseService.getSetting('timerTriggers');
+      if (timerTriggersJson) {
+        try {
+          const triggers = JSON.parse(timerTriggersJson);
+          if (Array.isArray(triggers) && triggers.some((t: any) => t.enabled)) {
+            features.push('⏱️');
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      // Check geofence triggers (any enabled trigger)
+      const geofenceTriggersJson = databaseService.getSetting('geofenceTriggers');
+      if (geofenceTriggersJson) {
+        try {
+          const triggers = JSON.parse(geofenceTriggersJson);
+          if (Array.isArray(triggers) && triggers.some((t: any) => t.enabled)) {
+            features.push('📍');
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      // Check remote admin scan
+      const remoteAdminInterval = databaseService.getSetting('remoteAdminScannerIntervalMinutes');
+      if (remoteAdminInterval && parseInt(remoteAdminInterval) > 0) {
+        features.push('🔍');
+      }
+
+      // Check auto time sync
+      const autoTimeSyncEnabled = databaseService.getSetting('autoTimeSyncEnabled');
+      if (autoTimeSyncEnabled === 'true') {
+        features.push('🕐');
+      }
+
       result = result.replace(/{FEATURES}/g, features.join(' '));
     }
 
@@ -7852,6 +9038,28 @@ class MeshtasticManager {
       const nodes = databaseService.getActiveNodes(maxNodeAgeDays);
       const directCount = nodes.filter((n: any) => n.hopsAway === 0).length;
       result = result.replace(/{DIRECTCOUNT}/g, directCount.toString());
+    }
+
+    // {TOTALNODES} - Total nodes (all nodes ever seen, regardless of when last heard)
+    if (result.includes('{TOTALNODES}')) {
+      const allNodes = databaseService.getAllNodes();
+      result = result.replace(/{TOTALNODES}/g, allNodes.length.toString());
+    }
+
+    // {ONLINENODES} - Online nodes as reported by the connected Meshtastic device (from LocalStats)
+    if (result.includes('{ONLINENODES}')) {
+      let onlineNodes = 0;
+      if (this.localNodeInfo?.nodeId) {
+        try {
+          const telemetry = await databaseService.getLatestTelemetryForTypeAsync(this.localNodeInfo.nodeId, 'numOnlineNodes');
+          if (telemetry?.value !== undefined && telemetry.value !== null) {
+            onlineNodes = Math.floor(telemetry.value);
+          }
+        } catch (error) {
+          logger.error('❌ Error fetching numOnlineNodes telemetry:', error);
+        }
+      }
+      result = result.replace(/{ONLINENODES}/g, onlineNodes.toString());
     }
 
     return result;
@@ -7897,19 +9105,53 @@ class MeshtasticManager {
     }
   }
 
-  private async replaceAnnouncementTokens(message: string): Promise<string> {
+  /**
+   * Parse a shell-style arguments string into an array
+   * Handles single quotes, double quotes, and unquoted tokens
+   * Example: `--ip 192.168.1.1 --dest '!ab1234' --set "lora.region US"`
+   * Returns: ['--ip', '192.168.1.1', '--dest', '!ab1234', '--set', 'lora.region US']
+   */
+  private parseScriptArgs(argsString: string): string[] {
+    const args: string[] = [];
+    let current = '';
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+
+    for (let i = 0; i < argsString.length; i++) {
+      const char = argsString[i];
+      if (char === "'" && !inDoubleQuote) {
+        inSingleQuote = !inSingleQuote;
+      } else if (char === '"' && !inSingleQuote) {
+        inDoubleQuote = !inDoubleQuote;
+      } else if (char === ' ' && !inSingleQuote && !inDoubleQuote) {
+        if (current) {
+          args.push(current);
+          current = '';
+        }
+      } else {
+        current += char;
+      }
+    }
+    if (current) {
+      args.push(current);
+    }
+    return args;
+  }
+
+  private async replaceAnnouncementTokens(message: string, urlEncode: boolean = false): Promise<string> {
     let result = message;
+    const encode = (v: string) => urlEncode ? encodeURIComponent(v) : v;
 
     // {VERSION} - MeshMonitor version
     if (result.includes('{VERSION}')) {
-      result = result.replace(/{VERSION}/g, packageJson.version);
+      result = result.replace(/{VERSION}/g, encode(packageJson.version));
     }
 
     // {DURATION} - Uptime
     if (result.includes('{DURATION}')) {
       const uptimeMs = Date.now() - this.serverStartTime;
       const duration = this.formatDuration(uptimeMs);
-      result = result.replace(/{DURATION}/g, duration);
+      result = result.replace(/{DURATION}/g, encode(duration));
     }
 
     // {FEATURES} - Enabled features as emojis
@@ -7940,7 +9182,59 @@ class MeshtasticManager {
         features.push('👋');
       }
 
-      result = result.replace(/{FEATURES}/g, features.join(' '));
+      // Check auto-ping
+      const autoPingEnabled = databaseService.getSetting('autoPingEnabled');
+      if (autoPingEnabled === 'true') {
+        features.push('🏓');
+      }
+
+      // Check auto-key management
+      const autoKeyManagementEnabled = databaseService.getSetting('autoKeyManagementEnabled');
+      if (autoKeyManagementEnabled === 'true') {
+        features.push('🔑');
+      }
+
+      // Check auto-responder
+      const autoResponderEnabled = databaseService.getSetting('autoResponderEnabled');
+      if (autoResponderEnabled === 'true') {
+        features.push('💬');
+      }
+
+      // Check timed triggers (any enabled trigger)
+      const timerTriggersJson = databaseService.getSetting('timerTriggers');
+      if (timerTriggersJson) {
+        try {
+          const triggers = JSON.parse(timerTriggersJson);
+          if (Array.isArray(triggers) && triggers.some((t: any) => t.enabled)) {
+            features.push('⏱️');
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      // Check geofence triggers (any enabled trigger)
+      const geofenceTriggersJson = databaseService.getSetting('geofenceTriggers');
+      if (geofenceTriggersJson) {
+        try {
+          const triggers = JSON.parse(geofenceTriggersJson);
+          if (Array.isArray(triggers) && triggers.some((t: any) => t.enabled)) {
+            features.push('📍');
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      // Check remote admin scan
+      const remoteAdminInterval = databaseService.getSetting('remoteAdminScannerIntervalMinutes');
+      if (remoteAdminInterval && parseInt(remoteAdminInterval) > 0) {
+        features.push('🔍');
+      }
+
+      // Check auto time sync
+      const autoTimeSyncEnabled = databaseService.getSetting('autoTimeSyncEnabled');
+      if (autoTimeSyncEnabled === 'true') {
+        features.push('🕐');
+      }
+
+      result = result.replace(/{FEATURES}/g, encode(features.join(' ')));
     }
 
     // {NODECOUNT} - Active nodes based on maxNodeAgeHours setting
@@ -7949,7 +9243,7 @@ class MeshtasticManager {
       const maxNodeAgeDays = maxNodeAgeHours / 24;
       const nodes = databaseService.getActiveNodes(maxNodeAgeDays);
       logger.info(`📢 Token replacement - NODECOUNT: ${nodes.length} active nodes (maxNodeAgeHours: ${maxNodeAgeHours})`);
-      result = result.replace(/{NODECOUNT}/g, nodes.length.toString());
+      result = result.replace(/{NODECOUNT}/g, encode(nodes.length.toString()));
     }
 
     // {DIRECTCOUNT} - Direct nodes (0 hops) from active nodes
@@ -7959,40 +9253,85 @@ class MeshtasticManager {
       const nodes = databaseService.getActiveNodes(maxNodeAgeDays);
       const directCount = nodes.filter((n: any) => n.hopsAway === 0).length;
       logger.info(`📢 Token replacement - DIRECTCOUNT: ${directCount} direct nodes out of ${nodes.length} active nodes`);
-      result = result.replace(/{DIRECTCOUNT}/g, directCount.toString());
+      result = result.replace(/{DIRECTCOUNT}/g, encode(directCount.toString()));
+    }
+
+    // {TOTALNODES} - Total nodes (all nodes ever seen, regardless of when last heard)
+    if (result.includes('{TOTALNODES}')) {
+      const allNodes = databaseService.getAllNodes();
+      logger.info(`📢 Token replacement - TOTALNODES: ${allNodes.length} total nodes`);
+      result = result.replace(/{TOTALNODES}/g, encode(allNodes.length.toString()));
+    }
+
+    // {ONLINENODES} - Online nodes as reported by the connected Meshtastic device (from LocalStats)
+    if (result.includes('{ONLINENODES}')) {
+      let onlineNodes = 0;
+      if (this.localNodeInfo?.nodeId) {
+        try {
+          const telemetry = await databaseService.getLatestTelemetryForTypeAsync(this.localNodeInfo.nodeId, 'numOnlineNodes');
+          if (telemetry?.value !== undefined && telemetry.value !== null) {
+            onlineNodes = Math.floor(telemetry.value);
+          }
+        } catch (error) {
+          logger.error('❌ Error fetching numOnlineNodes telemetry:', error);
+        }
+      }
+      logger.info(`📢 Token replacement - ONLINENODES: ${onlineNodes} online nodes (from device LocalStats)`);
+      result = result.replace(/{ONLINENODES}/g, encode(onlineNodes.toString()));
+    }
+
+    // {IP} - Meshtastic node IP address
+    if (result.includes('{IP}')) {
+      const config = this.getConfig();
+      result = result.replace(/{IP}/g, encode(config.nodeIp));
+    }
+
+    // {PORT} - Meshtastic node TCP port
+    if (result.includes('{PORT}')) {
+      const config = this.getConfig();
+      result = result.replace(/{PORT}/g, encode(String(config.tcpPort)));
     }
 
     return result;
   }
 
-  private async replaceAcknowledgementTokens(message: string, nodeId: string, fromNum: number, numberHops: number, date: string, time: string, channelIndex: number, isDirectMessage: boolean, rxSnr?: number, rxRssi?: number, viaMqtt?: boolean): Promise<string> {
-    let result = message;
+  /**
+   * Public wrapper for replaceAnnouncementTokens, used by the preview API endpoint.
+   */
+  public async previewAnnouncementMessage(message: string): Promise<string> {
+    return this.replaceAnnouncementTokens(message);
+  }
+
+  private async replaceAcknowledgementTokens(message: string, nodeId: string, fromNum: number, numberHops: number, date: string, time: string, channelIndex: number, isDirectMessage: boolean, rxSnr?: number, rxRssi?: number, viaMqtt?: boolean, urlEncode: boolean = false): Promise<string> {
+    // Start with base announcement tokens (includes {IP}, {PORT}, {VERSION}, {DURATION}, {FEATURES}, {NODECOUNT}, {DIRECTCOUNT})
+    let result = await this.replaceAnnouncementTokens(message, urlEncode);
+    const encode = (v: string) => urlEncode ? encodeURIComponent(v) : v;
 
     // {NODE_ID} - Sender node ID
     if (result.includes('{NODE_ID}')) {
-      result = result.replace(/{NODE_ID}/g, nodeId);
+      result = result.replace(/{NODE_ID}/g, encode(nodeId));
     }
 
     // {LONG_NAME} - Sender node long name
     if (result.includes('{LONG_NAME}')) {
       const node = databaseService.getNode(fromNum);
       const longName = node?.longName || 'Unknown';
-      result = result.replace(/{LONG_NAME}/g, longName);
+      result = result.replace(/{LONG_NAME}/g, encode(longName));
     }
 
     // {SHORT_NAME} - Sender node short name
     if (result.includes('{SHORT_NAME}')) {
       const node = databaseService.getNode(fromNum);
       const shortName = node?.shortName || '????';
-      result = result.replace(/{SHORT_NAME}/g, shortName);
+      result = result.replace(/{SHORT_NAME}/g, encode(shortName));
     }
 
     // {NUMBER_HOPS} and {HOPS} - Number of hops
     if (result.includes('{NUMBER_HOPS}')) {
-      result = result.replace(/{NUMBER_HOPS}/g, numberHops.toString());
+      result = result.replace(/{NUMBER_HOPS}/g, encode(numberHops.toString()));
     }
     if (result.includes('{HOPS}')) {
-      result = result.replace(/{HOPS}/g, numberHops.toString());
+      result = result.replace(/{HOPS}/g, encode(numberHops.toString()));
     }
 
     // {RABBIT_HOPS} - Rabbit emojis equal to hop count (or 🎯 for direct/0 hops)
@@ -8000,85 +9339,28 @@ class MeshtasticManager {
       // Ensure numberHops is valid (>= 0) to prevent String.repeat() errors
       const validHops = Math.max(0, numberHops);
       const rabbitEmojis = validHops === 0 ? '🎯' : '🐇'.repeat(validHops);
-      result = result.replace(/{RABBIT_HOPS}/g, rabbitEmojis);
+      result = result.replace(/{RABBIT_HOPS}/g, encode(rabbitEmojis));
     }
 
     // {DATE} - Date
     if (result.includes('{DATE}')) {
-      result = result.replace(/{DATE}/g, date);
+      result = result.replace(/{DATE}/g, encode(date));
     }
 
     // {TIME} - Time
     if (result.includes('{TIME}')) {
-      result = result.replace(/{TIME}/g, time);
+      result = result.replace(/{TIME}/g, encode(time));
     }
 
-    // {VERSION} - MeshMonitor version
-    if (result.includes('{VERSION}')) {
-      result = result.replace(/{VERSION}/g, packageJson.version);
-    }
-
-    // {DURATION} - Uptime
-    if (result.includes('{DURATION}')) {
-      const uptimeMs = Date.now() - this.serverStartTime;
-      const duration = this.formatDuration(uptimeMs);
-      result = result.replace(/{DURATION}/g, duration);
-    }
-
-    // {FEATURES} - Enabled features as emojis
-    if (result.includes('{FEATURES}')) {
-      const features: string[] = [];
-
-      // Check traceroute
-      const tracerouteInterval = databaseService.getSetting('tracerouteIntervalMinutes');
-      if (tracerouteInterval && parseInt(tracerouteInterval) > 0) {
-        features.push('🗺️');
-      }
-
-      // Check auto-ack
-      const autoAckEnabled = databaseService.getSetting('autoAckEnabled');
-      if (autoAckEnabled === 'true') {
-        features.push('🤖');
-      }
-
-      // Check auto-announce
-      const autoAnnounceEnabled = databaseService.getSetting('autoAnnounceEnabled');
-      if (autoAnnounceEnabled === 'true') {
-        features.push('📢');
-      }
-
-      // Check auto-welcome
-      const autoWelcomeEnabled = databaseService.getSetting('autoWelcomeEnabled');
-      if (autoWelcomeEnabled === 'true') {
-        features.push('👋');
-      }
-
-      result = result.replace(/{FEATURES}/g, features.join(' '));
-    }
-
-    // {NODECOUNT} - Active nodes based on maxNodeAgeHours setting
-    if (result.includes('{NODECOUNT}')) {
-      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
-      const maxNodeAgeDays = maxNodeAgeHours / 24;
-      const nodes = databaseService.getActiveNodes(maxNodeAgeDays);
-      result = result.replace(/{NODECOUNT}/g, nodes.length.toString());
-    }
-
-    // {DIRECTCOUNT} - Direct nodes (0 hops) from active nodes
-    if (result.includes('{DIRECTCOUNT}')) {
-      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
-      const maxNodeAgeDays = maxNodeAgeHours / 24;
-      const nodes = databaseService.getActiveNodes(maxNodeAgeDays);
-      const directCount = nodes.filter((n: any) => n.hopsAway === 0).length;
-      result = result.replace(/{DIRECTCOUNT}/g, directCount.toString());
-    }
+    // Note: {VERSION}, {DURATION}, {FEATURES}, {NODECOUNT}, {DIRECTCOUNT}, {IP}, {PORT}
+    // are now handled by replaceAnnouncementTokens which is called at the start of this function
 
     // {SNR} - Signal-to-Noise Ratio
     if (result.includes('{SNR}')) {
       const snrValue = (rxSnr !== undefined && rxSnr !== null && rxSnr !== 0)
         ? rxSnr.toFixed(1)
         : 'N/A';
-      result = result.replace(/{SNR}/g, snrValue);
+      result = result.replace(/{SNR}/g, encode(snrValue));
     }
 
     // {RSSI} - Received Signal Strength Indicator
@@ -8086,7 +9368,7 @@ class MeshtasticManager {
       const rssiValue = (rxRssi !== undefined && rxRssi !== null && rxRssi !== 0)
         ? rxRssi.toString()
         : 'N/A';
-      result = result.replace(/{RSSI}/g, rssiValue);
+      result = result.replace(/{RSSI}/g, encode(rssiValue));
     }
 
     // {CHANNEL} - Channel name (or index if no name or DM)
@@ -8099,13 +9381,13 @@ class MeshtasticManager {
         // Use channel name if available and not empty, otherwise fall back to channel number
         channelName = (channel?.name && channel.name.trim()) ? channel.name.trim() : channelIndex.toString();
       }
-      result = result.replace(/{CHANNEL}/g, channelName);
+      result = result.replace(/{CHANNEL}/g, encode(channelName));
     }
 
     // {TRANSPORT} - Transport type (LoRa or MQTT)
     if (result.includes('{TRANSPORT}')) {
       const transport = viaMqtt === true ? 'MQTT' : 'LoRa';
-      result = result.replace(/{TRANSPORT}/g, transport);
+      result = result.replace(/{TRANSPORT}/g, encode(transport));
     }
 
     return result;
@@ -8230,12 +9512,22 @@ class MeshtasticManager {
           const moduleConfigResponse = adminMsg.getModuleConfigResponse;
           if (moduleConfigResponse) {
             // Merge all module config fields that exist in the response
-            Object.keys(moduleConfigResponse).forEach((key) => {
-              // Skip internal protobuf fields
-              if (key !== 'payloadVariant' && moduleConfigResponse[key] !== undefined) {
-                nodeConfig.moduleConfig[key] = moduleConfigResponse[key];
-              }
+            const responseKeys = Object.keys(moduleConfigResponse).filter(k => k !== 'payloadVariant' && moduleConfigResponse[k] !== undefined);
+            responseKeys.forEach((key) => {
+              nodeConfig.moduleConfig[key] = moduleConfigResponse[key];
             });
+
+            // Proto3 omits all-default fields, so an empty getModuleConfigResponse means
+            // the node responded with a config where all values are defaults.
+            // Use the pending request tracker to store an empty config under the correct key.
+            if (responseKeys.length === 0) {
+              const pendingKey = this.pendingModuleConfigRequests.get(fromNum);
+              if (pendingKey) {
+                logger.info(`📊 Empty module config response from node ${fromNum}, storing defaults for '${pendingKey}'`);
+                nodeConfig.moduleConfig[pendingKey] = {};
+                this.pendingModuleConfigRequests.delete(fromNum);
+              }
+            }
           }
           nodeConfig.lastUpdated = Date.now();
           logger.info(`📊 Stored module config response from remote node ${fromNum}, keys:`, Object.keys(nodeConfig.moduleConfig));
@@ -8528,7 +9820,7 @@ class MeshtasticManager {
   /**
    * Send admin message to set a node as favorite on the device
    */
-  async sendFavoriteNode(nodeNum: number): Promise<void> {
+  async sendFavoriteNode(nodeNum: number, destinationNodeNum?: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -8538,15 +9830,26 @@ class MeshtasticManager {
       throw new Error('FIRMWARE_NOT_SUPPORTED');
     }
 
-    try {
-      // For local TCP connections, try sending without session passkey first
-      // (there's a known bug where session keys don't work properly over TCP)
-      logger.debug('⭐ Attempting to send favorite without session key (local TCP admin)');
-      const setFavoriteMsg = protobufService.createSetFavoriteNodeMessage(nodeNum, new Uint8Array()); // empty passkey
-      const adminPacket = protobufService.createAdminPacket(setFavoriteMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum); // send to local node
+    const localNodeNum = this.localNodeInfo?.nodeNum || 0;
+    const destNode = destinationNodeNum || localNodeNum;
+    const isRemote = destNode !== localNodeNum && destNode !== 0;
 
-      await this.transport.send(adminPacket);
-      logger.debug(`⭐ Sent set_favorite_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')})`);
+    try {
+      let sessionPasskey: Uint8Array = new Uint8Array();
+      if (isRemote) {
+        const cached = this.getSessionPasskey(destNode);
+        if (cached) {
+          sessionPasskey = cached;
+        } else {
+          const requested = await this.requestRemoteSessionPasskey(destNode);
+          if (!requested) throw new Error(`Failed to obtain session passkey for remote node ${destNode}`);
+          sessionPasskey = requested;
+        }
+      }
+
+      const setFavoriteMsg = protobufService.createSetFavoriteNodeMessage(nodeNum, sessionPasskey);
+      await this.sendAdminCommand(setFavoriteMsg, destNode);
+      logger.debug(`⭐ Sent set_favorite_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')}) to ${isRemote ? 'remote' : 'local'} node ${destNode}`);
     } catch (error) {
       logger.error('❌ Error sending favorite node admin message:', error);
       throw error;
@@ -8556,7 +9859,7 @@ class MeshtasticManager {
   /**
    * Send admin message to remove a node from favorites on the device
    */
-  async sendRemoveFavoriteNode(nodeNum: number): Promise<void> {
+  async sendRemoveFavoriteNode(nodeNum: number, destinationNodeNum?: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -8566,15 +9869,26 @@ class MeshtasticManager {
       throw new Error('FIRMWARE_NOT_SUPPORTED');
     }
 
-    try {
-      // For local TCP connections, try sending without session passkey first
-      // (there's a known bug where session keys don't work properly over TCP)
-      logger.debug('☆ Attempting to remove favorite without session key (local TCP admin)');
-      const removeFavoriteMsg = protobufService.createRemoveFavoriteNodeMessage(nodeNum, new Uint8Array()); // empty passkey
-      const adminPacket = protobufService.createAdminPacket(removeFavoriteMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum); // send to local node
+    const localNodeNum = this.localNodeInfo?.nodeNum || 0;
+    const destNode = destinationNodeNum || localNodeNum;
+    const isRemote = destNode !== localNodeNum && destNode !== 0;
 
-      await this.transport.send(adminPacket);
-      logger.debug(`☆ Sent remove_favorite_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')})`);
+    try {
+      let sessionPasskey: Uint8Array = new Uint8Array();
+      if (isRemote) {
+        const cached = this.getSessionPasskey(destNode);
+        if (cached) {
+          sessionPasskey = cached;
+        } else {
+          const requested = await this.requestRemoteSessionPasskey(destNode);
+          if (!requested) throw new Error(`Failed to obtain session passkey for remote node ${destNode}`);
+          sessionPasskey = requested;
+        }
+      }
+
+      const removeFavoriteMsg = protobufService.createRemoveFavoriteNodeMessage(nodeNum, sessionPasskey);
+      await this.sendAdminCommand(removeFavoriteMsg, destNode);
+      logger.debug(`☆ Sent remove_favorite_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')}) to ${isRemote ? 'remote' : 'local'} node ${destNode}`);
     } catch (error) {
       logger.error('❌ Error sending remove favorite node admin message:', error);
       throw error;
@@ -8584,7 +9898,7 @@ class MeshtasticManager {
   /**
    * Send admin message to set a node as ignored on the device
    */
-  async sendIgnoredNode(nodeNum: number): Promise<void> {
+  async sendIgnoredNode(nodeNum: number, destinationNodeNum?: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -8594,15 +9908,26 @@ class MeshtasticManager {
       throw new Error('FIRMWARE_NOT_SUPPORTED');
     }
 
-    try {
-      // For local TCP connections, try sending without session passkey first
-      // (there's a known bug where session keys don't work properly over TCP)
-      logger.debug('🚫 Attempting to set ignored node without session key (local TCP admin)');
-      const setIgnoredMsg = protobufService.createSetIgnoredNodeMessage(nodeNum, new Uint8Array()); // empty passkey
-      const adminPacket = protobufService.createAdminPacket(setIgnoredMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum); // send to local node
+    const localNodeNum = this.localNodeInfo?.nodeNum || 0;
+    const destNode = destinationNodeNum || localNodeNum;
+    const isRemote = destNode !== localNodeNum && destNode !== 0;
 
-      await this.transport.send(adminPacket);
-      logger.debug(`🚫 Sent set_ignored_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')})`);
+    try {
+      let sessionPasskey: Uint8Array = new Uint8Array();
+      if (isRemote) {
+        const cached = this.getSessionPasskey(destNode);
+        if (cached) {
+          sessionPasskey = cached;
+        } else {
+          const requested = await this.requestRemoteSessionPasskey(destNode);
+          if (!requested) throw new Error(`Failed to obtain session passkey for remote node ${destNode}`);
+          sessionPasskey = requested;
+        }
+      }
+
+      const setIgnoredMsg = protobufService.createSetIgnoredNodeMessage(nodeNum, sessionPasskey);
+      await this.sendAdminCommand(setIgnoredMsg, destNode);
+      logger.debug(`🚫 Sent set_ignored_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')}) to ${isRemote ? 'remote' : 'local'} node ${destNode}`);
     } catch (error) {
       logger.error('❌ Error sending ignored node admin message:', error);
       throw error;
@@ -8612,7 +9937,7 @@ class MeshtasticManager {
   /**
    * Send admin message to remove a node from ignored list on the device
    */
-  async sendRemoveIgnoredNode(nodeNum: number): Promise<void> {
+  async sendRemoveIgnoredNode(nodeNum: number, destinationNodeNum?: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -8622,15 +9947,26 @@ class MeshtasticManager {
       throw new Error('FIRMWARE_NOT_SUPPORTED');
     }
 
-    try {
-      // For local TCP connections, try sending without session passkey first
-      // (there's a known bug where session keys don't work properly over TCP)
-      logger.debug('✅ Attempting to remove ignored node without session key (local TCP admin)');
-      const removeIgnoredMsg = protobufService.createRemoveIgnoredNodeMessage(nodeNum, new Uint8Array()); // empty passkey
-      const adminPacket = protobufService.createAdminPacket(removeIgnoredMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum); // send to local node
+    const localNodeNum = this.localNodeInfo?.nodeNum || 0;
+    const destNode = destinationNodeNum || localNodeNum;
+    const isRemote = destNode !== localNodeNum && destNode !== 0;
 
-      await this.transport.send(adminPacket);
-      logger.debug(`✅ Sent remove_ignored_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')})`);
+    try {
+      let sessionPasskey: Uint8Array = new Uint8Array();
+      if (isRemote) {
+        const cached = this.getSessionPasskey(destNode);
+        if (cached) {
+          sessionPasskey = cached;
+        } else {
+          const requested = await this.requestRemoteSessionPasskey(destNode);
+          if (!requested) throw new Error(`Failed to obtain session passkey for remote node ${destNode}`);
+          sessionPasskey = requested;
+        }
+      }
+
+      const removeIgnoredMsg = protobufService.createRemoveIgnoredNodeMessage(nodeNum, sessionPasskey);
+      await this.sendAdminCommand(removeIgnoredMsg, destNode);
+      logger.debug(`✅ Sent remove_ignored_node for ${nodeNum} (!${nodeNum.toString(16).padStart(8, '0')}) to ${isRemote ? 'remote' : 'local'} node ${destNode}`);
     } catch (error) {
       logger.error('❌ Error sending remove ignored node admin message:', error);
       throw error;
@@ -8769,7 +10105,9 @@ class MeshtasticManager {
         const moduleConfigMap: { [key: number]: string } = {
           0: 'mqtt',
           5: 'telemetry',
-          9: 'neighborInfo'
+          9: 'neighborInfo',
+          13: 'statusmessage',
+          14: 'trafficManagement'
         };
         const configKey = moduleConfigMap[configType];
         if (configKey) {
@@ -8792,6 +10130,18 @@ class MeshtasticManager {
           if (nodeConfig?.deviceConfig) {
             delete nodeConfig.deviceConfig[configKey];
           }
+        }
+      }
+
+      // Track pending module config request so empty Proto3 responses can be mapped
+      if (isModuleConfig) {
+        const moduleConfigMap: { [key: number]: string } = {
+          0: 'mqtt', 5: 'telemetry', 9: 'neighborInfo',
+          13: 'statusmessage', 14: 'trafficManagement'
+        };
+        const pendingKey = moduleConfigMap[configType];
+        if (pendingKey) {
+          this.pendingModuleConfigRequests.set(destinationNodeNum, pendingKey);
         }
       }
 
@@ -8818,7 +10168,9 @@ class MeshtasticManager {
             const moduleConfigMap: { [key: number]: string } = {
               0: 'mqtt',
               5: 'telemetry',
-              9: 'neighborInfo'
+              9: 'neighborInfo',
+              13: 'statusmessage',
+              14: 'trafficManagement'
             };
             const configKey = moduleConfigMap[configType];
             if (configKey && nodeConfig.moduleConfig?.[configKey]) {
@@ -9101,6 +10453,125 @@ class MeshtasticManager {
   }
 
   /**
+   * Send reboot command to a node (local or remote)
+   * @param destinationNodeNum The target node number (0 or local node num for local)
+   * @param seconds Number of seconds before reboot (default: 5, use negative to cancel)
+   */
+  async sendRebootCommand(destinationNodeNum: number, seconds: number = 5): Promise<void> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    if (!this.localNodeInfo?.nodeNum) {
+      throw new Error('Local node number not available');
+    }
+
+    const localNodeNum = this.localNodeInfo.nodeNum;
+    const isLocalNode = destinationNodeNum === 0 || destinationNodeNum === localNodeNum;
+
+    try {
+      const root = getProtobufRoot();
+      if (!root) {
+        throw new Error('Protobuf definitions not loaded. Please ensure protobuf definitions are initialized.');
+      }
+      const AdminMessage = root.lookupType('meshtastic.AdminMessage');
+      if (!AdminMessage) {
+        throw new Error('AdminMessage type not found');
+      }
+
+      let sessionPasskey: Uint8Array | null = null;
+
+      // For remote nodes, get the session passkey
+      if (!isLocalNode) {
+        sessionPasskey = this.getSessionPasskey(destinationNodeNum);
+        if (!sessionPasskey) {
+          logger.info(`🔑 No cached passkey for remote node ${destinationNodeNum}, requesting new one...`);
+          sessionPasskey = await this.requestRemoteSessionPasskey(destinationNodeNum);
+          if (!sessionPasskey) {
+            throw new Error(`Failed to obtain session passkey for remote node ${destinationNodeNum}`);
+          }
+        }
+      }
+
+      const adminMsg = AdminMessage.create({
+        ...(sessionPasskey && { sessionPasskey }),
+        rebootSeconds: seconds
+      });
+      const encoded = AdminMessage.encode(adminMsg).finish();
+
+      const targetNodeNum = isLocalNode ? localNodeNum : destinationNodeNum;
+      const adminPacket = protobufService.createAdminPacket(encoded, targetNodeNum, localNodeNum);
+      await this.transport.send(adminPacket);
+
+      logger.info(`🔄 Sent reboot command to node ${targetNodeNum} (reboot in ${seconds} seconds)`);
+    } catch (error) {
+      logger.error(`❌ Error sending reboot command to node ${destinationNodeNum}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Send set time command to a node (local or remote)
+   * Sets the node's time to the current server time
+   * @param destinationNodeNum The target node number (0 or local node num for local)
+   */
+  async sendSetTimeCommand(destinationNodeNum: number): Promise<void> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    if (!this.localNodeInfo?.nodeNum) {
+      throw new Error('Local node number not available');
+    }
+
+    const localNodeNum = this.localNodeInfo.nodeNum;
+    const isLocalNode = destinationNodeNum === 0 || destinationNodeNum === localNodeNum;
+
+    try {
+      const root = getProtobufRoot();
+      if (!root) {
+        throw new Error('Protobuf definitions not loaded. Please ensure protobuf definitions are initialized.');
+      }
+      const AdminMessage = root.lookupType('meshtastic.AdminMessage');
+      if (!AdminMessage) {
+        throw new Error('AdminMessage type not found');
+      }
+
+      let sessionPasskey: Uint8Array | null = null;
+
+      // For remote nodes, get the session passkey
+      if (!isLocalNode) {
+        sessionPasskey = this.getSessionPasskey(destinationNodeNum);
+        if (!sessionPasskey) {
+          logger.info(`🔑 No cached passkey for remote node ${destinationNodeNum}, requesting new one...`);
+          sessionPasskey = await this.requestRemoteSessionPasskey(destinationNodeNum);
+          if (!sessionPasskey) {
+            throw new Error(`Failed to obtain session passkey for remote node ${destinationNodeNum}`);
+          }
+        }
+      }
+
+      // Get current Unix timestamp
+      const currentTime = Math.floor(Date.now() / 1000);
+
+      const adminMsg = AdminMessage.create({
+        ...(sessionPasskey && { sessionPasskey }),
+        setTimeOnly: currentTime
+      });
+      const encoded = AdminMessage.encode(adminMsg).finish();
+
+      const targetNodeNum = isLocalNode ? localNodeNum : destinationNodeNum;
+      const adminPacket = protobufService.createAdminPacket(encoded, targetNodeNum, localNodeNum);
+      await this.transport.send(adminPacket);
+
+      logger.info(`🕐 Sent set time command to node ${targetNodeNum} (time: ${currentTime} / ${new Date(currentTime * 1000).toISOString()})`);
+    } catch (error) {
+      logger.error(`❌ Error sending set time command to node ${destinationNodeNum}:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Request all module configurations from the device for complete backup
    * This requests all 13 module config types defined in the protobufs
    */
@@ -9123,7 +10594,9 @@ class MeshtasticManager {
       9,  // NEIGHBORINFO_CONFIG
       10, // AMBIENTLIGHTING_CONFIG
       11, // DETECTIONSENSOR_CONFIG
-      12  // PAXCOUNTER_CONFIG
+      12, // PAXCOUNTER_CONFIG
+      13, // STATUSMESSAGE_CONFIG
+      14  // TRAFFICMANAGEMENT_CONFIG
     ];
 
     logger.info('📦 Requesting all module configs for complete backup...');
@@ -9344,10 +10817,11 @@ class MeshtasticManager {
       // Extract position data if provided
       const { latitude, longitude, altitude, ...positionConfig } = config;
 
-      // Per Meshtastic docs: Set fixed position coordinates FIRST, THEN set fixedPosition flag
-      // If lat/long provided, send position update first
+      // Per Meshtastic docs: Set fixed position coordinates FIRST, THEN set fixedPosition flag.
+      // set_fixed_position automatically sets fixedPosition=true on the device.
+      // No delay needed: firmware processes incoming messages sequentially from its receive buffer.
       if (latitude !== undefined && longitude !== undefined) {
-        logger.debug(`⚙️ Setting fixed position coordinates FIRST: lat=${latitude}, lon=${longitude}, alt=${altitude || 0}`);
+        logger.debug(`⚙️ Setting fixed position coordinates: lat=${latitude}, lon=${longitude}, alt=${altitude || 0}`);
         const setPositionMsg = protobufService.createSetFixedPositionMessage(
           latitude,
           longitude,
@@ -9358,9 +10832,6 @@ class MeshtasticManager {
 
         await this.transport.send(positionPacket);
         logger.debug('⚙️ Sent set_fixed_position admin message');
-
-        // Add delay to ensure device processes the position before the config
-        await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
       // Then send position configuration (fixedPosition flag, broadcast intervals, etc.)
@@ -9475,6 +10946,13 @@ class MeshtasticManager {
 
       await this.transport.send(adminPacket);
       logger.debug('⚙️ Sent set_telemetry_config admin message');
+
+      // Update local cache with the config that was sent
+      if (!this.actualModuleConfig) {
+        this.actualModuleConfig = {};
+      }
+      this.actualModuleConfig.telemetry = { ...this.actualModuleConfig.telemetry, ...config };
+      logger.debug('⚙️ Updated actualModuleConfig.telemetry cache');
     } catch (error) {
       logger.error('❌ Error sending telemetry config:', error);
       throw error;
@@ -9762,6 +11240,16 @@ class MeshtasticManager {
 
     // Send want_config_id to trigger node to send updated info
     await this.sendWantConfigId();
+
+    // Also request all module configs to get fresh telemetry, mqtt, etc.
+    setTimeout(async () => {
+      try {
+        logger.info('📦 Requesting fresh module configs...');
+        await this.requestAllModuleConfigs();
+      } catch (error) {
+        logger.error('❌ Failed to request module configs during refresh:', error);
+      }
+    }, 1000);
   }
 
   /**
@@ -9786,7 +11274,12 @@ class MeshtasticManager {
 
     this.isConnected = false;
 
-    // Clear any active intervals
+    // Clear any active intervals and pending jitter timeouts
+    if (this.tracerouteJitterTimeout) {
+      clearTimeout(this.tracerouteJitterTimeout);
+      this.tracerouteJitterTimeout = null;
+    }
+
     if (this.tracerouteInterval) {
       clearInterval(this.tracerouteInterval);
       this.tracerouteInterval = null;
@@ -9795,6 +11288,11 @@ class MeshtasticManager {
     if (this.remoteAdminScannerInterval) {
       clearInterval(this.remoteAdminScannerInterval);
       this.remoteAdminScannerInterval = null;
+    }
+
+    if (this.timeSyncInterval) {
+      clearInterval(this.timeSyncInterval);
+      this.timeSyncInterval = null;
     }
 
     if (this.announceInterval) {

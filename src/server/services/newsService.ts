@@ -6,8 +6,12 @@
  */
 
 import * as cron from 'node-cron';
+import { createRequire } from 'module';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
+
+const require = createRequire(import.meta.url);
+const appVersion: string = require('../../../package.json').version;
 
 // News feed types
 export interface NewsItem {
@@ -17,6 +21,7 @@ export interface NewsItem {
   date: string;
   category: 'release' | 'security' | 'feature' | 'maintenance';
   priority: 'normal' | 'important';
+  minVersion?: string;
 }
 
 export interface NewsFeed {
@@ -30,6 +35,22 @@ const DEFAULT_NEWS_URL = 'https://meshmonitor.org/news.json';
 class NewsService {
   private cronJob: cron.ScheduledTask | null = null;
   private isInitialized = false;
+
+  /**
+   * Compare semver versions. Returns true if current >= required.
+   */
+  private isVersionAtLeast(current: string, required: string): boolean {
+    const parse = (v: string) => v.split('.').map(Number);
+    const cur = parse(current);
+    const req = parse(required);
+    for (let i = 0; i < Math.max(cur.length, req.length); i++) {
+      const c = cur[i] || 0;
+      const r = req[i] || 0;
+      if (c > r) return true;
+      if (c < r) return false;
+    }
+    return true; // equal
+  }
 
   /**
    * Initialize the news service
@@ -146,6 +167,12 @@ class NewsService {
       }
 
       const feed = JSON.parse(cache.feedData) as NewsFeed;
+
+      // Filter out items that require a newer version than currently installed
+      feed.items = feed.items.filter(item =>
+        !item.minVersion || this.isVersionAtLeast(appVersion, item.minVersion)
+      );
+
       return feed;
     } catch (error) {
       logger.error('Error retrieving cached news:', error);
@@ -179,7 +206,7 @@ class NewsService {
 
   /**
    * Get unread news for a user
-   * Returns news items that the user hasn't dismissed
+   * Returns news items that the user hasn't dismissed and are newer than lastSeenNewsId
    */
   async getUnreadNewsForUser(userId: number): Promise<NewsItem[]> {
     try {
@@ -191,8 +218,33 @@ class NewsService {
       const userStatus = await this.getUserNewsStatus(userId);
       const dismissedIds = new Set(userStatus?.dismissedNewsIds || []);
 
-      // Filter out dismissed items
-      return feed.items.filter(item => !dismissedIds.has(item.id));
+      // Find the date of the lastSeenNewsId item to filter out older items
+      let lastSeenDate: Date | null = null;
+      if (userStatus?.lastSeenNewsId) {
+        const lastSeenItem = feed.items.find(item => item.id === userStatus.lastSeenNewsId);
+        if (lastSeenItem) {
+          lastSeenDate = new Date(lastSeenItem.date);
+        }
+      }
+
+      // Filter items: show if newer than lastSeenDate OR important (unless dismissed)
+      return feed.items.filter(item => {
+        // Hide dismissed items
+        if (dismissedIds.has(item.id)) {
+          return false;
+        }
+        // Always show important items that aren't dismissed
+        if (item.priority === 'important') {
+          return true;
+        }
+        // If we have a lastSeenDate, only show items newer than that
+        if (lastSeenDate) {
+          const itemDate = new Date(item.date);
+          return itemDate > lastSeenDate;
+        }
+        // No lastSeenDate means show all non-dismissed items (first time user)
+        return true;
+      });
     } catch (error) {
       logger.error('Error getting unread news for user:', error);
       return [];

@@ -1391,9 +1391,6 @@ class ProtobufService {
       if (config.positionBroadcastSecs !== undefined) positionConfigData.positionBroadcastSecs = config.positionBroadcastSecs;
       if (config.positionBroadcastSmartEnabled !== undefined) positionConfigData.positionBroadcastSmartEnabled = config.positionBroadcastSmartEnabled;
       if (config.fixedPosition !== undefined) positionConfigData.fixedPosition = config.fixedPosition;
-      if (config.fixedLatitude !== undefined) positionConfigData.fixedLatitude = config.fixedLatitude;
-      if (config.fixedLongitude !== undefined) positionConfigData.fixedLongitude = config.fixedLongitude;
-      if (config.fixedAltitude !== undefined) positionConfigData.fixedAltitude = config.fixedAltitude;
       if (config.gpsUpdateInterval !== undefined) positionConfigData.gpsUpdateInterval = config.gpsUpdateInterval;
       if (config.positionFlags !== undefined) positionConfigData.positionFlags = config.positionFlags;
       if (config.rxGpio !== undefined) positionConfigData.rxGpio = config.rxGpio;
@@ -1598,7 +1595,9 @@ class ProtobufService {
         'neighborinfo': 'neighborInfo',
         'ambientlighting': 'ambientLighting',
         'detectionsensor': 'detectionSensor',
-        'paxcounter': 'paxcounter'
+        'paxcounter': 'paxcounter',
+        'statusmessage': 'statusmessage',
+        'trafficmanagement': 'trafficManagement'
       };
 
       const fieldName = configFieldMap[configType];

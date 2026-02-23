@@ -185,6 +185,87 @@ Distance calculator that uses the new location environment variables to calculat
 - Shows distance in both kilometers and miles
 - Includes compass direction from sender to MeshMonitor
 
+### remote-admin.py / remote-admin.sh (Python/Shell)
+Remote admin scripts for sending Meshtastic CLI commands to nodes. Works with Geofence triggers, Timer triggers, and Auto Responder.
+
+**Available in:** Python (`remote-admin.py`) and Shell (`remote-admin.sh`)
+
+**Environment Variables (set automatically by MeshMonitor):**
+- `MESHTASTIC_IP` - IP address of the connected Meshtastic node
+- `MESHTASTIC_PORT` - TCP port (usually 4403)
+- `NODE_ID` - Destination node ID (e.g., `!abcd1234`)
+- `GEOFENCE_NAME` - Name of the geofence (for geofence triggers)
+- `GEOFENCE_EVENT` - Event type: entry, exit, or while_inside
+
+**Using Script Arguments (Recommended):**
+
+MeshMonitor supports passing arguments directly to scripts via the "Arguments" field in the UI. This eliminates the need for wrapper scripts:
+
+1. **Reboot a node when it enters a geofence:**
+   - Create geofence trigger with event "entry"
+   - Set Script to `/data/scripts/remote-admin.py`
+   - Set Arguments to: `--reboot`
+
+2. **Change radio settings when node exits an area:**
+   - Set Script to `/data/scripts/remote-admin.py`
+   - Set Arguments to: `--set lora.region US`
+
+3. **Set node position with token expansion:**
+   - Set Arguments to: `--dest {NODE_ID} --setlat 40.7128 --setlon -74.0060`
+
+4. **Change channel settings:**
+   - Set Arguments to: `--ch-set psk random --ch-index 1`
+
+**Available Tokens for Script Arguments:**
+
+| Token | Description | Available In |
+|-------|-------------|--------------|
+| `{IP}` | Meshtastic node IP address | All triggers |
+| `{PORT}` | Meshtastic TCP port | All triggers |
+| `{NODE_ID}` | Triggering node ID | Geofence, AutoResponder |
+| `{GEOFENCE_NAME}` | Name of the geofence | Geofence only |
+| `{EVENT}` | Event type (entry/exit/while_inside) | Geofence only |
+| `{VERSION}` | MeshMonitor version | All triggers |
+| `{NODECOUNT}` | Active node count | All triggers |
+
+**Example Geofence Configurations:**
+
+| Name | Event | Script | Arguments |
+|------|-------|--------|-----------|
+| Reboot on Entry | entry | remote-admin.py | `--reboot` |
+| Set Region on Exit | exit | remote-admin.py | `--set lora.region US` |
+| Update Position | entry | remote-admin.py | `--setlat 40.7128 --setlon -74.0060` |
+| Factory Reset | entry | remote-admin.py | `--factory-reset` |
+
+**Standalone Usage:**
+```bash
+# Specify IP and destination manually
+./remote-admin.py --ip 192.168.1.100 --dest !abcd1234 --reboot
+
+# Use environment variables
+export MESHTASTIC_IP=192.168.1.100
+export NODE_ID=!abcd1234
+./remote-admin.py --set device.role CLIENT
+```
+
+**Legacy Wrapper Scripts (Optional):**
+
+While no longer necessary with Script Arguments, you can still create wrapper scripts if preferred:
+
+```python
+#!/usr/bin/env python3
+# geofence-reboot.py - Reboot node on geofence entry
+import subprocess
+import sys
+subprocess.run(['/data/scripts/remote-admin.py', '--reboot'])
+```
+
+```bash
+#!/bin/sh
+# geofence-set-region.sh - Set region when node exits area
+/data/scripts/remote-admin.sh --set lora.region US
+```
+
 ### api-query.py (Python)
 Demonstrates using MeshMonitor's v1 API from scripts. Shows how to query node information using API token authentication.
 
@@ -308,7 +389,7 @@ EOF
 
 - Scripts are sandboxed to `/data/scripts/` directory only
 - Path traversal attempts (`..`) are blocked
-- Scripts have 10-second execution timeout
+- Scripts have 30-second execution timeout
 - Scripts run with container user permissions (not root)
 - Output is limited to 1MB
 

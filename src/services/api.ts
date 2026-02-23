@@ -1112,6 +1112,47 @@ class ApiService {
     return response.json();
   }
 
+  async getConnectionInfo(): Promise<{
+    connected: boolean;
+    nodeResponsive: boolean;
+    configuring: boolean;
+    nodeIp: string;
+    defaultIp: string;
+    defaultPort: number;
+    isOverridden: boolean;
+    tcpPort: number;
+    userDisconnected?: boolean;
+  }> {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/connection/info`, {
+      credentials: 'include'
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to get connection info');
+    }
+
+    return response.json();
+  }
+
+  async configureConnection(nodeIp: string): Promise<{ success: boolean; message: string; nodeIp: string }> {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/connection/configure`, {
+      method: 'POST',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+      body: JSON.stringify({ nodeIp })
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to configure connection');
+    }
+
+    return response.json();
+  }
+
   async getVirtualNodeStatus() {
     await this.ensureBaseUrl();
     const response = await fetch(`${this.baseUrl}/api/virtual-node/status`, {
@@ -1209,6 +1250,7 @@ class ApiService {
     pskLength?: number;
     description?: string;
     isEnabled?: boolean;
+    enforceNameValidation?: boolean;
   }): Promise<{
     success: boolean;
     data: ChannelDatabaseEntry;
@@ -1227,6 +1269,7 @@ class ApiService {
       psk?: string;
       description?: string;
       isEnabled?: boolean;
+      enforceNameValidation?: boolean;
     }
   ): Promise<{
     success: boolean;
@@ -1244,6 +1287,16 @@ class ApiService {
     message: string;
   }> {
     return this.delete(`/api/channel-database/${id}`);
+  }
+
+  /**
+   * Reorder channel database entries
+   */
+  async reorderChannelDatabaseEntries(channels: { id: number; sortOrder: number }[]): Promise<{
+    success: boolean;
+    message: string;
+  }> {
+    return this.put('/api/channel-database/reorder', { channels });
   }
 
   /**
@@ -1345,6 +1398,8 @@ export interface ChannelDatabaseEntry {
   psk?: string;
   description: string | null;
   isEnabled: boolean;
+  enforceNameValidation: boolean;
+  sortOrder: number;
   decryptedPacketCount: number;
   lastDecryptedAt: number | null;
   createdBy: number | null;

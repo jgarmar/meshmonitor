@@ -33,6 +33,7 @@ interface ModuleConfigurationSectionProps {
 
   // Telemetry Config
   telemetryDeviceUpdateInterval: number;
+  telemetryDeviceTelemetryEnabled: boolean;
   telemetryEnvironmentUpdateInterval: number;
   telemetryEnvironmentMeasurementEnabled: boolean;
   telemetryEnvironmentScreenEnabled: boolean;
@@ -42,8 +43,36 @@ interface ModuleConfigurationSectionProps {
   telemetryPowerMeasurementEnabled: boolean;
   telemetryPowerUpdateInterval: number;
   telemetryPowerScreenEnabled: boolean;
+  telemetryHealthMeasurementEnabled: boolean;
+  telemetryHealthUpdateInterval: number;
+  telemetryHealthScreenEnabled: boolean;
   onTelemetryConfigChange: (field: string, value: any) => void;
   onSaveTelemetryConfig: () => Promise<void>;
+
+  // Status Message Config
+  statusMessageNodeStatus: string;
+  onStatusMessageConfigChange: (field: string, value: any) => void;
+  onSaveStatusMessageConfig: () => Promise<void>;
+  statusMessageIsDisabled: boolean;
+
+  // Traffic Management Config
+  trafficManagementEnabled: boolean;
+  trafficManagementPositionDedupEnabled: boolean;
+  trafficManagementPositionDedupTimeSecs: number;
+  trafficManagementPositionDedupDistanceMeters: number;
+  trafficManagementNodeinfoDirectResponseEnabled: boolean;
+  trafficManagementNodeinfoDirectResponseMyNodeOnly: boolean;
+  trafficManagementRateLimitEnabled: boolean;
+  trafficManagementRateLimitMaxPerNode: number;
+  trafficManagementRateLimitWindowSecs: number;
+  trafficManagementUnknownPacketDropEnabled: boolean;
+  trafficManagementUnknownPacketGracePeriodSecs: number;
+  trafficManagementHopExhaustionEnabled: boolean;
+  trafficManagementHopExhaustionMinHops: number;
+  trafficManagementHopExhaustionMaxHops: number;
+  onTrafficManagementConfigChange: (field: string, value: any) => void;
+  onSaveTrafficManagementConfig: () => Promise<void>;
+  trafficManagementIsDisabled: boolean;
 
   // Common
   isExecuting: boolean;
@@ -53,6 +82,8 @@ interface ModuleConfigurationSectionProps {
   mqttHeaderActions?: React.ReactNode;
   neighborInfoHeaderActions?: React.ReactNode;
   telemetryHeaderActions?: React.ReactNode;
+  statusMessageHeaderActions?: React.ReactNode;
+  trafficManagementHeaderActions?: React.ReactNode;
 }
 
 export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProps> = ({
@@ -72,6 +103,7 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
   onNeighborInfoConfigChange,
   onSaveNeighborInfoConfig,
   telemetryDeviceUpdateInterval,
+  telemetryDeviceTelemetryEnabled,
   telemetryEnvironmentUpdateInterval,
   telemetryEnvironmentMeasurementEnabled,
   telemetryEnvironmentScreenEnabled,
@@ -81,13 +113,39 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
   telemetryPowerMeasurementEnabled,
   telemetryPowerUpdateInterval,
   telemetryPowerScreenEnabled,
+  telemetryHealthMeasurementEnabled,
+  telemetryHealthUpdateInterval,
+  telemetryHealthScreenEnabled,
   onTelemetryConfigChange,
   onSaveTelemetryConfig,
+  statusMessageNodeStatus,
+  onStatusMessageConfigChange,
+  onSaveStatusMessageConfig,
+  statusMessageIsDisabled,
+  trafficManagementEnabled,
+  trafficManagementPositionDedupEnabled,
+  trafficManagementPositionDedupTimeSecs,
+  trafficManagementPositionDedupDistanceMeters,
+  trafficManagementNodeinfoDirectResponseEnabled,
+  trafficManagementNodeinfoDirectResponseMyNodeOnly,
+  trafficManagementRateLimitEnabled,
+  trafficManagementRateLimitMaxPerNode,
+  trafficManagementRateLimitWindowSecs,
+  trafficManagementUnknownPacketDropEnabled,
+  trafficManagementUnknownPacketGracePeriodSecs,
+  trafficManagementHopExhaustionEnabled,
+  trafficManagementHopExhaustionMinHops,
+  trafficManagementHopExhaustionMaxHops,
+  onTrafficManagementConfigChange,
+  onSaveTrafficManagementConfig,
+  trafficManagementIsDisabled,
   isExecuting,
   selectedNodeNum,
   mqttHeaderActions,
   neighborInfoHeaderActions,
   telemetryHeaderActions,
+  statusMessageHeaderActions,
+  trafficManagementHeaderActions,
 }) => {
   const { t } = useTranslation();
 
@@ -305,21 +363,38 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
           {t('telemetry_config.device_section', 'Device Telemetry')}
         </h4>
         <div className="setting-item">
-          <label>
-            {t('telemetry_config.device_interval', 'Device Update Interval (seconds)')}
-            <span className="setting-description">{t('telemetry_config.device_interval_description', 'How often to collect and transmit device metrics (battery, voltage, etc.)')}</span>
+          <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+            <input
+              type="checkbox"
+              checked={telemetryDeviceTelemetryEnabled}
+              onChange={(e) => onTelemetryConfigChange('deviceTelemetryEnabled', e.target.checked)}
+              disabled={isExecuting}
+              style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+            />
+            <div style={{ flex: 1 }}>
+              <div>{t('telemetry_config.device_enabled', 'Device Telemetry Enabled')}</div>
+              <span className="setting-description">{t('telemetry_config.device_enabled_description', 'Enable sending device metrics (battery, voltage, etc.) to the mesh network')}</span>
+            </div>
           </label>
-          <input
-            type="number"
-            min="0"
-            value={telemetryDeviceUpdateInterval}
-            onChange={(e) => onTelemetryConfigChange('deviceUpdateInterval', parseInt(e.target.value) || 0)}
-            disabled={isExecuting}
-            className="setting-input"
-            style={{ width: '100%', maxWidth: '600px' }}
-            placeholder="900"
-          />
         </div>
+        {telemetryDeviceTelemetryEnabled && (
+          <div className="setting-item">
+            <label>
+              {t('telemetry_config.device_interval', 'Device Update Interval (seconds)')}
+              <span className="setting-description">{t('telemetry_config.device_interval_description', 'How often to collect and transmit device metrics (battery, voltage, etc.)')}</span>
+            </label>
+            <input
+              type="number"
+              min="0"
+              value={telemetryDeviceUpdateInterval}
+              onChange={(e) => onTelemetryConfigChange('deviceUpdateInterval', parseInt(e.target.value) || 0)}
+              disabled={isExecuting}
+              className="setting-input"
+              style={{ width: '100%', maxWidth: '600px' }}
+              placeholder="900"
+            />
+          </div>
+        )}
 
         {/* Environment Telemetry */}
         <h4 style={{ margin: '1rem 0 0.75rem', color: 'var(--ctp-subtext0)' }}>
@@ -489,6 +564,61 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
               </div>
             </>
           )}
+
+          {/* Health Metrics */}
+          <h4 style={{ margin: '1rem 0 0.75rem', color: 'var(--ctp-subtext0)' }}>
+            {t('telemetry_config.health_section', 'Health Metrics')}
+          </h4>
+          <div className="setting-item">
+            <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+              <input
+                type="checkbox"
+                checked={telemetryHealthMeasurementEnabled}
+                onChange={(e) => onTelemetryConfigChange('healthMeasurementEnabled', e.target.checked)}
+                disabled={isExecuting}
+                style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+              />
+              <div style={{ flex: 1 }}>
+                <div>{t('telemetry_config.health_enabled', 'Health Measurement Enabled')}</div>
+                <span className="setting-description">{t('telemetry_config.health_enabled_description', 'Enable collection of health telemetry data')}</span>
+              </div>
+            </label>
+          </div>
+          {telemetryHealthMeasurementEnabled && (
+            <>
+              <div className="setting-item">
+                <label>
+                  {t('telemetry_config.health_interval', 'Health Update Interval (seconds)')}
+                  <span className="setting-description">{t('telemetry_config.health_interval_description', 'How often to send health metrics to the mesh')}</span>
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  value={telemetryHealthUpdateInterval}
+                  onChange={(e) => onTelemetryConfigChange('healthUpdateInterval', parseInt(e.target.value) || 0)}
+                  disabled={isExecuting}
+                  className="setting-input"
+                  style={{ width: '100%', maxWidth: '600px' }}
+                  placeholder="900"
+                />
+              </div>
+              <div className="setting-item">
+                <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                  <input
+                    type="checkbox"
+                    checked={telemetryHealthScreenEnabled}
+                    onChange={(e) => onTelemetryConfigChange('healthScreenEnabled', e.target.checked)}
+                    disabled={isExecuting}
+                    style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+                  />
+                  <div style={{ flex: 1 }}>
+                    <div>{t('telemetry_config.health_screen', 'Health Screen Enabled')}</div>
+                    <span className="setting-description">{t('telemetry_config.health_screen_description', 'Display health metrics on the device screen')}</span>
+                  </div>
+                </label>
+              </div>
+            </>
+          )}
         </CollapsibleSection>
 
         <button
@@ -503,6 +633,229 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
         >
           {isExecuting ? t('common.saving') : t('telemetry_config.save_button', 'Save Telemetry Config')}
         </button>
+      </CollapsibleSection>
+
+      {/* Status Message Config Section */}
+      <CollapsibleSection
+        id="admin-statusmessage-config"
+        title={t('statusmessage_config.title', 'Status Message')}
+        nested={true}
+        headerActions={statusMessageHeaderActions}
+      >
+        {statusMessageIsDisabled && (
+          <div style={{
+            padding: '1rem',
+            backgroundColor: 'var(--ctp-surface0)',
+            borderRadius: '0.5rem',
+            color: 'var(--ctp-subtext0)',
+            fontStyle: 'italic',
+            marginBottom: '1rem'
+          }}>
+            {t('statusmessage_config.unsupported', 'Unsupported by device firmware — Requires firmware 2.7.19 or greater')}
+          </div>
+        )}
+        <div style={statusMessageIsDisabled ? { opacity: 0.4, pointerEvents: 'none' } : undefined}>
+          <div className="setting-item">
+            <label>
+              {t('statusmessage_config.node_status', 'Node Status')}
+              <span className="setting-description">
+                {t('statusmessage_config.node_status_description', 'A short status message displayed on the node. Maximum 80 characters.')}
+              </span>
+            </label>
+            <div style={{ position: 'relative' }}>
+              <input
+                type="text"
+                maxLength={80}
+                value={statusMessageNodeStatus}
+                onChange={(e) => onStatusMessageConfigChange('nodeStatus', e.target.value)}
+                disabled={isExecuting || statusMessageIsDisabled}
+                className="setting-input"
+                placeholder={t('statusmessage_config.node_status_placeholder', 'Enter status message...')}
+              />
+              <span style={{
+                position: 'absolute',
+                right: '0.5rem',
+                bottom: '-1.2rem',
+                fontSize: '0.75rem',
+                color: statusMessageNodeStatus.length >= 70 ? 'var(--ctp-peach)' : 'var(--ctp-subtext0)'
+              }}>
+                {statusMessageNodeStatus.length}/80
+              </span>
+            </div>
+          </div>
+          <button
+            className="save-button"
+            onClick={onSaveStatusMessageConfig}
+            disabled={isExecuting || selectedNodeNum === null || statusMessageIsDisabled}
+            style={{
+              marginTop: '1.5rem',
+              opacity: (isExecuting || selectedNodeNum === null || statusMessageIsDisabled) ? 0.5 : 1,
+              cursor: (isExecuting || selectedNodeNum === null || statusMessageIsDisabled) ? 'not-allowed' : 'pointer'
+            }}
+          >
+            {isExecuting ? t('common.saving') : t('statusmessage_config.save_button', 'Save Status Message Config')}
+          </button>
+        </div>
+      </CollapsibleSection>
+
+      {/* Traffic Management Config Section */}
+      <CollapsibleSection
+        id="admin-trafficmanagement-config"
+        title={t('trafficmanagement_config.title', 'Traffic Management')}
+        nested={true}
+        headerActions={trafficManagementHeaderActions}
+      >
+        {trafficManagementIsDisabled && (
+          <div style={{
+            padding: '1rem',
+            backgroundColor: 'var(--ctp-surface0)',
+            borderRadius: '0.5rem',
+            color: 'var(--ctp-subtext0)',
+            fontStyle: 'italic',
+            marginBottom: '1rem'
+          }}>
+            {t('trafficmanagement_config.unsupported', 'Unsupported by device firmware — Not yet available in any firmware release')}
+          </div>
+        )}
+        <div style={trafficManagementIsDisabled ? { opacity: 0.4, pointerEvents: 'none' } : undefined}>
+          <div className="setting-item">
+            <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+              <input
+                type="checkbox"
+                checked={trafficManagementEnabled}
+                onChange={(e) => onTrafficManagementConfigChange('enabled', e.target.checked)}
+                disabled={isExecuting || trafficManagementIsDisabled}
+                style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+              />
+              <div style={{ flex: 1 }}>
+                <div>{t('trafficmanagement_config.enabled', 'Enable Traffic Management')}</div>
+                <span className="setting-description">{t('trafficmanagement_config.enabled_description', 'Enable traffic management features to control mesh network traffic')}</span>
+              </div>
+            </label>
+          </div>
+
+          {(trafficManagementEnabled || trafficManagementIsDisabled) && (
+            <>
+              {/* Position Dedup */}
+              <div style={{ marginLeft: '1rem', paddingLeft: '1rem', borderLeft: '2px solid var(--ctp-surface1)', marginBottom: '0.5rem' }}>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--ctp-text)', marginBottom: '0.5rem' }}>{t('trafficmanagement_config.position_dedup', 'Position Deduplication')}</div>
+                <div className="setting-item">
+                  <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input type="checkbox" checked={trafficManagementPositionDedupEnabled} onChange={(e) => onTrafficManagementConfigChange('positionDedupEnabled', e.target.checked)} disabled={isExecuting || trafficManagementIsDisabled} style={{ width: 'auto', margin: 0, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}><div>{t('trafficmanagement_config.position_dedup_enabled', 'Enable')}</div></div>
+                  </label>
+                </div>
+                {(trafficManagementPositionDedupEnabled || trafficManagementIsDisabled) && (
+                  <>
+                    <div className="setting-item">
+                      <label>{t('trafficmanagement_config.position_dedup_time', 'Time Window (seconds)')}</label>
+                      <input type="number" min="0" value={trafficManagementPositionDedupTimeSecs} onChange={(e) => onTrafficManagementConfigChange('positionDedupTimeSecs', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                    </div>
+                    <div className="setting-item">
+                      <label>{t('trafficmanagement_config.position_dedup_distance', 'Distance Threshold (meters)')}</label>
+                      <input type="number" min="0" value={trafficManagementPositionDedupDistanceMeters} onChange={(e) => onTrafficManagementConfigChange('positionDedupDistanceMeters', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* NodeInfo Direct Response */}
+              <div style={{ marginLeft: '1rem', paddingLeft: '1rem', borderLeft: '2px solid var(--ctp-surface1)', marginBottom: '0.5rem' }}>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--ctp-text)', marginBottom: '0.5rem' }}>{t('trafficmanagement_config.nodeinfo_direct_response', 'NodeInfo Direct Response')}</div>
+                <div className="setting-item">
+                  <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input type="checkbox" checked={trafficManagementNodeinfoDirectResponseEnabled} onChange={(e) => onTrafficManagementConfigChange('nodeinfoDirectResponseEnabled', e.target.checked)} disabled={isExecuting || trafficManagementIsDisabled} style={{ width: 'auto', margin: 0, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}><div>{t('trafficmanagement_config.nodeinfo_direct_response_enabled', 'Enable')}</div></div>
+                  </label>
+                </div>
+                {(trafficManagementNodeinfoDirectResponseEnabled || trafficManagementIsDisabled) && (
+                  <div className="setting-item">
+                    <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                      <input type="checkbox" checked={trafficManagementNodeinfoDirectResponseMyNodeOnly} onChange={(e) => onTrafficManagementConfigChange('nodeinfoDirectResponseMyNodeOnly', e.target.checked)} disabled={isExecuting || trafficManagementIsDisabled} style={{ width: 'auto', margin: 0, flexShrink: 0 }} />
+                      <div style={{ flex: 1 }}><div>{t('trafficmanagement_config.nodeinfo_my_node_only', 'My Node Only')}</div></div>
+                    </label>
+                  </div>
+                )}
+              </div>
+
+              {/* Rate Limiting */}
+              <div style={{ marginLeft: '1rem', paddingLeft: '1rem', borderLeft: '2px solid var(--ctp-surface1)', marginBottom: '0.5rem' }}>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--ctp-text)', marginBottom: '0.5rem' }}>{t('trafficmanagement_config.rate_limiting', 'Rate Limiting')}</div>
+                <div className="setting-item">
+                  <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input type="checkbox" checked={trafficManagementRateLimitEnabled} onChange={(e) => onTrafficManagementConfigChange('rateLimitEnabled', e.target.checked)} disabled={isExecuting || trafficManagementIsDisabled} style={{ width: 'auto', margin: 0, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}><div>{t('trafficmanagement_config.rate_limit_enabled', 'Enable')}</div></div>
+                  </label>
+                </div>
+                {(trafficManagementRateLimitEnabled || trafficManagementIsDisabled) && (
+                  <>
+                    <div className="setting-item">
+                      <label>{t('trafficmanagement_config.rate_limit_max', 'Max Packets Per Node')}</label>
+                      <input type="number" min="0" value={trafficManagementRateLimitMaxPerNode} onChange={(e) => onTrafficManagementConfigChange('rateLimitMaxPerNode', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                    </div>
+                    <div className="setting-item">
+                      <label>{t('trafficmanagement_config.rate_limit_window', 'Window (seconds)')}</label>
+                      <input type="number" min="0" value={trafficManagementRateLimitWindowSecs} onChange={(e) => onTrafficManagementConfigChange('rateLimitWindowSecs', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Unknown Packet Drop */}
+              <div style={{ marginLeft: '1rem', paddingLeft: '1rem', borderLeft: '2px solid var(--ctp-surface1)', marginBottom: '0.5rem' }}>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--ctp-text)', marginBottom: '0.5rem' }}>{t('trafficmanagement_config.unknown_packet_drop', 'Unknown Packet Drop')}</div>
+                <div className="setting-item">
+                  <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input type="checkbox" checked={trafficManagementUnknownPacketDropEnabled} onChange={(e) => onTrafficManagementConfigChange('unknownPacketDropEnabled', e.target.checked)} disabled={isExecuting || trafficManagementIsDisabled} style={{ width: 'auto', margin: 0, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}><div>{t('trafficmanagement_config.unknown_packet_drop_enabled', 'Enable')}</div></div>
+                  </label>
+                </div>
+                {(trafficManagementUnknownPacketDropEnabled || trafficManagementIsDisabled) && (
+                  <div className="setting-item">
+                    <label>{t('trafficmanagement_config.unknown_packet_grace_period', 'Grace Period (seconds)')}</label>
+                    <input type="number" min="0" value={trafficManagementUnknownPacketGracePeriodSecs} onChange={(e) => onTrafficManagementConfigChange('unknownPacketGracePeriodSecs', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                  </div>
+                )}
+              </div>
+
+              {/* Hop Exhaustion */}
+              <div style={{ marginLeft: '1rem', paddingLeft: '1rem', borderLeft: '2px solid var(--ctp-surface1)', marginBottom: '0.5rem' }}>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--ctp-text)', marginBottom: '0.5rem' }}>{t('trafficmanagement_config.hop_exhaustion', 'Hop Exhaustion')}</div>
+                <div className="setting-item">
+                  <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input type="checkbox" checked={trafficManagementHopExhaustionEnabled} onChange={(e) => onTrafficManagementConfigChange('hopExhaustionEnabled', e.target.checked)} disabled={isExecuting || trafficManagementIsDisabled} style={{ width: 'auto', margin: 0, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}><div>{t('trafficmanagement_config.hop_exhaustion_enabled', 'Enable')}</div></div>
+                  </label>
+                </div>
+                {(trafficManagementHopExhaustionEnabled || trafficManagementIsDisabled) && (
+                  <>
+                    <div className="setting-item">
+                      <label>{t('trafficmanagement_config.hop_exhaustion_min', 'Minimum Hops')}</label>
+                      <input type="number" min="0" max="7" value={trafficManagementHopExhaustionMinHops} onChange={(e) => onTrafficManagementConfigChange('hopExhaustionMinHops', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                    </div>
+                    <div className="setting-item">
+                      <label>{t('trafficmanagement_config.hop_exhaustion_max', 'Maximum Hops')}</label>
+                      <input type="number" min="0" max="7" value={trafficManagementHopExhaustionMaxHops} onChange={(e) => onTrafficManagementConfigChange('hopExhaustionMaxHops', parseInt(e.target.value) || 0)} disabled={isExecuting || trafficManagementIsDisabled} className="setting-input" />
+                    </div>
+                  </>
+                )}
+              </div>
+            </>
+          )}
+
+          <button
+            className="save-button"
+            onClick={onSaveTrafficManagementConfig}
+            disabled={isExecuting || selectedNodeNum === null || trafficManagementIsDisabled}
+            style={{
+              marginTop: '1rem',
+              opacity: (isExecuting || selectedNodeNum === null || trafficManagementIsDisabled) ? 0.5 : 1,
+              cursor: (isExecuting || selectedNodeNum === null || trafficManagementIsDisabled) ? 'not-allowed' : 'pointer'
+            }}
+          >
+            {isExecuting ? t('common.saving') : t('trafficmanagement_config.save_button', 'Save Traffic Management Config')}
+          </button>
+        </div>
       </CollapsibleSection>
     </CollapsibleSection>
   );

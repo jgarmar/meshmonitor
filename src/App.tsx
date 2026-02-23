@@ -19,6 +19,7 @@ import Dashboard from './components/Dashboard';
 import NodesTab from './components/NodesTab';
 import MessagesTab from './components/MessagesTab';
 import ChannelsTab from './components/ChannelsTab';
+import { MeshCoreTab } from './components/MeshCore';
 import AutoAcknowledgeSection from './components/AutoAcknowledgeSection';
 import AutoTracerouteSection from './components/AutoTracerouteSection';
 import AutoAnnounceSection from './components/AutoAnnounceSection';
@@ -28,6 +29,9 @@ import AutoKeyManagementSection from './components/AutoKeyManagementSection';
 import TimerTriggersSection from './components/TimerTriggersSection';
 import GeofenceTriggersSection from './components/GeofenceTriggersSection';
 import RemoteAdminScannerSection from './components/RemoteAdminScannerSection';
+import AutoTimeSyncSection from './components/AutoTimeSyncSection';
+import AutoPingSection from './components/AutoPingSection';
+import IgnoredNodesSection from './components/IgnoredNodesSection';
 import SectionNav from './components/SectionNav';
 import { ToastProvider, useToast } from './components/ToastContainer';
 import { RebootModal } from './components/RebootModal';
@@ -35,6 +39,7 @@ import { AppBanners } from './components/AppBanners';
 import { AppHeader } from './components/AppHeader';
 import { PurgeDataModal } from './components/PurgeDataModal';
 import { PositionOverrideModal } from './components/PositionOverrideModal';
+import { NodeInfoModal } from './components/NodeInfoModal/NodeInfoModal';
 import { SystemStatusModal } from './components/SystemStatusModal';
 import { NodePopup } from './components/NodePopup';
 import { EmojiPickerModal } from './components/EmojiPickerModal';
@@ -95,7 +100,7 @@ L.Icon.Default.mergeOptions({
 
 function App() {
   const { t } = useTranslation();
-  const { authStatus, hasPermission } = useAuth();
+  const { authStatus, hasPermission, loading: authLoading } = useAuth();
   const { getToken: getCsrfToken, refreshToken: refreshCsrfToken } = useCsrf();
   const webSocketConnected = useWebSocketConnected();
   const { showToast } = useToast();
@@ -126,6 +131,14 @@ function App() {
   const [showNewsPopup, setShowNewsPopup] = useState(false);
   const [forceShowAllNews, setForceShowAllNews] = useState(false);
   const [showPositionOverrideModal, setShowPositionOverrideModal] = useState(false);
+  const [showNodeInfoModal, setShowNodeInfoModal] = useState(false);
+  const [nodeConnectionInfo, setNodeConnectionInfo] = useState<{
+    nodeIp: string;
+    tcpPort: number;
+    defaultIp: string;
+    defaultPort: number;
+    isOverridden: boolean;
+  } | null>(null);
   const [selectedRouteSegment, setSelectedRouteSegment] = useState<{ nodeNum1: number; nodeNum2: number } | null>(null);
   const [emojiPickerMessage, setEmojiPickerMessage] = useState<MeshMessage | null>(null);
 
@@ -171,6 +184,7 @@ function App() {
       minHops: 0,
       maxHops: 10,
       showPKI: false,
+      showRemoteAdmin: false,
       showUnknown: false,
       showIgnored: false,
       deviceRoles: [] as number[], // Empty array means show all roles
@@ -266,6 +280,8 @@ function App() {
     setTracerouteIntervalMinutes,
     setTemperatureUnit,
     setDistanceUnit,
+    positionHistoryLineStyle,
+    setPositionHistoryLineStyle,
     setTelemetryVisualizationHours,
     setFavoriteTelemetryStorageDays,
     setPreferredSortField,
@@ -478,6 +494,20 @@ function App() {
     setAutoAckTapbackEnabled,
     autoAckReplyEnabled,
     setAutoAckReplyEnabled,
+    autoAckDirectEnabled,
+    setAutoAckDirectEnabled,
+    autoAckDirectTapbackEnabled,
+    setAutoAckDirectTapbackEnabled,
+    autoAckDirectReplyEnabled,
+    setAutoAckDirectReplyEnabled,
+    autoAckMultihopEnabled,
+    setAutoAckMultihopEnabled,
+    autoAckMultihopTapbackEnabled,
+    setAutoAckMultihopTapbackEnabled,
+    autoAckMultihopReplyEnabled,
+    setAutoAckMultihopReplyEnabled,
+    autoAckTestMessages,
+    setAutoAckTestMessages,
     autoAnnounceEnabled,
     setAutoAnnounceEnabled,
     autoAnnounceIntervalHours,
@@ -535,6 +565,12 @@ function App() {
   // Check tab permissions and redirect if unauthorized
   // This prevents users from accessing protected tabs via direct URL navigation
   useEffect(() => {
+    // Wait for auth to finish loading before checking permissions
+    // This prevents false redirects when navigating via URL hash
+    if (authLoading) {
+      return;
+    }
+
     const isAdmin = authStatus?.user?.isAdmin || false;
     const isAuthenticated = authStatus?.authenticated || false;
 
@@ -557,7 +593,7 @@ function App() {
       logger.info(`[Auth] Redirecting from '${activeTab}' tab - insufficient permissions`);
       setActiveTab('nodes');
     }
-  }, [activeTab, authStatus, hasPermission, setActiveTab]);
+  }, [activeTab, authStatus, authLoading, hasPermission, setActiveTab]);
 
   // Helper function to safely parse node IDs to node numbers
   const parseNodeId = useCallback((nodeId: string): number => {
@@ -926,6 +962,30 @@ function App() {
 
           if (settings.autoAckReplyEnabled !== undefined) {
             setAutoAckReplyEnabled(settings.autoAckReplyEnabled !== 'false'); // Default true for backward compatibility
+          }
+
+          // New direct/multihop settings
+          if (settings.autoAckDirectEnabled !== undefined) {
+            setAutoAckDirectEnabled(settings.autoAckDirectEnabled !== 'false');
+          }
+          if (settings.autoAckDirectTapbackEnabled !== undefined) {
+            setAutoAckDirectTapbackEnabled(settings.autoAckDirectTapbackEnabled !== 'false');
+          }
+          if (settings.autoAckDirectReplyEnabled !== undefined) {
+            setAutoAckDirectReplyEnabled(settings.autoAckDirectReplyEnabled !== 'false');
+          }
+          if (settings.autoAckMultihopEnabled !== undefined) {
+            setAutoAckMultihopEnabled(settings.autoAckMultihopEnabled !== 'false');
+          }
+          if (settings.autoAckMultihopTapbackEnabled !== undefined) {
+            setAutoAckMultihopTapbackEnabled(settings.autoAckMultihopTapbackEnabled !== 'false');
+          }
+          if (settings.autoAckMultihopReplyEnabled !== undefined) {
+            setAutoAckMultihopReplyEnabled(settings.autoAckMultihopReplyEnabled !== 'false');
+          }
+
+          if (settings.autoAckTestMessages) {
+            setAutoAckTestMessages(settings.autoAckTestMessages);
           }
 
           if (settings.autoAnnounceEnabled !== undefined) {
@@ -1830,15 +1890,21 @@ function App() {
   }, [connectionStatus]);
 
   // Timer to update message status indicators (timeout detection after 30s)
+  // Only runs when on channels/messages tabs to reduce CPU usage on mobile (#1769)
   const [, setStatusTick] = useState(0);
   useEffect(() => {
+    // Only run timer when viewing messaging tabs where status indicators are visible
+    if (activeTab !== 'channels' && activeTab !== 'messages') {
+      return;
+    }
+
     const interval = setInterval(() => {
       // Force re-render to update message status indicators
       setStatusTick(prev => prev + 1);
-    }, 1000); // Update every second
+    }, 5000); // Update every 5 seconds (reduced from 1s for mobile performance)
 
     return () => clearInterval(interval);
-  }, []);
+  }, [activeTab]);
 
   const requestFullNodeDatabase = async () => {
     try {
@@ -2452,6 +2518,43 @@ function App() {
       logger.error('Failed to reconnect:', error);
       setConnectionStatus('user-disconnected');
       showToast(t('toast.failed_reconnect'), 'error');
+    }
+  };
+
+  // Handler to open node info modal and fetch connection info
+  const handleNodeClick = async () => {
+    if (authStatus?.authenticated) {
+      try {
+        const info = await api.getConnectionInfo();
+        setNodeConnectionInfo({
+          nodeIp: info.nodeIp,
+          tcpPort: info.tcpPort,
+          defaultIp: info.defaultIp,
+          defaultPort: info.defaultPort,
+          isOverridden: info.isOverridden
+        });
+        setShowNodeInfoModal(true);
+      } catch (error) {
+        logger.error('Failed to get connection info:', error);
+        showToast(t('toast.failed_connection_info'), 'error');
+      }
+    }
+  };
+
+  // Handler to change node IP/address
+  const handleChangeNodeIp = async (newAddress: string) => {
+    try {
+      await api.configureConnection(newAddress);
+      // Show success message and reload page to get fresh data from new node
+      showToast(t('node_info.success'), 'success');
+      setShowNodeInfoModal(false);
+      // Reload page after a short delay to allow toast to be seen
+      setTimeout(() => {
+        window.location.reload();
+      }, 1500);
+    } catch (error) {
+      logger.error('Failed to configure connection:', error);
+      throw error; // Re-throw so the modal can display the error
     }
   };
 
@@ -3384,7 +3487,7 @@ function App() {
 
   const getNodeShortName = (nodeId: string): string => {
     const node = nodes.find(n => n.user?.id === nodeId);
-    return (node?.user?.shortName && node.user.shortName.trim()) || nodeId.substring(1, 5);
+    return (node?.user?.shortName && node.user.shortName.trim()) || nodeId.slice(-4);
   };
 
   const getAvailableChannels = (): number[] => {
@@ -3496,7 +3599,9 @@ function App() {
   const processedNodes = useMemo((): DeviceInfo[] => {
     const cutoffTime = Date.now() / 1000 - maxNodeAgeHours * 60 * 60;
 
+    // Age filter (favorites are always visible)
     const ageFiltered = nodes.filter(node => {
+      if (node.isFavorite) return true;
       if (!node.lastHeard) return false;
       return node.lastHeard >= cutoffTime;
     });
@@ -3561,6 +3666,13 @@ function App() {
       // PKI filter
       if (nodeFilters.showPKI) {
         const matches = nodeId && nodesWithPKC.has(nodeId);
+        if (isShowMode && !matches) return false;
+        if (!isShowMode && matches) return false;
+      }
+
+      // Remote Admin filter
+      if (nodeFilters.showRemoteAdmin) {
+        const matches = !!node.hasRemoteAdmin;
         if (isShowMode && !matches) return false;
         if (!isShowMode && matches) return false;
       }
@@ -3631,8 +3743,9 @@ function App() {
 
   // Function to center map on a specific node
   const centerMapOnNode = useCallback((node: DeviceInfo) => {
-    if (node.position && node.position.latitude != null && node.position.longitude != null) {
-      setMapCenterTarget([node.position.latitude, node.position.longitude]);
+    const effectivePos = getEffectivePosition(node);
+    if (effectivePos.latitude != null && effectivePos.longitude != null) {
+      setMapCenterTarget([effectivePos.latitude, effectivePos.longitude]);
     }
   }, []);
 
@@ -3810,15 +3923,16 @@ function App() {
   const handleSenderClick = useCallback((nodeId: string, event: React.MouseEvent) => {
     const rect = event.currentTarget.getBoundingClientRect();
 
-    // Get sidebar width from CSS variable to avoid overlap
-    const sidebarWidth = parseInt(
-      getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width') || '60px'
-    );
+    // Get actual sidebar width from the sidebar element itself
+    // This handles expanded sidebar (240px) and calc() with safe-area-inset
+    const sidebarElement = document.querySelector('.sidebar');
+    const sidebarWidth = sidebarElement ? sidebarElement.getBoundingClientRect().width : 60;
 
-    // Popup max-width is 280px, and it's centered with translateX(-50%)
-    // So the left edge will be at x - 140px
-    const popupHalfWidth = 140;
+    // Popup max-width is 300px, and it's centered with translateX(-50%)
+    // So the left edge will be at x - 150px
+    const popupHalfWidth = 150;
     let x = rect.left + rect.width / 2;
+    let y = rect.top;
 
     // Ensure popup doesn't go under the sidebar (with 10px padding for safety)
     const minX = sidebarWidth + popupHalfWidth + 10;
@@ -3826,11 +3940,24 @@ function App() {
       x = minX;
     }
 
+    // Ensure popup doesn't go off the right edge of the screen
+    const maxX = window.innerWidth - popupHalfWidth - 10;
+    if (x > maxX) {
+      x = maxX;
+    }
+
+    // Ensure popup doesn't go above the viewport (popup appears above click point)
+    // Popup is approximately 300px tall max, and uses translateY(-100%)
+    const minY = 320; // Approximate popup height + padding
+    if (y < minY) {
+      y = minY;
+    }
+
     setNodePopup({
       nodeId,
       position: {
         x,
-        y: rect.top,
+        y,
       },
     });
   }, []);
@@ -3979,6 +4106,7 @@ function App() {
         onReconnect={handleReconnect}
         onShowLoginModal={() => setShowLoginModal(true)}
         onLogout={() => setActiveTab('nodes')}
+        onNodeClick={handleNodeClick}
       />
 
       <AppBanners
@@ -4039,6 +4167,23 @@ function App() {
         baseUrl={baseUrl}
       />
 
+      <NodeInfoModal
+        isOpen={showNodeInfoModal}
+        onClose={() => setShowNodeInfoModal(false)}
+        nodeInfo={deviceInfo?.localNodeInfo ? {
+          longName: deviceInfo.localNodeInfo.longName,
+          shortName: deviceInfo.localNodeInfo.shortName,
+          nodeId: deviceInfo.localNodeInfo.nodeId
+        } : null}
+        nodeIp={nodeConnectionInfo?.nodeIp || nodeAddress}
+        tcpPort={nodeConnectionInfo?.tcpPort || 4403}
+        defaultIp={nodeConnectionInfo?.defaultIp || ''}
+        defaultPort={nodeConnectionInfo?.defaultPort || 4403}
+        isOverridden={nodeConnectionInfo?.isOverridden || false}
+        isAdmin={authStatus?.user?.isAdmin || false}
+        onChangeIp={handleChangeNodeIp}
+      />
+
       {selectedRouteSegment && (
         <RouteSegmentTraceroutesModal
           nodeNum1={selectedRouteSegment.nodeNum1}
@@ -4093,6 +4238,7 @@ function App() {
         }}
         baseUrl={baseUrl}
         connectedNodeName={connectedNodeName}
+        meshcoreEnabled={authStatus?.meshcoreEnabled || false}
       />
 
       <main className="app-main">
@@ -4125,6 +4271,9 @@ function App() {
             visibleNodeNums={visibleNodeNums}
             tracerouteNodeNums={tracerouteNodeNums}
             tracerouteBounds={tracerouteBounds}
+            onTraceroute={handleTraceroute}
+            connectionStatus={connectionStatus}
+            tracerouteLoading={tracerouteLoading}
           />
         )}
         {activeTab === 'channels' && (
@@ -4279,6 +4428,7 @@ function App() {
             inactiveNodeCooldownHours={inactiveNodeCooldownHours}
             temperatureUnit={temperatureUnit}
             distanceUnit={distanceUnit}
+            positionHistoryLineStyle={positionHistoryLineStyle}
             telemetryVisualizationHours={telemetryVisualizationHours}
             favoriteTelemetryStorageDays={favoriteTelemetryStorageDays}
             preferredSortField={preferredSortField}
@@ -4303,6 +4453,7 @@ function App() {
             onInactiveNodeCooldownHoursChange={setInactiveNodeCooldownHours}
             onTemperatureUnitChange={setTemperatureUnit}
             onDistanceUnitChange={setDistanceUnit}
+            onPositionHistoryLineStyleChange={setPositionHistoryLineStyle}
             onTelemetryVisualizationChange={setTelemetryVisualizationHours}
             onFavoriteTelemetryStorageDaysChange={setFavoriteTelemetryStorageDays}
             onPreferredSortFieldChange={setPreferredSortField}
@@ -4326,13 +4477,16 @@ function App() {
               items={[
                 { id: 'auto-welcome', label: t('automation.welcome.title', 'Auto Welcome') },
                 { id: 'auto-traceroute', label: t('automation.traceroute.title', 'Auto Traceroute') },
+                { id: 'auto-ping', label: t('automation.auto_ping.title', 'Auto Ping') },
                 { id: 'remote-admin-scanner', label: t('automation.remote_admin_scanner.title', 'Remote Admin Scanner') },
+                { id: 'auto-time-sync', label: t('automation.time_sync.title', 'Auto Time Sync') },
                 { id: 'auto-acknowledge', label: t('automation.acknowledge.title', 'Auto Acknowledge') },
                 { id: 'auto-announce', label: t('automation.announce.title', 'Auto Announce') },
                 { id: 'auto-responder', label: t('automation.auto_responder.title', 'Auto Responder') },
                 { id: 'auto-key-management', label: t('automation.auto_key_management.title', 'Auto Key Management') },
                 { id: 'timer-triggers', label: t('automation.timer_triggers.title', 'Timer Triggers') },
                 { id: 'geofence-triggers', label: t('automation.geofence_triggers.title', 'Geofence Triggers') },
+                { id: 'ignored-nodes', label: t('automation.ignored_nodes.title', 'Ignored Nodes') },
               ]}
             />
             <div className="settings-content">
@@ -4359,8 +4513,18 @@ function App() {
                   onIntervalChange={setTracerouteIntervalMinutes}
                 />
               </div>
+              <div id="auto-ping">
+                <AutoPingSection
+                  baseUrl={baseUrl}
+                />
+              </div>
               <div id="remote-admin-scanner">
                 <RemoteAdminScannerSection
+                  baseUrl={baseUrl}
+                />
+              </div>
+              <div id="auto-time-sync">
+                <AutoTimeSyncSection
                   baseUrl={baseUrl}
                 />
               </div>
@@ -4377,6 +4541,13 @@ function App() {
                   skipIncompleteNodes={autoAckSkipIncompleteNodes}
                   tapbackEnabled={autoAckTapbackEnabled}
                   replyEnabled={autoAckReplyEnabled}
+                  directEnabled={autoAckDirectEnabled}
+                  directTapbackEnabled={autoAckDirectTapbackEnabled}
+                  directReplyEnabled={autoAckDirectReplyEnabled}
+                  multihopEnabled={autoAckMultihopEnabled}
+                  multihopTapbackEnabled={autoAckMultihopTapbackEnabled}
+                  multihopReplyEnabled={autoAckMultihopReplyEnabled}
+                  testMessages={autoAckTestMessages}
                   baseUrl={baseUrl}
                   onEnabledChange={setAutoAckEnabled}
                   onRegexChange={setAutoAckRegex}
@@ -4388,6 +4559,13 @@ function App() {
                   onSkipIncompleteNodesChange={setAutoAckSkipIncompleteNodes}
                   onTapbackEnabledChange={setAutoAckTapbackEnabled}
                   onReplyEnabledChange={setAutoAckReplyEnabled}
+                  onDirectEnabledChange={setAutoAckDirectEnabled}
+                  onDirectTapbackEnabledChange={setAutoAckDirectTapbackEnabled}
+                  onDirectReplyEnabledChange={setAutoAckDirectReplyEnabled}
+                  onMultihopEnabledChange={setAutoAckMultihopEnabled}
+                  onMultihopTapbackEnabledChange={setAutoAckMultihopTapbackEnabled}
+                  onMultihopReplyEnabledChange={setAutoAckMultihopReplyEnabled}
+                  onTestMessagesChange={setAutoAckTestMessages}
                 />
               </div>
               <div id="auto-announce">
@@ -4458,6 +4636,11 @@ function App() {
                   onTriggersChange={setGeofenceTriggers}
                 />
               </div>
+              <div id="ignored-nodes">
+                <IgnoredNodesSection
+                  baseUrl={baseUrl}
+                />
+              </div>
             </div>
           </div>
         )}
@@ -4486,6 +4669,7 @@ function App() {
         {activeTab === 'security' && (
           <SecurityTab onTabChange={setActiveTab} onSelectDMNode={setSelectedDMNode} setNewMessage={setNewMessage} />
         )}
+        {activeTab === 'meshcore' && <MeshCoreTab baseUrl={baseUrl} />}
       </main>
 
       {/* Node Popup */}
@@ -4510,6 +4694,9 @@ function App() {
         traceroutes={traceroutes}
         currentNodeId={currentNodeId}
         distanceUnit={distanceUnit}
+        onTraceroute={handleTraceroute}
+        connectionStatus={connectionStatus}
+        tracerouteLoading={tracerouteLoading}
       />
 
       {/* News Popup */}

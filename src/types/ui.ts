@@ -12,7 +12,8 @@ export type TabType =
   | 'audit'
   | 'security'
   | 'themes'
-  | 'admin';
+  | 'admin'
+  | 'meshcore';
 
 export type SortField = 'longName' | 'shortName' | 'id' | 'lastHeard' | 'snr' | 'battery' | 'hwModel' | 'hops';
 
@@ -82,6 +83,7 @@ export interface NodeFilters {
   minHops: number;
   maxHops: number;
   showPKI: boolean;
+  showRemoteAdmin: boolean;
   showUnknown: boolean;
   showIgnored: boolean;
   deviceRoles: number[];
@@ -103,6 +105,7 @@ export interface NewsItem {
   date: string;
   category: 'release' | 'security' | 'feature' | 'maintenance';
   priority: 'normal' | 'important';
+  minVersion?: string;
 }
 
 /**

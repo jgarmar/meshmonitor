@@ -1,8 +1,8 @@
-import databaseService, { DbPacketLog } from '../../services/database.js';
+import databaseService, { DbPacketLog, DbPacketCountByNode, DbPacketCountByPortnum } from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
 
 class PacketLogService {
-  private cleanupInterval: NodeJS.Timeout | null = null;
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
   private readonly CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 
   constructor() {
@@ -152,6 +152,20 @@ class PacketLogService {
   getMaxAgeHours(): number {
     const maxAgeStr = databaseService.getSetting('packet_log_max_age_hours');
     return maxAgeStr ? parseInt(maxAgeStr, 10) : 24;
+  }
+
+  /**
+   * Get packet counts grouped by node (for distribution charts)
+   */
+  async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number }): Promise<DbPacketCountByNode[]> {
+    return databaseService.getPacketCountsByNodeAsync(options);
+  }
+
+  /**
+   * Get packet counts grouped by portnum (for distribution charts)
+   */
+  async getPacketCountsByPortnumAsync(options?: { since?: number; from_node?: number }): Promise<DbPacketCountByPortnum[]> {
+    return databaseService.getPacketCountsByPortnumAsync(options);
   }
 
   /**

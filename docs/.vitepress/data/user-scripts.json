@@ -365,10 +365,10 @@
     "name": "Sky and Sea Alert",
     "filename": "sky_and_sea_alert.py",
     "icon": "✈️",
-    "description": "Lightweight proximity alert system for aircraft and vessels using free public ADS-B and AIS APIs. Features emoji-based notifications, configurable geofencing, built-in deduplication, and KISS design philosophy.",
+    "description": "A script that delivers simple, emoji-based alerts when aircraft fly overhead or vessels pass nearby, using local ADS-B/AIS receivers or official cloud APIs.",
     "language": "Python",
     "tags": ["Aircraft", "Marine", "ADS-B", "AIS", "Geofencing", "Proximity", "Tracking", "Situational Awareness"],
-    "githubPath": "maxhayim/sky-and-sea-alert/sky_and_sea_alert.py",
+    "githubPath": "maxhayim/meshmonitor-skyandsea-alert/sky_and_sea_alert.py",
     "exampleTrigger": "Timer-based (automatic polling) or manual execution",
     "requirements": [
       "Python 3.8+",
@@ -384,6 +384,143 @@
       "Built-in alert deduplication (suppress repeated alerts)",
       "Environment variable configuration",
       "No external Python dependencies (uses only requests)"
+    ]
+  },
+  {
+    "name": "Remote Admin (Python)",
+    "filename": "remote-admin.py",
+    "icon": "🔧",
+    "description": "Send remote admin commands to Meshtastic nodes via the CLI. Designed for Geofence triggers but works with any automation. Supports rebooting nodes, changing settings, and more when nodes enter/exit geofences.",
+    "language": "Python",
+    "tags": ["Remote Admin", "Geofence", "CLI", "Automation", "Device Control"],
+    "githubPath": "Yeraze/meshmonitor/examples/auto-responder-scripts/remote-admin.py",
+    "exampleTrigger": "Geofence trigger (entry/exit/while_inside)",
+    "requirements": [
+      "Python 3.6+ (included in MeshMonitor)",
+      "Meshtastic CLI (included in MeshMonitor container)"
+    ],
+    "author": "MeshMonitor",
+    "features": [
+      "Use with Geofence triggers for location-based actions",
+      "Full meshtastic CLI support (--reboot, --set, etc.)",
+      "Uses MESHTASTIC_IP and NODE_ID environment variables",
+      "Create wrapper scripts for specific geofence actions",
+      "JSON output for integration with MeshMonitor"
+    ]
+  },
+  {
+    "name": "Remote Admin (Shell)",
+    "filename": "remote-admin.sh",
+    "icon": "🔧",
+    "description": "Simple shell wrapper for remote admin commands. Pass any meshtastic CLI arguments to control nodes when they enter/exit geofences.",
+    "language": "Shell",
+    "tags": ["Remote Admin", "Geofence", "CLI", "Automation", "Device Control", "Shell"],
+    "githubPath": "Yeraze/meshmonitor/examples/auto-responder-scripts/remote-admin.sh",
+    "exampleTrigger": "Geofence trigger (entry/exit/while_inside)",
+    "requirements": [
+      "BusyBox sh (included in MeshMonitor)",
+      "Meshtastic CLI (included in MeshMonitor container)"
+    ],
+    "author": "MeshMonitor",
+    "features": [
+      "Lightweight shell implementation",
+      "Pass arguments directly to meshtastic CLI",
+      "Uses MESHTASTIC_IP and NODE_ID environment variables",
+      "Easy to create wrapper scripts for specific actions",
+      "JSON output for integration with MeshMonitor"
+    ]
+  },
+  {
+    "name": "MeMon - Network Health Monitor",
+    "filename": "memon.py",
+    "icon": "🌐",
+    "description": "Monitors router and DNS resolver health with intelligent alerting. Supports Auto Responder (on-demand status checks) and Timer Trigger (scheduled monitoring with failure streak tracking, alert backoff, and recovery detection). Prevents alert spam through configurable thresholds.",
+    "language": "Python",
+    "tags": ["Network", "Monitoring", "DNS", "Router", "Health Check", "Auto Responder", "Timer Trigger", "Alerting"],
+    "githubPath": "DagBertelsen/MeMon/memon.py",
+    "exampleTrigger": "netcheck status, netcheck router, netcheck dns",
+    "requirements": [
+      "Python 3.5+ (standard library only, zero external dependencies)",
+      "memon.config.json configuration file (see README for examples)"
+    ],
+    "author": "DagBertelsen",
+    "features": [
+      "Router health checks (HTTPS, HTTP, or TCP socket)",
+      "DNS resolver monitoring with multiple servers",
+      "Failure streak tracking with alert backoff",
+      "Dual mode: Auto Responder (stateless) or Timer Trigger (stateful)",
+      "Recovery detection and notifications",
+      "UTF-8 config with emoji support"
+    ]
+  },
+  {
+    "name": "EQ (Earthquake Alerts)",
+    "filename": "mm_earthquake.py",
+    "icon": "🌎",
+    "description": "Automatically broadcasts USGS earthquake alerts for a configured location using Timer Triggers. Posts bulletins for NEW, UPDATED, and CLEARED alerts with smart deduplication to prevent mesh spam. Supports on-demand commands for earthquake summaries and detailed event info.",
+    "language": "Python",
+    "tags": ["Earthquake", "USGS", "Alerts", "Automation", "Timer Trigger", "GPS"],
+    "gistId": "1a8822b43981cab682c138fc4365cb90",
+    "exampleTrigger": "!eq, !eq detail 1, !eq help",
+    "requirements": [
+      "Python 3.8+",
+      "Internet connection for earthquake.usgs.gov",
+      "Configure EQ_LAT/EQ_LON in script"
+    ],
+    "author": "jeepnjonny",
+    "features": [
+      "Automatic alerts via Timer Triggers",
+      "Smart deduplication (NEW, UPDATED, CLEARED only)",
+      "On-demand earthquake summary queries",
+      "Configurable radius, magnitude threshold, and lookback window",
+      "Lightweight messages optimized for LoRa",
+      "No external dependencies (stdlib only)"
+    ]
+  },
+  {
+    "name": "LLM Bridge",
+    "filename": "mm_llm_bridge.py",
+    "icon": "📡🧠",
+    "description": "Interact with Large Language Models (OpenAI-compatible APIs, OpenClaw, Ollama, etc.) over Meshtastic. Enforces strict Meshtastic-safe response limits and automatically splits long answers to remain within radio constraints.",
+    "language": "Python",
+    "tags": ["AI", "LLM", "Ollama", "OpenAI", "Meshtastic", "Automation"],
+    "githubPath": "maxhayim/meshmonitor-llm-bridge/mm_llm_bridge.py",
+    "exampleTrigger": "!ask What is 5x5?",
+    "requirements": [
+      "Python 3.8+",
+      "Configured LLM endpoint (OpenAI-compatible API or Ollama)",
+      "Auto Responder rule pointing to /data/scripts/mm_llm_bridge.py"
+    ],
+    "author": "maxhayim",
+    "features": [
+      "Supports OpenAI-compatible APIs, OpenClaw, and Ollama",
+      "Automatic response splitting for Meshtastic radio limits",
+      "Configurable triggers (!ask, @claw, @ai)",
+      "HTTP retry logic with configurable timeout",
+      "Environment variable configuration for all settings"
+    ]
+  },
+  {
+    "name": "RayHunter Monitor",
+    "filename": "rayhunter-monitor.py",
+    "icon": "📡",
+    "description": "Monitors an EFF RayHunter device for IMSI catcher / cell-site simulator warnings and broadcasts alerts on the mesh. Polls the current analysis for Low, Medium, and High severity events and formats a concise alert message.",
+    "language": "Python",
+    "tags": ["Security", "Monitoring", "Timer Trigger", "Alerting", "RayHunter", "IMSI Catcher"],
+    "githubPath": "Yeraze/meshmonitor/examples/auto-responder-scripts/rayhunter-monitor.py",
+    "exampleTrigger": "Timer Trigger (e.g. every 5 minutes)",
+    "requirements": [
+      "Python 3.8+ (standard library only, zero external dependencies)",
+      "EFF RayHunter device on the network (default http://192.168.1.1:8080)"
+    ],
+    "author": "MeshMonitor",
+    "features": [
+      "Polls RayHunter current recording for active warnings",
+      "Parses NDJSON analysis reports for Low/Medium/High severity events",
+      "Formatted mesh-friendly alert messages with severity counts",
+      "Silent when no warnings (no unnecessary mesh traffic)",
+      "Configurable RayHunter URL via --url flag or RAYHUNTER_URL env var",
+      "--always-report flag for testing"
     ]
   }
 ]

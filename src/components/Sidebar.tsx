@@ -23,6 +23,7 @@ interface SidebarProps {
   onNewsClick?: () => void;
   baseUrl: string;
   connectedNodeName?: string;
+  meshcoreEnabled?: boolean;
 }
 
 const Sidebar: React.FC<SidebarProps> = ({
@@ -36,7 +37,8 @@ const Sidebar: React.FC<SidebarProps> = ({
   onChannelsClick,
   onNewsClick,
   baseUrl,
-  connectedNodeName
+  connectedNodeName,
+  meshcoreEnabled
 }) => {
   const { t } = useTranslation();
   // Start collapsed (narrow/icon-only) by default for cleaner desktop UI
@@ -72,10 +74,13 @@ const Sidebar: React.FC<SidebarProps> = ({
   React.useEffect(() => {
     const updateSidebarWidth = () => {
       const isMobile = window.matchMedia('(max-width: 768px)').matches;
-      const collapsedWidth = isMobile ? '48px' : '60px';
+      const baseCollapsedWidth = isMobile ? 48 : 60;
+      const baseExpandedWidth = 240;
+      const baseWidth = isCollapsed ? baseCollapsedWidth : baseExpandedWidth;
+      // Use calc() to include safe-area-inset-left for iPhone notch in landscape
       document.documentElement.style.setProperty(
         '--sidebar-width',
-        isCollapsed ? collapsedWidth : '240px'
+        `calc(${baseWidth}px + env(safe-area-inset-left, 0px))`
       );
     };
 
@@ -170,6 +175,9 @@ const Sidebar: React.FC<SidebarProps> = ({
           )}
           {hasPermission('dashboard', 'read') && (
             <NavItem id="dashboard" label={t('nav.dashboard')} icon="📊" />
+          )}
+          {meshcoreEnabled && hasPermission('meshcore', 'read') && (
+            <NavItem id="meshcore" label={t('nav.meshcore', 'MeshCore')} icon="📶" />
           )}
         </div>
 

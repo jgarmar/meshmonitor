@@ -142,6 +142,7 @@ export interface DbTelemetry {
   unit?: string | null;
   createdAt: number;
   packetTimestamp?: number | null;
+  packetId?: number | null;
   channel?: number | null;
   precisionBits?: number | null;
   gpsAccuracy?: number | null;
@@ -275,6 +276,8 @@ export interface DbChannelDatabase {
   pskLength: number; // 16 for AES-128, 32 for AES-256
   description?: string | null;
   isEnabled: boolean;
+  enforceNameValidation: boolean;
+  sortOrder: number; // Order for decryption priority (lower = tried first)
   decryptedPacketCount: number;
   lastDecryptedAt?: number | null;
   createdBy?: number | null;

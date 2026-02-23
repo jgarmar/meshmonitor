@@ -34,6 +34,39 @@
 
 ## Current Sprint
 
+### Script Test Feature (#1748)
+
+**Completed:**
+- [x] Extend `/api/scripts/test` endpoint to support all trigger types (auto-responder, geofence, timer)
+  - Added `triggerType` parameter (default: 'auto-responder' for backward compatibility)
+  - Different environment variables based on trigger type (MESSAGE, GEOFENCE_NAME, TIMER_NAME, etc.)
+  - Parse JSON output to extract `wouldSendMessages` from response/responses fields
+  - Track execution time in milliseconds
+  - Support optional mock node info (nodeNum, shortName, longName, lat, lon)
+  - Script arguments with token expansion
+- [x] Create ScriptTestModal component (`src/components/ScriptTestModal.tsx`)
+  - Modal with mock context form fields per trigger type
+  - Collapsible sections: Console Output, Would Send to Mesh, Environment Variables
+  - Shows execution time and success/error status
+  - Displays extracted parameters for auto-responder
+- [x] Add Test button to TriggerItem component (auto-responder)
+  - Button appears when responseType is 'script'
+  - Opens ScriptTestModal with trigger configuration
+- [x] Add Test button to GeofenceTriggerItem component
+  - Button appears when responseType is 'script'
+  - Includes geofence event type selector (entry/exit/while_inside)
+- [x] Add Test button to TimerTriggerItem component
+  - Button appears when responseType is 'script'
+- [x] Add i18n keys to `public/locales/en.json`
+  - `script_test.*` keys for modal labels, descriptions, and messages
+- [x] Build passes with no TypeScript errors
+- [x] All unit tests pass (2351 passed)
+
+**Summary:**
+Added a "Test" button to script-based automation triggers that executes the script in a sandbox without broadcasting to the mesh. Shows a modal with console output, the messages that would be sent, extracted parameters, and environment variables.
+
+---
+
 ### Remote Admin Telemetry Configuration (#1589)
 
 **Completed:**
@@ -255,20 +288,19 @@ Added 4 new filter options to the Messages page node list, similar to what exist
 
 ### Replace GPL-licensed Session Store (#1177)
 
-**Priority: HIGH** - License compatibility issue
+**Completed:**
+- [x] Write custom SQLite session store using `better-sqlite3` (MIT licensed)
+- [x] Implement express-session Store interface: `get`, `set`, `destroy`, `touch`
+- [x] Add session cleanup for expired sessions
+- [x] Remove `better-sqlite3-session-store` dependency
+- [x] Update `src/server/auth/sessionConfig.ts` to use new store
+- [x] Add multi-backend session stores: PostgreSQL (`connect-pg-simple`), MySQL (`express-mysql-session`)
+- [x] Fix `environment.ts` database type detection to recognize MySQL/MariaDB URLs
+- [x] Create `src/types/express-mysql-session.d.ts` type declaration
+- [x] Delete `src/types/better-sqlite3-session-store.d.ts`
 
-The `better-sqlite3-session-store` package is GPL-3.0-only licensed, which conflicts with MeshMonitor's BSD-3-Clause license. This is actual code being imported and linked, not just data definitions.
-
-**Tasks:**
-- [ ] Write custom SQLite session store using `better-sqlite3` (MIT licensed)
-- [ ] Implement express-session Store interface: `get`, `set`, `destroy`, `touch`
-- [ ] Add session cleanup for expired sessions
-- [ ] Remove `better-sqlite3-session-store` dependency
-- [ ] Update `src/server/auth/sessionConfig.ts` to use new store
-- [ ] Test session persistence across restarts
-- [ ] Run system tests
-
-**Reference:** The existing store is ~72 lines. We already use `better-sqlite3` directly (MIT licensed).
+**Summary:**
+Replaced the GPL-3.0-licensed `better-sqlite3-session-store` with a custom MIT-licensed SQLite session store (`src/server/auth/sqliteSessionStore.ts`). Also added proper session store support for PostgreSQL and MySQL backends, and fixed database URL detection in `environment.ts` to recognize `mysql://` and `mariadb://` URLs.
 
 ---
 

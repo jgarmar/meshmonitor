@@ -3,7 +3,9 @@ import { sql } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import { calculateDistance } from '../utils/distance.js';
+import { isNodeComplete } from '../utils/nodeHelpers.js';
 import { logger } from '../utils/logger.js';
+import { getPortNumName } from '../server/constants/meshtastic.js';
 import { getEnvironmentConfig } from '../server/config/environment.js';
 import { UserModel } from '../server/models/User.js';
 import { PermissionModel } from '../server/models/Permission.js';
@@ -64,6 +66,23 @@ import { migration as packetViaMqttMigration, runMigration057Postgres, runMigrat
 import { migration as transportMechanismMigration, runMigration058Postgres, runMigration058Mysql } from '../server/migrations/058_convert_via_mqtt_to_transport_mechanism.js';
 import { migration as channelDbViewOnMapMigration, runMigration059Postgres, runMigration059Mysql } from '../server/migrations/059_add_channel_database_view_on_map.js';
 import { migration as autoTracerouteEnabledMigration, runMigration060Postgres, runMigration060Mysql } from '../server/migrations/060_add_auto_traceroute_enabled_column.js';
+import { migration as spamDetectionMigration, runMigration061Postgres, runMigration061Mysql } from '../server/migrations/061_add_spam_detection_columns.js';
+import { migration as positionDoublePrecisionMigration, runMigration062Postgres, runMigration062Mysql } from '../server/migrations/062_upgrade_position_precision.js';
+import { migration as positionHistoryHoursMigration, runMigration063Postgres, runMigration063Mysql } from '../server/migrations/063_add_position_history_hours.js';
+import { migration as enforceNameValidationMigration, runMigration064Postgres, runMigration064Mysql } from '../server/migrations/064_add_enforce_name_validation.js';
+import { migration as sortOrderMigration, runMigration065Postgres, runMigration065Mysql } from '../server/migrations/065_add_sortorder_to_channel_database.js';
+import { migration as ignoredNodesMigration, runMigration066Postgres, runMigration066Mysql } from '../server/migrations/066_add_ignored_nodes_table.js';
+import { migration as autoTimeSyncMigration, runMigration067Postgres, runMigration067Mysql } from '../server/migrations/067_add_auto_time_sync.js';
+import { migration as mfaColumnsMigration, runMigration068Postgres, runMigration068Mysql } from '../server/migrations/068_add_mfa_columns.js';
+import { migration as traceroutePositionsMigration, runMigration069Postgres, runMigration069Mysql } from '../server/migrations/069_add_traceroute_positions.js';
+import { migration as meshcoreTablesMigration, runMigration070Postgres as runMigration070MeshcorePostgres, runMigration070Mysql as runMigration070MeshcoreMysql } from '../server/migrations/070_add_meshcore_tables.js';
+import { migration as meshcorePermissionMigration, runMigration071Postgres, runMigration071Mysql } from '../server/migrations/071_add_meshcore_permission.js';
+import { migration as dmUnreadIndexMigration, runMigration072Postgres, runMigration072Mysql } from '../server/migrations/072_add_messages_dm_unread_index.js';
+import { migration as packetIdMigration, runMigration073Postgres, runMigration073Mysql } from '../server/migrations/073_add_packet_id_to_telemetry.js';
+import { migration as showMeshCoreNodesMigration, runMigration074Postgres, runMigration074Mysql } from '../server/migrations/074_add_show_meshcore_nodes_preference.js';
+import { migration as telemetryPacketIdBigintMigration, runMigration075Postgres, runMigration075Mysql } from '../server/migrations/075_upgrade_telemetry_packetid_bigint.js';
+import { migration as accuracyEstimatedPrefsMigration, runMigration076Postgres, runMigration076Mysql } from '../server/migrations/076_add_accuracy_and_estimated_position_prefs.js';
+import { migration as ignoredNodesNodeNumBigintMigration, runMigration077Postgres, runMigration077Mysql } from '../server/migrations/077_upgrade_ignored_nodes_nodenum_bigint.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
 
 // Drizzle ORM imports for dual-database support
@@ -85,6 +104,7 @@ import {
   NotificationsRepository,
   MiscRepository,
   ChannelDatabaseRepository,
+  IgnoredNodesRepository,
 } from '../db/repositories/index.js';
 import type { DatabaseType } from '../db/types.js';
 import { packetLogPostgres, packetLogMysql, packetLogSqlite } from '../db/schema/packets.js';
@@ -202,6 +222,7 @@ export interface DbTelemetry {
   unit?: string;
   createdAt: number;
   packetTimestamp?: number; // Original timestamp from the packet (may be inaccurate if node has wrong time)
+  packetId?: number; // Meshtastic meshPacket.id for deduplication
   // Position precision tracking metadata (Migration 020)
   channel?: number; // Which channel this telemetry came from
   precisionBits?: number; // Position precision bits (for latitude/longitude telemetry)
@@ -287,6 +308,19 @@ export interface DbPacketLog {
   transport_mechanism?: number;
 }
 
+export interface DbPacketCountByNode {
+  from_node: number;
+  from_node_id: string | null;
+  from_node_longName: string | null;
+  count: number;
+}
+
+export interface DbPacketCountByPortnum {
+  portnum: number;
+  portnum_name: string;
+  count: number;
+}
+
 export interface DbCustomTheme {
   id?: number;
   name: string;
@@ -360,6 +394,10 @@ class DatabaseService {
   private _traceroutesCache: DbTraceroute[] = [];
   private _traceroutesByNodesCache: Map<string, DbTraceroute[]> = new Map();
   private cacheInitialized = false;
+
+  // Track nodes that have already had their "new node" notification sent
+  // to avoid duplicate notifications when node data is updated incrementally
+  private newNodeNotifiedSet: Set<number> = new Set();
 
   /**
    * Get the Drizzle database instance for direct access if needed
@@ -445,6 +483,7 @@ class DatabaseService {
   public notificationsRepo: NotificationsRepository | null = null;
   public miscRepo: MiscRepository | null = null;
   public channelDatabaseRepo: ChannelDatabaseRepository | null = null;
+  public ignoredNodesRepo: IgnoredNodesRepository | null = null;
 
   constructor() {
     logger.debug('🔧🔧🔧 DatabaseService constructor called');
@@ -710,6 +749,7 @@ class DatabaseService {
       this.notificationsRepo = new NotificationsRepository(drizzleDb, this.drizzleDbType);
       this.miscRepo = new MiscRepository(drizzleDb, this.drizzleDbType);
       this.channelDatabaseRepo = new ChannelDatabaseRepository(drizzleDb, this.drizzleDbType);
+      this.ignoredNodesRepo = new IgnoredNodesRepository(drizzleDb, this.drizzleDbType);
 
       logger.info('[DatabaseService] Drizzle repositories initialized successfully');
 
@@ -906,6 +946,23 @@ class DatabaseService {
     this.runTransportMechanismMigration();
     this.runChannelDbViewOnMapMigration();
     this.runAutoTracerouteEnabledMigration();
+    this.runSpamDetectionMigration();
+    this.runPositionDoublePrecisionMigration();
+    this.runPositionHistoryHoursMigration();
+    this.runEnforceNameValidationMigration();
+    this.runSortOrderMigration();
+    this.runIgnoredNodesTableMigration();
+    this.runAutoTimeSyncMigration();
+    this.runMfaColumnsMigration();
+    this.runTraceroutePositionsMigration();
+    this.runMeshcoreTablesMigration();
+    this.runMeshcorePermissionMigration();
+    this.runDmUnreadIndexMigration();
+    this.runPacketIdMigration();
+    this.runShowMeshCoreNodesMigration();
+    this.runTelemetryPacketIdBigintMigration();
+    this.runAccuracyEstimatedPrefsMigration();
+    this.runIgnoredNodesNodeNumBigintMigration();
     this.ensureAutomationDefaults();
     this.warmupCaches();
     this.isInitialized = true;
@@ -934,6 +991,13 @@ class DatabaseService {
         autoAckUseDM: 'false',
         autoAckTapbackEnabled: 'false',
         autoAckReplyEnabled: 'true',
+        // New direct/multihop settings - default to true for backward compatibility
+        autoAckDirectEnabled: 'true',
+        autoAckDirectTapbackEnabled: 'true',
+        autoAckDirectReplyEnabled: 'true',
+        autoAckMultihopEnabled: 'true',
+        autoAckMultihopTapbackEnabled: 'true',
+        autoAckMultihopReplyEnabled: 'true',
         autoAnnounceEnabled: 'false',
         autoAnnounceIntervalHours: '6',
         autoAnnounceMessage: 'MeshMonitor {VERSION} online for {DURATION} {FEATURES}',
@@ -942,7 +1006,11 @@ class DatabaseService {
         autoAnnounceUseSchedule: 'false',
         autoAnnounceSchedule: '0 */6 * * *',
         tracerouteIntervalMinutes: '0',
-        autoUpgradeImmediate: 'false'
+        autoUpgradeImmediate: 'false',
+        autoTimeSyncEnabled: 'false',
+        autoTimeSyncIntervalMinutes: '15',
+        autoTimeSyncExpirationHours: '24',
+        autoTimeSyncNodeFilterEnabled: 'false'
       };
 
       Object.entries(automationSettings).forEach(([key, defaultValue]) => {
@@ -2081,19 +2149,341 @@ class DatabaseService {
   private runAutoTracerouteEnabledMigration(): void {
     try {
       const migrationKey = 'migration_060_auto_traceroute_enabled';
-      const migrationCompleted = this.getSetting(migrationKey);
-
-      if (migrationCompleted === 'completed') {
-        logger.debug('✅ Auto traceroute enabled column migration already completed');
-        return;
-      }
-
-      logger.debug('Running migration 060: Add enabled column to auto_traceroute_nodes...');
+      // Always run the migration check - it's idempotent and verifies
+      // the column exists regardless of whether it was previously marked complete.
+      // This guards against edge cases where the setting was marked complete
+      // but the column is actually missing (e.g., restored backups).
       autoTracerouteEnabledMigration.up(this.db);
       this.setSetting(migrationKey, 'completed');
       logger.debug('✅ Auto traceroute enabled column migration completed successfully');
     } catch (error) {
       logger.error('❌ Failed to run auto traceroute enabled column migration:', error);
+      throw error;
+    }
+  }
+
+  private runSpamDetectionMigration(): void {
+    try {
+      const migrationKey = 'migration_061_spam_detection';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Spam detection columns migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 061: Add spam detection columns to nodes...');
+      spamDetectionMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Spam detection columns migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run spam detection columns migration:', error);
+      throw error;
+    }
+  }
+
+  private runPositionDoublePrecisionMigration(): void {
+    try {
+      const migrationKey = 'migration_062_position_double_precision';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Position double precision migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 062: Position double precision (no-op for SQLite)...');
+      positionDoublePrecisionMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Position double precision migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run position double precision migration:', error);
+      throw error;
+    }
+  }
+
+  private runPositionHistoryHoursMigration(): void {
+    try {
+      const migrationKey = 'migration_063_position_history_hours';
+      const migrationCompleted = this.getSetting(migrationKey);
+
+      if (migrationCompleted === 'completed') {
+        logger.debug('✅ Position history hours migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 063: Add position_history_hours column...');
+      positionHistoryHoursMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Position history hours migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run position history hours migration:', error);
+      throw error;
+    }
+  }
+
+  private runEnforceNameValidationMigration(): void {
+    const migrationKey = 'migration_064_enforce_name_validation';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 064 (enforce_name_validation) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 064: Add enforce_name_validation column...');
+      enforceNameValidationMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Enforce name validation migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run enforce name validation migration:', error);
+      throw error;
+    }
+  }
+
+  private runSortOrderMigration(): void {
+    const migrationKey = 'migration_065_sortorder';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 065 (sortOrder) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 065: Add sort_order column...');
+      sortOrderMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Sort order migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run sort order migration:', error);
+      throw error;
+    }
+  }
+
+  private runIgnoredNodesTableMigration(): void {
+    const migrationKey = 'migration_066_ignored_nodes_table';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 066 (ignored_nodes table) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 066: Add ignored_nodes table...');
+      ignoredNodesMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('Migration 066 (ignored_nodes table) completed successfully');
+    } catch (error) {
+      logger.error('Failed to run ignored_nodes table migration:', error);
+      throw error;
+    }
+  }
+
+  private runAutoTimeSyncMigration(): void {
+    const migrationKey = 'migration_067_auto_time_sync';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 067 (auto time sync) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 067: Add auto time sync schema...');
+      autoTimeSyncMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('Migration 067 (auto time sync) completed successfully');
+    } catch (error) {
+      logger.error('Failed to run auto time sync migration:', error);
+      throw error;
+    }
+  }
+
+  private runMfaColumnsMigration(): void {
+    const migrationKey = 'migration_068_mfa_columns';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 068 (MFA columns) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 068: Add MFA columns to users table...');
+      mfaColumnsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('Migration 068 (MFA columns) completed successfully');
+    } catch (error) {
+      logger.error('Failed to run MFA columns migration:', error);
+      throw error;
+    }
+  }
+
+  private runTraceroutePositionsMigration(): void {
+    const migrationKey = 'migration_069_traceroute_positions';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 069 (traceroute positions) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 069: Add position snapshot columns to traceroutes and route_segments...');
+      traceroutePositionsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('Migration 069 (traceroute positions) completed successfully');
+    } catch (error) {
+      logger.error('Failed to run traceroute positions migration:', error);
+      throw error;
+    }
+  }
+
+  private runMeshcoreTablesMigration(): void {
+    const migrationKey = 'migration_070_meshcore_tables';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 070 (meshcore tables) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 070: Add MeshCore tables...');
+      meshcoreTablesMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('MeshCore tables migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run MeshCore tables migration:', error);
+      throw error;
+    }
+  }
+
+  private runMeshcorePermissionMigration(): void {
+    const migrationKey = 'migration_071_meshcore_permission';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 071 (meshcore permission) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 071: Add meshcore permission resource...');
+      meshcorePermissionMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('MeshCore permission migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run MeshCore permission migration:', error);
+      throw error;
+    }
+  }
+
+  private runDmUnreadIndexMigration(): void {
+    const migrationKey = 'migration_072_dm_unread_index';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 072 (DM unread index) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 072: Add DM unread index...');
+      dmUnreadIndexMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('DM unread index migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run DM unread index migration:', error);
+      throw error;
+    }
+  }
+
+  private runPacketIdMigration(): void {
+    const migrationKey = 'migration_073_packet_id_telemetry';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 073 (packetId telemetry) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 073: Add packetId to telemetry...');
+      packetIdMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('PacketId telemetry migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run packetId telemetry migration:', error);
+      throw error;
+    }
+  }
+
+  private runShowMeshCoreNodesMigration(): void {
+    const migrationKey = 'migration_074_show_meshcore_nodes';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 074 (show_meshcore_nodes) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 074: Add show_meshcore_nodes to user_map_preferences...');
+      showMeshCoreNodesMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('show_meshcore_nodes migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run show_meshcore_nodes migration:', error);
+      throw error;
+    }
+  }
+
+  private runTelemetryPacketIdBigintMigration(): void {
+    const migrationKey = 'migration_075_telemetry_packetid_bigint';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 075 (telemetry_packetid_bigint) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 075: Upgrade telemetry packetId to BIGINT...');
+      telemetryPacketIdBigintMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('telemetry packetId bigint migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run telemetry packetId bigint migration:', error);
+      throw error;
+    }
+  }
+
+  private runAccuracyEstimatedPrefsMigration(): void {
+    const migrationKey = 'migration_076_accuracy_estimated_prefs';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 076 (accuracy_estimated_prefs) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 076: Add show_accuracy_regions and show_estimated_positions to user_map_preferences...');
+      accuracyEstimatedPrefsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('accuracy_estimated_prefs migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run accuracy_estimated_prefs migration:', error);
+      throw error;
+    }
+  }
+
+  private runIgnoredNodesNodeNumBigintMigration(): void {
+    const migrationKey = 'migration_077_ignored_nodes_nodenum_bigint';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 077 (ignored_nodes nodeNum bigint) already completed');
+        return;
+      }
+
+      logger.debug('Running migration 077: Upgrade ignored_nodes.nodeNum to BIGINT...');
+      ignoredNodesNodeNumBigintMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('ignored_nodes nodeNum bigint migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run ignored_nodes nodeNum bigint migration:', error);
       throw error;
     }
   }
@@ -2793,13 +3183,38 @@ class DatabaseService {
           logger.error('Failed to upsert node:', err);
         });
 
-        // Send notification for newly discovered node (only if not broadcast node)
+        // For newly discovered nodes, check persistent ignore list and restore status
         if (!existingNode && nodeData.nodeNum !== 4294967295) {
+          // Check if this node was previously ignored
+          if (this.ignoredNodesRepo) {
+            this.ignoredNodesRepo.isNodeIgnoredAsync(nodeData.nodeNum).then(wasIgnored => {
+              if (wasIgnored) {
+                logger.debug(`Restoring ignored status for returning node ${nodeData.nodeNum}`);
+                updatedNode.isIgnored = true;
+                this.nodesCache.set(nodeData.nodeNum!, updatedNode);
+                if (this.nodesRepo) {
+                  this.nodesRepo.setNodeIgnored(nodeData.nodeNum!, true).catch(err => {
+                    logger.error('Failed to restore ignored status:', err);
+                  });
+                }
+              }
+            }).catch(err => logger.error('Failed to check persistent ignore list:', err));
+          }
+        }
+
+        // Send new node notification when a node becomes complete (has longName, shortName, hwModel)
+        // This defers the notification until we have meaningful info instead of just a raw node ID
+        const wasComplete = existingNode ? isNodeComplete(existingNode) : false;
+        if (nodeData.nodeNum !== 4294967295 && !wasComplete &&
+            !this.newNodeNotifiedSet.has(nodeData.nodeNum) && isNodeComplete(updatedNode)) {
+          this.newNodeNotifiedSet.add(nodeData.nodeNum);
           import('../server/services/notificationService.js').then(({ notificationService }) => {
             notificationService.notifyNewNode(
-              nodeData.nodeId!,
-              nodeData.longName || nodeData.nodeId!,
-              nodeData.hopsAway
+              updatedNode.nodeId!,
+              updatedNode.longName!,
+              updatedNode.shortName!,
+              updatedNode.hwModel ?? undefined,
+              updatedNode.hopsAway
             ).catch(err => logger.error('Failed to send new node notification:', err));
           }).catch(err => logger.error('Failed to import notification service:', err));
         }
@@ -2890,6 +3305,15 @@ class DatabaseService {
         nodeData.nodeNum
       );
     } else {
+      // Check if this node was previously ignored (persistent ignore list)
+      let wasIgnored = false;
+      try {
+        const ignoreCheck = this.db.prepare('SELECT nodeNum FROM ignored_nodes WHERE nodeNum = ?');
+        wasIgnored = !!ignoreCheck.get(nodeData.nodeNum);
+      } catch {
+        // Table may not exist yet during initial setup
+      }
+
       const stmt = this.db.prepare(`
         INSERT INTO nodes (
           nodeNum, nodeId, longName, shortName, hwModel, role, hopsAway, viaMqtt, macaddr,
@@ -2898,8 +3322,9 @@ class DatabaseService {
           isFavorite, rebootCount, publicKey, hasPKC, lastPKIPacket, welcomedAt,
           keyIsLowEntropy, duplicateKeyDetected, keyMismatchDetected, keySecurityIssueDetails,
           positionChannel, positionPrecisionBits, positionTimestamp,
+          isIgnored,
           createdAt, updatedAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       stmt.run(
@@ -2937,20 +3362,40 @@ class DatabaseService {
         nodeData.positionChannel !== undefined ? nodeData.positionChannel : null,
         nodeData.positionPrecisionBits !== undefined ? nodeData.positionPrecisionBits : null,
         nodeData.positionTimestamp !== undefined ? nodeData.positionTimestamp : null,
+        wasIgnored ? 1 : 0,
         now,
         now
       );
 
-      // Send notification for newly discovered node (only if not broadcast node)
-      if (nodeData.nodeNum !== 4294967295 && nodeData.nodeId) {
-        // Import notification service dynamically to avoid circular dependencies
-        import('../server/services/notificationService.js').then(({ notificationService }) => {
-          notificationService.notifyNewNode(
-            nodeData.nodeId!,
-            nodeData.longName || nodeData.nodeId!,
-            nodeData.hopsAway
-          ).catch(err => logger.error('Failed to send new node notification:', err));
-        }).catch(err => logger.error('Failed to import notification service:', err));
+      if (wasIgnored) {
+        logger.debug(`Restored ignored status for returning node ${nodeData.nodeNum}`);
+      }
+    }
+
+    // Send new node notification when a node becomes complete (has longName, shortName, hwModel)
+    // This defers the notification until we have meaningful info instead of just a raw node ID
+    // For SQLite, build the merged node state to check completeness (COALESCE merges in SQL)
+    if (nodeData.nodeNum !== 4294967295 && !this.newNodeNotifiedSet.has(nodeData.nodeNum)) {
+      const wasComplete = existingNode ? isNodeComplete(existingNode) : false;
+      if (!wasComplete) {
+        const mergedNode = {
+          nodeId: nodeData.nodeId ?? existingNode?.nodeId,
+          longName: nodeData.longName ?? existingNode?.longName,
+          shortName: nodeData.shortName ?? existingNode?.shortName,
+          hwModel: nodeData.hwModel ?? existingNode?.hwModel,
+        };
+        if (isNodeComplete(mergedNode)) {
+          this.newNodeNotifiedSet.add(nodeData.nodeNum);
+          import('../server/services/notificationService.js').then(({ notificationService }) => {
+            notificationService.notifyNewNode(
+              mergedNode.nodeId!,
+              mergedNode.longName!,
+              mergedNode.shortName!,
+              mergedNode.hwModel ?? undefined,
+              nodeData.hopsAway ?? existingNode?.hopsAway
+            ).catch(err => logger.error('Failed to send new node notification:', err));
+          }).catch(err => logger.error('Failed to import notification service:', err));
+        }
       }
     }
   }
@@ -3287,6 +3732,259 @@ class DatabaseService {
     `);
     const now = Date.now();
     stmt.run(keyIsLowEntropy ? 1 : 0, combinedDetails || null, now, nodeNum);
+  }
+
+  /**
+   * Get packet counts per node for the last hour (for spam detection)
+   * Returns an array of { nodeNum, packetCount }
+   * Excludes internal traffic (packets where both from and to are the local node)
+   */
+  getPacketCountsPerNodeLastHour(): Array<{ nodeNum: number; packetCount: number }> {
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+
+    // For PostgreSQL/MySQL, use async method
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      // Return empty array and caller should use async version
+      logger.warn('getPacketCountsPerNodeLastHour() called for non-SQLite database - use async version');
+      return [];
+    }
+
+    // Get local node number to exclude internal traffic
+    const localNodeNumStr = this.getSetting('localNodeNum');
+    const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
+
+    const stmt = this.db.prepare(`
+      SELECT from_node as nodeNum, COUNT(*) as packetCount
+      FROM packet_log
+      WHERE timestamp >= ?
+        AND NOT (from_node = ? AND to_node = ?)
+      GROUP BY from_node
+    `);
+
+    return stmt.all(oneHourAgo, localNodeNum || -1, localNodeNum || -1) as Array<{ nodeNum: number; packetCount: number }>;
+  }
+
+  /**
+   * Get packet counts per node for the last hour (async version)
+   * Excludes internal traffic (packets where both from and to are the local node)
+   */
+  async getPacketCountsPerNodeLastHourAsync(): Promise<Array<{ nodeNum: number; packetCount: number }>> {
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+
+    // Get local node number to exclude internal traffic
+    const localNodeNumStr = this.getSetting('localNodeNum');
+    const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
+
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        const result = await this.postgresPool.query(`
+          SELECT from_node as "nodeNum", COUNT(*)::int as "packetCount"
+          FROM packet_log
+          WHERE timestamp >= $1
+            AND NOT (from_node = $2 AND to_node = $2)
+          GROUP BY from_node
+        `, [oneHourAgo, localNodeNum || -1]);
+
+        return result.rows;
+      } catch (error) {
+        logger.error('Error getting packet counts per node (PostgreSQL):', error);
+        return [];
+      }
+    }
+
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        const [rows] = await this.mysqlPool.query(`
+          SELECT from_node as nodeNum, COUNT(*) as packetCount
+          FROM packet_log
+          WHERE timestamp >= ?
+            AND NOT (from_node = ? AND to_node = ?)
+          GROUP BY from_node
+        `, [oneHourAgo, localNodeNum || -1, localNodeNum || -1]) as any;
+
+        return rows.map((row: any) => ({
+          nodeNum: Number(row.nodeNum),
+          packetCount: Number(row.packetCount)
+        }));
+      } catch (error) {
+        logger.error('Error getting packet counts per node (MySQL):', error);
+        return [];
+      }
+    }
+
+    // SQLite fallback
+    return this.getPacketCountsPerNodeLastHour();
+  }
+
+  /**
+   * Get top N broadcasters by packet count in the last hour
+   * Returns node info with packet counts, sorted by count descending
+   * Excludes internal traffic (packets where both from and to are the local node)
+   */
+  async getTopBroadcastersAsync(limit: number = 5): Promise<Array<{ nodeNum: number; shortName: string | null; longName: string | null; packetCount: number }>> {
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+
+    // Get local node number to exclude internal traffic
+    const localNodeNumStr = this.getSetting('localNodeNum');
+    const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
+
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        // Exclude packets where both from_node and to_node are the local node (internal traffic)
+        const result = await this.postgresPool.query(`
+          SELECT p.from_node as "nodeNum", n."shortName", n."longName", COUNT(*)::int as "packetCount"
+          FROM packet_log p
+          LEFT JOIN nodes n ON p.from_node = n."nodeNum"
+          WHERE p.timestamp >= $1
+            AND NOT (p.from_node = $3 AND p.to_node = $3)
+          GROUP BY p.from_node, n."shortName", n."longName"
+          ORDER BY "packetCount" DESC
+          LIMIT $2
+        `, [oneHourAgo, limit, localNodeNum || -1]);
+
+        return result.rows;
+      } catch (error) {
+        logger.error('Error getting top broadcasters (PostgreSQL):', error);
+        return [];
+      }
+    }
+
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        const [rows] = await this.mysqlPool.query(`
+          SELECT p.from_node as nodeNum, n.shortName, n.longName, COUNT(*) as packetCount
+          FROM packet_log p
+          LEFT JOIN nodes n ON p.from_node = n.nodeNum
+          WHERE p.timestamp >= ?
+            AND NOT (p.from_node = ? AND p.to_node = ?)
+          GROUP BY p.from_node, n.shortName, n.longName
+          ORDER BY packetCount DESC
+          LIMIT ?
+        `, [oneHourAgo, localNodeNum || -1, localNodeNum || -1, limit]) as any;
+
+        return rows.map((row: any) => ({
+          nodeNum: Number(row.nodeNum),
+          shortName: row.shortName,
+          longName: row.longName,
+          packetCount: Number(row.packetCount)
+        }));
+      } catch (error) {
+        logger.error('Error getting top broadcasters (MySQL):', error);
+        return [];
+      }
+    }
+
+    // SQLite - exclude packets where both from_node and to_node are the local node
+    const stmt = this.db.prepare(`
+      SELECT p.from_node as nodeNum, n.shortName, n.longName, COUNT(*) as packetCount
+      FROM packet_log p
+      LEFT JOIN nodes n ON p.from_node = n.nodeNum
+      WHERE p.timestamp >= ?
+        AND NOT (p.from_node = ? AND p.to_node = ?)
+      GROUP BY p.from_node
+      ORDER BY packetCount DESC
+      LIMIT ?
+    `);
+
+    return stmt.all(oneHourAgo, localNodeNum || -1, localNodeNum || -1, limit) as Array<{ nodeNum: number; shortName: string | null; longName: string | null; packetCount: number }>;
+  }
+
+  /**
+   * Update the spam detection flags for a node
+   */
+  updateNodeSpamFlags(nodeNum: number, isExcessivePackets: boolean, packetRatePerHour: number): void {
+    const now = Math.floor(Date.now() / 1000);
+
+    // For PostgreSQL/MySQL, update cache and fire-and-forget
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      const cachedNode = this.nodesCache.get(nodeNum);
+      if (cachedNode) {
+        (cachedNode as any).isExcessivePackets = isExcessivePackets;
+        (cachedNode as any).packetRatePerHour = packetRatePerHour;
+        (cachedNode as any).packetRateLastChecked = now;
+        cachedNode.updatedAt = Date.now();
+      }
+
+      // Fire-and-forget database update
+      this.updateNodeSpamFlagsAsync(nodeNum, isExcessivePackets, packetRatePerHour, now).catch(err => {
+        logger.error(`Failed to update node spam flags in database:`, err);
+      });
+      return;
+    }
+
+    // SQLite: synchronous update
+    const stmt = this.db.prepare(`
+      UPDATE nodes
+      SET isExcessivePackets = ?,
+          packetRatePerHour = ?,
+          packetRateLastChecked = ?,
+          updatedAt = ?
+      WHERE nodeNum = ?
+    `);
+    stmt.run(isExcessivePackets ? 1 : 0, packetRatePerHour, now, Date.now(), nodeNum);
+  }
+
+  /**
+   * Update the spam detection flags for a node (async)
+   */
+  async updateNodeSpamFlagsAsync(nodeNum: number, isExcessivePackets: boolean, packetRatePerHour: number, lastChecked: number): Promise<void> {
+    const now = Date.now();
+
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      await this.postgresPool.query(`
+        UPDATE nodes
+        SET "isExcessivePackets" = $1,
+            "packetRatePerHour" = $2,
+            "packetRateLastChecked" = $3,
+            "updatedAt" = $4
+        WHERE "nodeNum" = $5
+      `, [isExcessivePackets, packetRatePerHour, lastChecked, now, nodeNum]);
+      return;
+    }
+
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      await this.mysqlPool.query(`
+        UPDATE nodes
+        SET isExcessivePackets = ?,
+            packetRatePerHour = ?,
+            packetRateLastChecked = ?,
+            updatedAt = ?
+        WHERE nodeNum = ?
+      `, [isExcessivePackets, packetRatePerHour, lastChecked, now, nodeNum]);
+      return;
+    }
+  }
+
+  /**
+   * Get all nodes with excessive packet rates (for security page)
+   */
+  getNodesWithExcessivePackets(): DbNode[] {
+    // For PostgreSQL/MySQL, use cache
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      const result: DbNode[] = [];
+      for (const node of this.nodesCache.values()) {
+        if ((node as any).isExcessivePackets) {
+          result.push(node);
+        }
+      }
+      return result;
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT * FROM nodes WHERE isExcessivePackets = 1
+    `);
+    return stmt.all() as DbNode[];
+  }
+
+  /**
+   * Get all nodes with excessive packet rates (async)
+   */
+  async getNodesWithExcessivePacketsAsync(): Promise<DbNode[]> {
+    if (this.nodesRepo) {
+      // Use cache for now since we don't have a repo method yet
+      return this.getNodesWithExcessivePackets();
+    }
+    return this.getNodesWithExcessivePackets();
   }
 
   // Message operations
@@ -3635,21 +4333,62 @@ class DatabaseService {
   }
 
   /**
+   * Count distinct position packets for a node from the telemetry table.
+   */
+  async getPositionPacketCountByNodeAsync(nodeId: string, since?: number): Promise<number> {
+    if (this.telemetryRepo) {
+      return this.telemetryRepo.getPositionPacketCountByNode(nodeId, since);
+    }
+    return 0;
+  }
+
+  /**
+   * Count distinct non-position telemetry packets for a node from the telemetry table.
+   */
+  async getNonPositionTelemetryPacketCountByNodeAsync(nodeId: string, since?: number): Promise<number> {
+    if (this.telemetryRepo) {
+      return this.telemetryRepo.getNonPositionTelemetryPacketCountByNode(nodeId, since);
+    }
+    return 0;
+  }
+
+  /**
+   * Count messages sent from or to a specific node.
+   */
+  async getMessageCountByNodeAsync(nodeNum: number, since?: number): Promise<number> {
+    if (this.messagesRepo) {
+      return this.messagesRepo.getMessageCountByNode(nodeNum, since);
+    }
+    return 0;
+  }
+
+  /**
+   * Count traceroutes involving a specific node.
+   */
+  async getTracerouteCountByNodeAsync(nodeNum: number, since?: number): Promise<number> {
+    if (this.traceroutesRepo) {
+      return this.traceroutesRepo.getTracerouteCountByNode(nodeNum, since);
+    }
+    return 0;
+  }
+
+  /**
    * Update node mobility status based on position telemetry
-   * Checks if a node has moved more than 100 meters based on its last 50 position records
+   * Checks if a node has moved more than 100 meters based on its last 500 position records
    * @param nodeId The node ID to check
    * @returns The updated mobility status (0 = stationary, 1 = mobile)
    */
   updateNodeMobility(nodeId: string): number {
     try {
       // For PostgreSQL/MySQL, mobility detection requires async telemetry queries
-      // Skip for now - mobility will be detected via API endpoints
+      // Use updateNodeMobilityAsync instead
       if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
         return 0;
       }
 
-      // Get last 50 position telemetry records for this node
-      const positionTelemetry = this.getPositionTelemetryByNode(nodeId, 50);
+      // Get last 500 position telemetry records for this node
+      // Using a larger limit ensures we capture movement over a longer time period
+      const positionTelemetry = this.getPositionTelemetryByNode(nodeId, 500);
 
       const latitudes = positionTelemetry.filter(t => t.telemetryType === 'latitude');
       const longitudes = positionTelemetry.filter(t => t.telemetryType === 'longitude');
@@ -3685,6 +4424,71 @@ class DatabaseService {
       // Update the mobile flag in the database
       const stmt = this.db.prepare('UPDATE nodes SET mobile = ? WHERE nodeId = ?');
       stmt.run(isMobile, nodeId);
+
+      return isMobile;
+    } catch (error) {
+      logger.error(`Failed to update mobility for node ${nodeId}:`, error);
+      return 0; // Default to non-mobile on error
+    }
+  }
+
+  /**
+   * Async version of updateNodeMobility - works for all database backends
+   * Detects if a node has moved more than 100 meters based on position history
+   * @param nodeId The node ID to check
+   * @returns The updated mobility status (0 = stationary, 1 = mobile)
+   */
+  async updateNodeMobilityAsync(nodeId: string): Promise<number> {
+    try {
+      // Get last 500 position telemetry records for this node
+      // Using a larger limit ensures we capture movement over a longer time period
+      // (50 was too small - nodes parked for a while would show only recent stationary positions)
+      const positionTelemetry = await this.getPositionTelemetryByNodeAsync(nodeId, 500);
+
+      const latitudes = positionTelemetry.filter(t => t.telemetryType === 'latitude');
+      const longitudes = positionTelemetry.filter(t => t.telemetryType === 'longitude');
+
+      let isMobile = 0;
+
+      // Need at least 2 position records to detect movement
+      if (latitudes.length >= 2 && longitudes.length >= 2) {
+        const latValues = latitudes.map(t => t.value);
+        const lonValues = longitudes.map(t => t.value);
+
+        const minLat = Math.min(...latValues);
+        const maxLat = Math.max(...latValues);
+        const minLon = Math.min(...lonValues);
+        const maxLon = Math.max(...lonValues);
+
+        // Calculate distance between min/max corners using Haversine formula
+        const R = 6371; // Earth's radius in km
+        const dLat = (maxLat - minLat) * Math.PI / 180;
+        const dLon = (maxLon - minLon) * Math.PI / 180;
+        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                  Math.cos(minLat * Math.PI / 180) * Math.cos(maxLat * Math.PI / 180) *
+                  Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        const distance = R * c;
+
+        // If movement is greater than 100 meters (0.1 km), mark as mobile
+        isMobile = distance > 0.1 ? 1 : 0;
+
+        logger.debug(`📍 Node ${nodeId} mobility check: ${latitudes.length} positions, distance=${distance.toFixed(3)}km, mobile=${isMobile}`);
+      }
+
+      // Update the mobile flag in the database using repository
+      if (this.nodesRepo) {
+        await this.nodesRepo.updateNodeMobility(nodeId, isMobile);
+      }
+
+      // Also update the cache so getAllNodes() returns the updated value
+      for (const [nodeNum, cachedNode] of this.nodesCache.entries()) {
+        if (cachedNode.nodeId === nodeId) {
+          cachedNode.mobile = isMobile;
+          this.nodesCache.set(nodeNum, cachedNode);
+          break;
+        }
+      }
 
       return isMobile;
     } catch (error) {
@@ -3748,7 +4552,8 @@ class DatabaseService {
     }
 
     const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const stmt = this.db.prepare('DELETE FROM nodes WHERE lastHeard < ? OR lastHeard IS NULL');
+    // Skip nodes that are ignored - they should persist even if inactive
+    const stmt = this.db.prepare('DELETE FROM nodes WHERE (lastHeard < ? OR lastHeard IS NULL) AND (isIgnored = 0 OR isIgnored IS NULL)');
     const result = stmt.run(cutoff);
     return Number(result.changes);
   }
@@ -4293,12 +5098,9 @@ class DatabaseService {
     // For PostgreSQL/MySQL, fire-and-forget async insert
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       if (this.telemetryRepo) {
-        // Check if node exists in cache - if not, skip telemetry insert
-        // This prevents foreign key constraint violations during race conditions
-        if (!this.nodesCache.has(telemetryData.nodeNum)) {
-          logger.debug(`[DatabaseService] Skipping telemetry insert - node ${telemetryData.nodeNum} not in cache yet`);
-          return;
-        }
+        // Note: We removed the nodesCache check here because it was too aggressive -
+        // it would skip telemetry for nodes that exist in the DB but not in the in-memory cache
+        // (e.g., after server restart). The foreign key error handling below handles race conditions.
         this.telemetryRepo.insertTelemetry(telemetryData).catch((error) => {
           // Ignore foreign key violations - node might not be persisted yet
           const errorStr = String(error);
@@ -4400,11 +5202,15 @@ class DatabaseService {
     return this.getTelemetryByNode(nodeId, limit, sinceTimestamp, beforeTimestamp, offset, telemetryType);
   }
 
-  // Get only position-related telemetry (latitude, longitude, altitude) for a node
-  // This is much more efficient than fetching all telemetry types - reduces data fetched by ~70%
+  /**
+   * Get only position-related telemetry (latitude, longitude, altitude, ground_speed, ground_track) for a node.
+   * This is much more efficient than fetching all telemetry types - reduces data fetched by ~70%.
+   *
+   * NOTE: This sync method only works for SQLite. For PostgreSQL/MySQL, use getPositionTelemetryByNodeAsync().
+   * Returns empty array for non-SQLite backends by design (sync DB access not supported).
+   */
   getPositionTelemetryByNode(nodeId: string, limit: number = 1500, sinceTimestamp?: number): DbTelemetry[] {
-    // For PostgreSQL/MySQL, telemetry is not cached - return empty for sync calls
-    // Position telemetry is fetched via API endpoints which can be async
+    // INTENTIONAL: PostgreSQL/MySQL require async queries - use getPositionTelemetryByNodeAsync() instead
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return [];
     }
@@ -4412,7 +5218,7 @@ class DatabaseService {
     let query = `
       SELECT * FROM telemetry
       WHERE nodeId = ?
-        AND telemetryType IN ('latitude', 'longitude', 'altitude')
+        AND telemetryType IN ('latitude', 'longitude', 'altitude', 'ground_speed', 'ground_track')
     `;
     const params: any[] = [nodeId];
 
@@ -4430,6 +5236,16 @@ class DatabaseService {
     const stmt = this.db.prepare(query);
     const telemetry = stmt.all(...params) as DbTelemetry[];
     return telemetry.map(t => this.normalizeBigInts(t));
+  }
+
+  // Async version of getPositionTelemetryByNode - works for all database backends
+  async getPositionTelemetryByNodeAsync(nodeId: string, limit: number = 1500, sinceTimestamp?: number): Promise<DbTelemetry[]> {
+    if (this.telemetryRepo) {
+      // Cast to local DbTelemetry type (they have compatible structure)
+      return this.telemetryRepo.getPositionTelemetryByNode(nodeId, limit, sinceTimestamp) as unknown as Promise<DbTelemetry[]>;
+    }
+    // Fallback to sync method for SQLite when repo not available
+    return this.getPositionTelemetryByNode(nodeId, limit, sinceTimestamp);
   }
 
   /**
@@ -4643,7 +5459,24 @@ class DatabaseService {
     // Calculate the interval in milliseconds
     const intervalMs = actualIntervalMinutes * 60 * 1000;
 
+    // Telemetry types that should use raw values instead of averaging
+    // These are discrete integer values where averaging produces meaningless floats
+    const rawValueTypes = [
+      'sats_in_view',
+      'messageHops',
+      'batteryLevel',
+      'numOnlineNodes', 'numTotalNodes',
+      'numPacketsTx', 'numPacketsRx', 'numPacketsRxBad',
+      'numRxDupe', 'numTxRelay', 'numTxRelayCanceled', 'numTxDropped',
+      'systemNodeCount', 'systemDirectNodeCount',
+      'paxcounterWifi', 'paxcounterBle',
+      'particles03um', 'particles05um', 'particles10um',
+      'particles25um', 'particles50um', 'particles100um',
+      'co2', 'iaq',
+    ];
+
     // Build the query to group and average telemetry data by time intervals
+    // Exclude raw value types from this query - they'll be fetched separately
     let query = `
       SELECT
         nodeId,
@@ -4655,8 +5488,9 @@ class DatabaseService {
         MIN(createdAt) as createdAt
       FROM telemetry
       WHERE nodeId = ?
+        AND telemetryType NOT IN (${rawValueTypes.map(() => '?').join(', ')})
     `;
-    const params: any[] = [intervalMs, intervalMs, nodeId];
+    const params: any[] = [intervalMs, intervalMs, nodeId, ...rawValueTypes];
 
     if (sinceTimestamp !== undefined) {
       query += ` AND timestamp >= ?`;
@@ -4707,7 +5541,44 @@ class DatabaseService {
 
     const stmt = this.db.prepare(query);
     const telemetry = stmt.all(...params) as DbTelemetry[];
-    return telemetry.map(t => this.normalizeBigInts(t));
+
+    // Fetch raw values for types that shouldn't be averaged (sparse integer data)
+    let rawQuery = `
+      SELECT
+        nodeId,
+        nodeNum,
+        telemetryType,
+        timestamp,
+        value,
+        unit,
+        createdAt
+      FROM telemetry
+      WHERE nodeId = ?
+        AND telemetryType IN (${rawValueTypes.map(() => '?').join(', ')})
+    `;
+    const rawParams: any[] = [nodeId, ...rawValueTypes];
+
+    if (sinceTimestamp !== undefined) {
+      rawQuery += ` AND timestamp >= ?`;
+      rawParams.push(sinceTimestamp);
+    }
+
+    rawQuery += ` ORDER BY timestamp DESC`;
+
+    // Apply same limit logic for raw data
+    if (maxHours !== undefined) {
+      // For raw data, limit based on expected frequency (~10 per hour max for position data)
+      const rawLimit = Math.ceil((maxHours + 1) * 10 * rawValueTypes.length * 1.5);
+      rawQuery += ` LIMIT ?`;
+      rawParams.push(rawLimit);
+    }
+
+    const rawStmt = this.db.prepare(rawQuery);
+    const rawTelemetry = rawStmt.all(...rawParams) as DbTelemetry[];
+
+    // Combine averaged and raw telemetry
+    const combined = [...telemetry, ...rawTelemetry];
+    return combined.map(t => this.normalizeBigInts(t));
   }
 
   /**
@@ -4985,6 +5856,25 @@ class DatabaseService {
     `);
     const traceroutes = stmt.all(fromNodeNum, toNodeNum, toNodeNum, fromNodeNum, limit) as DbTraceroute[];
     return traceroutes.map(t => this.normalizeBigInts(t));
+  }
+
+  /**
+   * Async version of getTraceroutesByNodes for PostgreSQL/MySQL
+   */
+  async getTraceroutesByNodesAsync(fromNodeNum: number, toNodeNum: number, limit: number = 10): Promise<DbTraceroute[]> {
+    if (this.traceroutesRepo) {
+      const traceroutes = await this.traceroutesRepo.getTraceroutesByNodes(fromNodeNum, toNodeNum, limit);
+      return traceroutes.map(t => ({
+        ...t,
+        route: t.route || '',
+        routeBack: t.routeBack || '',
+        snrTowards: t.snrTowards || '',
+        snrBack: t.snrBack || '',
+      })) as DbTraceroute[];
+    }
+
+    // Fallback to sync for SQLite
+    return this.getTraceroutesByNodes(fromNodeNum, toNodeNum, limit);
   }
 
   getAllTraceroutes(limit: number = 100): DbTraceroute[] {
@@ -6411,6 +7301,33 @@ class DatabaseService {
     return telemetry ? this.normalizeBigInts(telemetry) : null;
   }
 
+  /**
+   * Async version of getLatestTelemetryForType - works with all database backends
+   */
+  async getLatestTelemetryForTypeAsync(nodeId: string, telemetryType: string): Promise<DbTelemetry | null> {
+    if (this.telemetryRepo) {
+      const result = await this.telemetryRepo.getLatestTelemetryForType(nodeId, telemetryType);
+      if (!result) return null;
+      // Normalize the result to match DbTelemetry interface (convert null to undefined)
+      return {
+        id: result.id,
+        nodeId: result.nodeId,
+        nodeNum: result.nodeNum,
+        telemetryType: result.telemetryType,
+        timestamp: result.timestamp,
+        value: result.value,
+        unit: result.unit ?? undefined,
+        createdAt: result.createdAt,
+        packetTimestamp: result.packetTimestamp ?? undefined,
+        channel: result.channel ?? undefined,
+        precisionBits: result.precisionBits ?? undefined,
+        gpsAccuracy: result.gpsAccuracy ?? undefined,
+      };
+    }
+    // Fallback to sync for SQLite if repo not ready
+    return this.getLatestTelemetryForType(nodeId, telemetryType);
+  }
+
   // Get distinct telemetry types per node (efficient for checking capabilities)
   getNodeTelemetryTypes(nodeId: string): string[] {
     // For PostgreSQL/MySQL, return empty array for sync calls
@@ -6471,7 +7388,6 @@ class DatabaseService {
 
   // Invalidate the telemetry types cache (call when new telemetry is inserted)
   invalidateTelemetryTypesCache(): void {
-    this.telemetryTypesCache = null;
     this.telemetryTypesCacheTime = 0;
   }
 
@@ -6717,6 +7633,11 @@ class DatabaseService {
   async setSettingAsync(key: string, value: string): Promise<void> {
     if (this.settingsRepo) {
       await this.settingsRepo.setSetting(key, value);
+      return;
+    }
+    // For PostgreSQL/MySQL without repo, just update cache (don't recurse into setSetting)
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      this.settingsCache.set(key, value);
       return;
     }
     // Fallback to sync for SQLite if repo not ready
@@ -6969,7 +7890,7 @@ class DatabaseService {
   }
 
   getLongestActiveRouteSegment(): DbRouteSegment | null {
-    // For PostgreSQL/MySQL, route segments not yet implemented
+    // For PostgreSQL/MySQL, use async version
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return null;
     }
@@ -6985,8 +7906,17 @@ class DatabaseService {
     return segment ? this.normalizeBigInts(segment) : null;
   }
 
+  async getLongestActiveRouteSegmentAsync(): Promise<DbRouteSegment | null> {
+    if ((this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') && this.traceroutesRepo) {
+      const segment = await this.traceroutesRepo.getLongestActiveRouteSegment();
+      if (!segment) return null;
+      return { ...segment, isRecordHolder: segment.isRecordHolder ?? false };
+    }
+    return this.getLongestActiveRouteSegment();
+  }
+
   getRecordHolderRouteSegment(): DbRouteSegment | null {
-    // For PostgreSQL/MySQL, route segments not yet implemented
+    // For PostgreSQL/MySQL, use async version
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return null;
     }
@@ -6998,6 +7928,15 @@ class DatabaseService {
     `);
     const segment = stmt.get() as DbRouteSegment | null;
     return segment ? this.normalizeBigInts(segment) : null;
+  }
+
+  async getRecordHolderRouteSegmentAsync(): Promise<DbRouteSegment | null> {
+    if ((this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') && this.traceroutesRepo) {
+      const segment = await this.traceroutesRepo.getRecordHolderRouteSegment();
+      if (!segment) return null;
+      return { ...segment, isRecordHolder: segment.isRecordHolder ?? false };
+    }
+    return this.getRecordHolderRouteSegment();
   }
 
   updateRecordHolderSegment(newSegment: DbRouteSegment): void {
@@ -7329,6 +8268,41 @@ class DatabaseService {
 
   // Ignored operations
   setNodeIgnored(nodeNum: number, isIgnored: boolean): void {
+    // Get the node info for the persistent ignore list
+    const node = this.getNode(nodeNum);
+    const nodeId = node?.nodeId || `!${nodeNum.toString(16).padStart(8, '0')}`;
+
+    // Persist to/remove from the ignored_nodes table
+    if (this.ignoredNodesRepo) {
+      if (isIgnored) {
+        this.ignoredNodesRepo.addIgnoredNodeAsync(
+          nodeNum, nodeId, node?.longName, node?.shortName
+        ).catch(err => {
+          logger.error('Failed to add node to persistent ignore list:', err);
+        });
+      } else {
+        this.ignoredNodesRepo.removeIgnoredNodeAsync(nodeNum).catch(err => {
+          logger.error('Failed to remove node from persistent ignore list:', err);
+        });
+      }
+    } else {
+      // SQLite fallback: use raw SQL for the ignored_nodes table
+      try {
+        if (isIgnored) {
+          const stmt = this.db.prepare(`
+            INSERT OR REPLACE INTO ignored_nodes (nodeNum, nodeId, longName, shortName, ignoredAt)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          stmt.run(nodeNum, nodeId, node?.longName || null, node?.shortName || null, Date.now());
+        } else {
+          const stmt = this.db.prepare('DELETE FROM ignored_nodes WHERE nodeNum = ?');
+          stmt.run(nodeNum);
+        }
+      } catch (err) {
+        logger.error('Failed to update persistent ignore list:', err);
+      }
+    }
+
     // For PostgreSQL/MySQL, update cache and fire-and-forget
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       const cachedNode = this.nodesCache.get(nodeNum);
@@ -7358,12 +8332,65 @@ class DatabaseService {
     const result = stmt.run(isIgnored ? 1 : 0, now, nodeNum);
 
     if (result.changes === 0) {
-      const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
-      logger.warn(`⚠️ Failed to update ignored status for node ${nodeId} (${nodeNum}): node not found in database`);
+      logger.warn(`Failed to update ignored status for node ${nodeId} (${nodeNum}): node not found in database`);
       throw new Error(`Node ${nodeId} not found`);
     }
 
     logger.debug(`${isIgnored ? '🚫' : '✅'} Node ${nodeNum} ignored status set to: ${isIgnored} (${result.changes} row updated)`);
+  }
+
+  // Persistent ignored nodes operations
+  async addIgnoredNodeAsync(
+    nodeNum: number,
+    nodeId: string,
+    longName?: string | null,
+    shortName?: string | null,
+    ignoredBy?: string | null,
+  ): Promise<void> {
+    if (this.ignoredNodesRepo) {
+      await this.ignoredNodesRepo.addIgnoredNodeAsync(nodeNum, nodeId, longName, shortName, ignoredBy);
+    } else {
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO ignored_nodes (nodeNum, nodeId, longName, shortName, ignoredAt, ignoredBy)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(nodeNum, nodeId, longName || null, shortName || null, Date.now(), ignoredBy || null);
+    }
+  }
+
+  async removeIgnoredNodeAsync(nodeNum: number): Promise<void> {
+    if (this.ignoredNodesRepo) {
+      await this.ignoredNodesRepo.removeIgnoredNodeAsync(nodeNum);
+    } else {
+      const stmt = this.db.prepare('DELETE FROM ignored_nodes WHERE nodeNum = ?');
+      stmt.run(nodeNum);
+    }
+  }
+
+  async getIgnoredNodesAsync(): Promise<Array<{
+    nodeNum: number;
+    nodeId: string;
+    longName: string | null;
+    shortName: string | null;
+    ignoredAt: number;
+    ignoredBy: string | null;
+  }>> {
+    if (this.ignoredNodesRepo) {
+      return this.ignoredNodesRepo.getIgnoredNodesAsync();
+    }
+    // SQLite fallback
+    const stmt = this.db.prepare('SELECT * FROM ignored_nodes');
+    return stmt.all() as any[];
+  }
+
+  async isNodeIgnoredAsync(nodeNum: number): Promise<boolean> {
+    if (this.ignoredNodesRepo) {
+      return this.ignoredNodesRepo.isNodeIgnoredAsync(nodeNum);
+    }
+    // SQLite fallback
+    const stmt = this.db.prepare('SELECT nodeNum FROM ignored_nodes WHERE nodeNum = ?');
+    const row = stmt.get(nodeNum);
+    return !!row;
   }
 
   // Position override operations
@@ -7794,6 +8821,7 @@ class DatabaseService {
     offset?: number;
     userId?: number;
     action?: string;
+    excludeAction?: string;
     resource?: string;
     startDate?: number;
     endDate?: number;
@@ -7804,6 +8832,7 @@ class DatabaseService {
       offset = 0,
       userId,
       action,
+      excludeAction,
       resource,
       startDate,
       endDate,
@@ -7822,6 +8851,11 @@ class DatabaseService {
     if (action) {
       conditions.push('al.action = ?');
       params.push(action);
+    }
+
+    if (excludeAction) {
+      conditions.push('al.action != ?');
+      params.push(excludeAction);
     }
 
     if (resource) {
@@ -7885,6 +8919,7 @@ class DatabaseService {
     offset?: number;
     userId?: number;
     action?: string;
+    excludeAction?: string;
     resource?: string;
     startDate?: number;
     endDate?: number;
@@ -7900,6 +8935,7 @@ class DatabaseService {
       offset = 0,
       userId,
       action,
+      excludeAction,
       resource,
       startDate,
       endDate,
@@ -7923,6 +8959,11 @@ class DatabaseService {
         if (action) {
           conditions.push(`action = $${paramIndex++}`);
           params.push(action);
+        }
+
+        if (excludeAction) {
+          conditions.push(`action != $${paramIndex++}`);
+          params.push(excludeAction);
         }
 
         if (resource) {
@@ -7982,6 +9023,11 @@ class DatabaseService {
         if (action) {
           conditions.push('action = ?');
           params.push(action);
+        }
+
+        if (excludeAction) {
+          conditions.push('action != ?');
+          params.push(excludeAction);
         }
 
         if (resource) {
@@ -8286,6 +9332,44 @@ class DatabaseService {
     return Number(result.changes) > 0;
   }
 
+  // Update message rxTime and timestamp when ACK is received (fixes outgoing message ordering)
+  updateMessageTimestamps(requestId: number, rxTime: number): boolean {
+    // For PostgreSQL/MySQL, fire-and-forget async update
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      if (this.messagesRepo) {
+        this.messagesRepo.updateMessageTimestamps(requestId, rxTime).catch((error) => {
+          logger.debug(`[DatabaseService] Message timestamp update skipped for requestId ${requestId}: ${error}`);
+        });
+      }
+      // Also update the cache immediately so poll returns updated state
+      for (const msg of this._messagesCache) {
+        if ((msg as any).requestId === requestId) {
+          (msg as any).rxTime = rxTime;
+          (msg as any).timestamp = rxTime;
+          break;
+        }
+      }
+      // Update channel-specific caches too
+      for (const [_channel, messages] of this._messagesCacheChannel) {
+        for (const msg of messages) {
+          if ((msg as any).requestId === requestId) {
+            (msg as any).rxTime = rxTime;
+            (msg as any).timestamp = rxTime;
+            break;
+          }
+        }
+      }
+      return true; // Optimistic return
+    }
+    const stmt = this.db.prepare(`
+      UPDATE messages
+      SET rxTime = ?, timestamp = ?
+      WHERE requestId = ?
+    `);
+    const result = stmt.run(rxTime, rxTime, requestId);
+    return Number(result.changes) > 0;
+  }
+
   getUnreadMessageIds(userId: number | null): string[] {
     const stmt = this.db.prepare(`
       SELECT m.id FROM messages m
@@ -8419,7 +9503,52 @@ class DatabaseService {
       }
     }
 
-    // MySQL not yet implemented, return empty
+    // MySQL implementation using mysqlPool
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        let query: string;
+        let params: any[];
+
+        if (userId === null) {
+          query = `
+            SELECT m.channel, COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm.messageId
+            WHERE rm.messageId IS NULL
+              AND m.channel != -1
+              AND m.portnum = 1
+              ${localNodeId ? 'AND m.fromNodeId != ?' : ''}
+            GROUP BY m.channel
+          `;
+          params = localNodeId ? [localNodeId] : [];
+        } else {
+          query = `
+            SELECT m.channel, COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm.messageId AND rm.userId = ?
+            WHERE rm.messageId IS NULL
+              AND m.channel != -1
+              AND m.portnum = 1
+              ${localNodeId ? 'AND m.fromNodeId != ?' : ''}
+            GROUP BY m.channel
+          `;
+          params = localNodeId ? [userId, localNodeId] : [userId];
+        }
+
+        const [rows] = await this.mysqlPool.query(query, params) as any;
+        const counts: {[channelId: number]: number} = {};
+
+        for (const row of rows) {
+          counts[Number(row.channel)] = Number(row.count);
+        }
+
+        return counts;
+      } catch (error) {
+        logger.error('Error getting unread counts by channel:', error);
+        return {};
+      }
+    }
+
     return {};
   }
 
@@ -8477,8 +9606,185 @@ class DatabaseService {
       }
     }
 
-    // MySQL not yet implemented, return 0
+    // MySQL implementation using mysqlPool
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        let query: string;
+        let params: any[];
+
+        if (userId === null) {
+          query = `
+            SELECT COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm.messageId
+            WHERE rm.messageId IS NULL
+              AND m.portnum = 1
+              AND m.channel = -1
+              AND m.fromNodeId = ?
+              AND m.toNodeId = ?
+          `;
+          params = [remoteNodeId, localNodeId];
+        } else {
+          query = `
+            SELECT COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm.messageId AND rm.userId = ?
+            WHERE rm.messageId IS NULL
+              AND m.portnum = 1
+              AND m.channel = -1
+              AND m.fromNodeId = ?
+              AND m.toNodeId = ?
+          `;
+          params = [userId, remoteNodeId, localNodeId];
+        }
+
+        const [rows] = await this.mysqlPool.query(query, params) as any;
+
+        if (rows.length > 0) {
+          return Number(rows[0].count);
+        }
+
+        return 0;
+      } catch (error) {
+        logger.error('Error getting unread DM count:', error);
+        return 0;
+      }
+    }
+
     return 0;
+  }
+
+  /**
+   * Get all DM unread counts in a single batch query, grouped by remote node.
+   * Returns { [fromNodeId: string]: number } for all nodes with unread DMs.
+   */
+  getBatchUnreadDMCounts(localNodeId: string, userId: number | null): { [fromNodeId: string]: number } {
+    // For PostgreSQL/MySQL, return empty (handled by async version)
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      return {};
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT m.fromNodeId, COUNT(*) as count
+      FROM messages m
+      LEFT JOIN read_messages rm ON m.id = rm.message_id AND rm.user_id ${userId === null ? 'IS NULL' : '= ?'}
+      WHERE rm.message_id IS NULL
+        AND m.portnum = 1
+        AND m.channel = -1
+        AND m.toNodeId = ?
+      GROUP BY m.fromNodeId
+    `);
+
+    const params = userId === null
+      ? [localNodeId]
+      : [userId, localNodeId];
+
+    const rows = stmt.all(...params) as { fromNodeId: string; count: number }[];
+    const result: { [fromNodeId: string]: number } = {};
+    for (const row of rows) {
+      result[row.fromNodeId] = Number(row.count);
+    }
+    return result;
+  }
+
+  /**
+   * Async version of getBatchUnreadDMCounts for PostgreSQL/MySQL support.
+   */
+  async getBatchUnreadDMCountsAsync(localNodeId: string, userId: number | null): Promise<{ [fromNodeId: string]: number }> {
+    // For SQLite, use sync version
+    if (this.drizzleDbType !== 'postgres' && this.drizzleDbType !== 'mysql') {
+      return this.getBatchUnreadDMCounts(localNodeId, userId);
+    }
+
+    // PostgreSQL implementation
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        let query: string;
+        let params: any[];
+
+        if (userId === null) {
+          query = `
+            SELECT m."fromNodeId", COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm."messageId"
+            WHERE rm."messageId" IS NULL
+              AND m.portnum = 1
+              AND m.channel = -1
+              AND m."toNodeId" = $1
+            GROUP BY m."fromNodeId"
+          `;
+          params = [localNodeId];
+        } else {
+          query = `
+            SELECT m."fromNodeId", COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm."messageId" AND rm."userId" = $1
+            WHERE rm."messageId" IS NULL
+              AND m.portnum = 1
+              AND m.channel = -1
+              AND m."toNodeId" = $2
+            GROUP BY m."fromNodeId"
+          `;
+          params = [userId, localNodeId];
+        }
+
+        const result = await this.postgresPool.query(query, params);
+        const counts: { [fromNodeId: string]: number } = {};
+        for (const row of result.rows) {
+          counts[row.fromNodeId] = Number(row.count);
+        }
+        return counts;
+      } catch (error) {
+        logger.error('Error getting batch unread DM counts:', error);
+        return {};
+      }
+    }
+
+    // MySQL implementation using mysqlPool
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        let query: string;
+        let params: any[];
+
+        if (userId === null) {
+          query = `
+            SELECT m.fromNodeId, COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm.messageId
+            WHERE rm.messageId IS NULL
+              AND m.portnum = 1
+              AND m.channel = -1
+              AND m.toNodeId = ?
+            GROUP BY m.fromNodeId
+          `;
+          params = [localNodeId];
+        } else {
+          query = `
+            SELECT m.fromNodeId, COUNT(*) as count
+            FROM messages m
+            LEFT JOIN read_messages rm ON m.id = rm.messageId AND rm.userId = ?
+            WHERE rm.messageId IS NULL
+              AND m.portnum = 1
+              AND m.channel = -1
+              AND m.toNodeId = ?
+            GROUP BY m.fromNodeId
+          `;
+          params = [userId, localNodeId];
+        }
+
+        const [rows] = await this.mysqlPool.query(query, params) as any;
+        const counts: { [fromNodeId: string]: number } = {};
+        for (const row of rows) {
+          counts[row.fromNodeId] = Number(row.count);
+        }
+        return counts;
+      } catch (error) {
+        logger.error('Error getting batch unread DM counts:', error);
+        return {};
+      }
+    }
+
+    return {};
   }
 
   cleanupOldReadMessages(days: number): number {
@@ -9098,6 +10404,277 @@ class DatabaseService {
     return Number(result.changes);
   }
 
+  /**
+   * Get packet counts grouped by from_node (for distribution charts)
+   * Returns top N nodes by packet count, plus counts for remainder grouped as "Other"
+   */
+  async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number }): Promise<DbPacketCountByNode[]> {
+    const { since, limit = 10, portnum } = options || {};
+
+    // For PostgreSQL
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        const params: any[] = [];
+        let paramIndex = 1;
+        const conditions: string[] = [];
+
+        if (since !== undefined) {
+          conditions.push(`pl.timestamp >= $${paramIndex++}`);
+          params.push(since);
+        }
+        if (portnum !== undefined) {
+          conditions.push(`pl.portnum = $${paramIndex++}`);
+          params.push(portnum);
+        }
+
+        let query = `
+          SELECT
+            pl.from_node,
+            n."nodeId" as "from_node_id",
+            n."longName" as "from_node_longName",
+            COUNT(*) as count
+          FROM packet_log pl
+          LEFT JOIN nodes n ON pl.from_node = n."nodeNum"
+        `;
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` GROUP BY pl.from_node, n."nodeId", n."longName" ORDER BY count DESC LIMIT $${paramIndex++}`;
+        params.push(limit);
+
+        const result = await this.postgresPool.query(query, params);
+        return (result.rows ?? []).map((row: any) => ({
+          from_node: Number(row.from_node),
+          from_node_id: row.from_node_id,
+          from_node_longName: row.from_node_longName,
+          count: Number(row.count),
+        }));
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to get packet counts by node:', error);
+        return [];
+      }
+    }
+
+    // For MySQL
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        if (since !== undefined) {
+          conditions.push(`pl.timestamp >= ?`);
+          params.push(since);
+        }
+        if (portnum !== undefined) {
+          conditions.push(`pl.portnum = ?`);
+          params.push(portnum);
+        }
+
+        let query = `
+          SELECT
+            pl.from_node,
+            n.nodeId as from_node_id,
+            n.longName as from_node_longName,
+            COUNT(*) as count
+          FROM packet_log pl
+          LEFT JOIN nodes n ON pl.from_node = n.nodeNum
+        `;
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` GROUP BY pl.from_node, n.nodeId, n.longName ORDER BY count DESC LIMIT ?`;
+        params.push(limit);
+
+        const [rows] = await this.mysqlPool.query(query, params);
+        return ((rows as any[]) ?? []).map((row: any) => ({
+          from_node: Number(row.from_node),
+          from_node_id: row.from_node_id,
+          from_node_longName: row.from_node_longName,
+          count: Number(row.count),
+        }));
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to get packet counts by node:', error);
+        return [];
+      }
+    }
+
+    // For SQLite
+    try {
+      const params: any[] = [];
+      const conditions: string[] = [];
+
+      if (since !== undefined) {
+        conditions.push(`pl.timestamp >= ?`);
+        params.push(since);
+      }
+      if (portnum !== undefined) {
+        conditions.push(`pl.portnum = ?`);
+        params.push(portnum);
+      }
+
+      let query = `
+        SELECT
+          pl.from_node,
+          n.nodeId as from_node_id,
+          n.longName as from_node_longName,
+          COUNT(*) as count
+        FROM packet_log pl
+        LEFT JOIN nodes n ON pl.from_node = n.nodeNum
+      `;
+
+      if (conditions.length > 0) {
+        query += ` WHERE ${conditions.join(' AND ')}`;
+      }
+
+      query += ` GROUP BY pl.from_node ORDER BY count DESC LIMIT ?`;
+      params.push(limit);
+
+      const stmt = this.db.prepare(query);
+      const rows = stmt.all(...params) as any[];
+      return rows.map((row: any) => ({
+        from_node: Number(row.from_node),
+        from_node_id: row.from_node_id,
+        from_node_longName: row.from_node_longName,
+        count: Number(row.count),
+      }));
+    } catch (error) {
+      logger.error('[DatabaseService] Failed to get packet counts by node:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get packet counts grouped by portnum (for distribution charts)
+   * Includes port name from meshtastic constants
+   */
+  async getPacketCountsByPortnumAsync(options?: { since?: number; from_node?: number }): Promise<DbPacketCountByPortnum[]> {
+    const { since, from_node } = options || {};
+
+    // For PostgreSQL
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        const params: any[] = [];
+        let paramIndex = 1;
+        const conditions: string[] = [];
+
+        if (since !== undefined) {
+          conditions.push(`timestamp >= $${paramIndex++}`);
+          params.push(since);
+        }
+        if (from_node !== undefined) {
+          conditions.push(`from_node = $${paramIndex++}`);
+          params.push(from_node);
+        }
+
+        let query = `
+          SELECT
+            portnum,
+            COUNT(*) as count
+          FROM packet_log
+        `;
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` GROUP BY portnum ORDER BY count DESC`;
+
+        const result = await this.postgresPool.query(query, params);
+        return (result.rows ?? []).map((row: any) => ({
+          portnum: Number(row.portnum),
+          portnum_name: getPortNumName(Number(row.portnum)),
+          count: Number(row.count),
+        }));
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to get packet counts by portnum:', error);
+        return [];
+      }
+    }
+
+    // For MySQL
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        if (since !== undefined) {
+          conditions.push(`timestamp >= ?`);
+          params.push(since);
+        }
+        if (from_node !== undefined) {
+          conditions.push(`from_node = ?`);
+          params.push(from_node);
+        }
+
+        let query = `
+          SELECT
+            portnum,
+            COUNT(*) as count
+          FROM packet_log
+        `;
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` GROUP BY portnum ORDER BY count DESC`;
+
+        const [rows] = await this.mysqlPool.query(query, params);
+        return ((rows as any[]) ?? []).map((row: any) => ({
+          portnum: Number(row.portnum),
+          portnum_name: getPortNumName(Number(row.portnum)),
+          count: Number(row.count),
+        }));
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to get packet counts by portnum:', error);
+        return [];
+      }
+    }
+
+    // For SQLite
+    try {
+      const conditions: string[] = [];
+      const params: any[] = [];
+
+      if (since !== undefined) {
+        conditions.push(`timestamp >= ?`);
+        params.push(since);
+      }
+      if (from_node !== undefined) {
+        conditions.push(`from_node = ?`);
+        params.push(from_node);
+      }
+
+      let query = `
+        SELECT
+          portnum,
+          COUNT(*) as count
+        FROM packet_log
+      `;
+
+      if (conditions.length > 0) {
+        query += ` WHERE ${conditions.join(' AND ')}`;
+      }
+
+      query += ` GROUP BY portnum ORDER BY count DESC`;
+
+      const stmt = this.db.prepare(query);
+      const rows = stmt.all(...params) as any[];
+      return rows.map((row: any) => ({
+        portnum: Number(row.portnum),
+        portnum_name: getPortNumName(Number(row.portnum)),
+        count: Number(row.count),
+      }));
+    } catch (error) {
+      logger.error('[DatabaseService] Failed to get packet counts by portnum:', error);
+      return [];
+    }
+  }
+
   // Custom Themes Methods
 
   /**
@@ -9324,6 +10901,57 @@ class DatabaseService {
       // Run migration 060: Add enabled column to auto_traceroute_nodes
       await runMigration060Postgres(client);
 
+      // Run migration 061: Add spam detection columns to nodes
+      await runMigration061Postgres(client);
+
+      // Run migration 062: Upgrade position columns from REAL to DOUBLE PRECISION
+      await runMigration062Postgres(client);
+
+      // Run migration 063: Add position_history_hours column
+      await runMigration063Postgres(client);
+
+      // Run migration 064: Add enforce_name_validation column to channel_database
+      await runMigration064Postgres(client);
+
+      // Run migration 065: Add sortOrder column to channel_database
+      await runMigration065Postgres(client);
+
+      // Run migration 066: Add ignored_nodes table
+      await runMigration066Postgres(client);
+
+      // Run migration 067: Add auto time sync schema
+      await runMigration067Postgres(client);
+
+      // Run migration 068: Add MFA columns to users table
+      await runMigration068Postgres(client);
+
+      // Run migration 069: Add position snapshot columns to traceroutes and route_segments
+      await runMigration069Postgres(client);
+
+      // Run migration 070: Add MeshCore tables
+      await runMigration070MeshcorePostgres(client);
+
+      // Run migration 071: Add meshcore permission resource
+      await runMigration071Postgres(client);
+
+      // Run migration 072: Add DM unread index
+      await runMigration072Postgres(client);
+
+      // Run migration 073: Add packetId to telemetry
+      await runMigration073Postgres(client);
+
+      // Run migration 074: Add show_meshcore_nodes to user_map_preferences
+      await runMigration074Postgres(client);
+
+      // Run migration 075: Upgrade telemetry packetId to BIGINT
+      await runMigration075Postgres(client);
+
+      // Run migration 076: Add show_accuracy_regions and show_estimated_positions
+      await runMigration076Postgres(client);
+
+      // Run migration 077: Upgrade ignored_nodes.nodeNum to BIGINT
+      await runMigration077Postgres(client);
+
       // Verify all expected tables exist
       const result = await client.query(`
         SELECT table_name FROM information_schema.tables
@@ -9416,6 +11044,57 @@ class DatabaseService {
       // Run migration 060: Add enabled column to auto_traceroute_nodes
       await runMigration060Mysql(pool);
 
+      // Run migration 061: Add spam detection columns to nodes
+      await runMigration061Mysql(pool);
+
+      // Run migration 062: Position precision (no-op for MySQL, already uses DOUBLE)
+      await runMigration062Mysql(pool);
+
+      // Run migration 063: Add position_history_hours column
+      await runMigration063Mysql(pool);
+
+      // Run migration 064: Add enforce_name_validation column to channel_database
+      await runMigration064Mysql(pool);
+
+      // Run migration 065: Add sortOrder column to channel_database
+      await runMigration065Mysql(pool);
+
+      // Run migration 066: Add ignored_nodes table
+      await runMigration066Mysql(pool);
+
+      // Run migration 067: Add auto time sync schema
+      await runMigration067Mysql(pool);
+
+      // Run migration 068: Add MFA columns to users table
+      await runMigration068Mysql(pool);
+
+      // Run migration 069: Add position snapshot columns to traceroutes and route_segments
+      await runMigration069Mysql(pool);
+
+      // Run migration 070: Add MeshCore tables
+      await runMigration070MeshcoreMysql(pool);
+
+      // Run migration 071: Add meshcore permission resource
+      await runMigration071Mysql(pool);
+
+      // Run migration 072: Add DM unread index
+      await runMigration072Mysql(pool);
+
+      // Run migration 073: Add packetId to telemetry
+      await runMigration073Mysql(pool);
+
+      // Run migration 074: Add show_meshcore_nodes to user_map_preferences
+      await runMigration074Mysql(pool);
+
+      // Run migration 075: Upgrade telemetry packetId to BIGINT
+      await runMigration075Mysql(pool);
+
+      // Run migration 076: Add show_accuracy_regions and show_estimated_positions
+      await runMigration076Mysql(pool);
+
+      // Run migration 077: Upgrade ignored_nodes.nodeNum to BIGINT
+      await runMigration077Mysql(pool);
+
       // Verify all expected tables exist
       const [rows] = await connection.query(`
         SELECT table_name FROM information_schema.tables
@@ -9457,6 +11136,9 @@ class DatabaseService {
         isAdmin: dbUser.isAdmin,
         isActive: dbUser.isActive,
         passwordLocked: dbUser.passwordLocked,
+        mfaEnabled: dbUser.mfaEnabled ?? false,
+        mfaSecret: dbUser.mfaSecret ?? null,
+        mfaBackupCodes: dbUser.mfaBackupCodes ?? null,
         createdAt: dbUser.createdAt,
         lastLoginAt: dbUser.lastLoginAt,
       };
@@ -9495,6 +11177,9 @@ class DatabaseService {
         isAdmin: dbUser.isAdmin,
         isActive: dbUser.isActive,
         passwordLocked: dbUser.passwordLocked,
+        mfaEnabled: dbUser.mfaEnabled ?? false,
+        mfaSecret: dbUser.mfaSecret ?? null,
+        mfaBackupCodes: dbUser.mfaBackupCodes ?? null,
         createdAt: dbUser.createdAt,
         lastLoginAt: Date.now(),
       };
@@ -9554,6 +11239,9 @@ class DatabaseService {
         isAdmin: dbUser.isAdmin,
         isActive: dbUser.isActive,
         passwordLocked: dbUser.passwordLocked,
+        mfaEnabled: dbUser.mfaEnabled ?? false,
+        mfaSecret: dbUser.mfaSecret ?? null,
+        mfaBackupCodes: dbUser.mfaBackupCodes ?? null,
         createdAt: dbUser.createdAt,
         lastLoginAt: dbUser.lastLoginAt,
       };
@@ -9751,6 +11439,56 @@ class DatabaseService {
     await this.userModel.updatePassword(userId, newPassword);
   }
 
+  // ============ ASYNC MFA METHODS ============
+
+  /**
+   * Update MFA secret and backup codes for a user.
+   */
+  async updateUserMfaSecretAsync(userId: number, secret: string, backupCodes: string): Promise<void> {
+    if (this.authRepo) {
+      await this.authRepo.updateUser(userId, { mfaSecret: secret, mfaBackupCodes: backupCodes });
+      return;
+    }
+    // Fallback to sync for SQLite
+    this.userModel.update(userId, { mfaSecret: secret, mfaBackupCodes: backupCodes });
+  }
+
+  /**
+   * Clear MFA data for a user (disable MFA).
+   */
+  async clearUserMfaAsync(userId: number): Promise<void> {
+    if (this.authRepo) {
+      await this.authRepo.updateUser(userId, { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: null });
+      return;
+    }
+    // Fallback to sync for SQLite
+    this.userModel.update(userId, { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: null });
+  }
+
+  /**
+   * Enable MFA for a user (set mfaEnabled to true).
+   */
+  async enableUserMfaAsync(userId: number): Promise<void> {
+    if (this.authRepo) {
+      await this.authRepo.updateUser(userId, { mfaEnabled: true });
+      return;
+    }
+    // Fallback to sync for SQLite
+    this.userModel.update(userId, { mfaEnabled: true });
+  }
+
+  /**
+   * Update backup codes for a user (after one is consumed).
+   */
+  async consumeBackupCodeAsync(userId: number, remainingCodes: string): Promise<void> {
+    if (this.authRepo) {
+      await this.authRepo.updateUser(userId, { mfaBackupCodes: remainingCodes });
+      return;
+    }
+    // Fallback to sync for SQLite
+    this.userModel.update(userId, { mfaBackupCodes: remainingCodes });
+  }
+
   // ============ ASYNC CHANNEL DATABASE METHODS ============
   // These methods provide server-side decryption channel management
 
@@ -9793,6 +11531,7 @@ class DatabaseService {
     pskLength: number;
     description?: string | null;
     isEnabled?: boolean;
+    enforceNameValidation?: boolean;
     createdBy?: number | null;
   }): Promise<number> {
     if (!this.channelDatabaseRepo) {
@@ -9810,6 +11549,8 @@ class DatabaseService {
     pskLength?: number;
     description?: string | null;
     isEnabled?: boolean;
+    enforceNameValidation?: boolean;
+    sortOrder?: number;
   }): Promise<void> {
     if (!this.channelDatabaseRepo) {
       throw new Error('Channel database repository not initialized');
@@ -9825,6 +11566,17 @@ class DatabaseService {
       throw new Error('Channel database repository not initialized');
     }
     return this.channelDatabaseRepo.deleteAsync(id);
+  }
+
+  /**
+   * Reorder channel database entries
+   * Updates the sortOrder for each entry in the provided array
+   */
+  async reorderChannelDatabaseEntriesAsync(updates: { id: number; sortOrder: number }[]): Promise<void> {
+    if (!this.channelDatabaseRepo) {
+      throw new Error('Channel database repository not initialized');
+    }
+    return this.channelDatabaseRepo.reorderAsync(updates);
   }
 
   /**
@@ -10094,6 +11846,178 @@ class DatabaseService {
       oldestBackup: stats.oldestTimestamp ? new Date(stats.oldestTimestamp).toISOString() : null,
       newestBackup: stats.newestTimestamp ? new Date(stats.newestTimestamp).toISOString() : null,
     };
+  }
+
+  // ============ AUTO TIME SYNC SETTINGS ============
+
+  /**
+   * Check if auto time sync is enabled
+   */
+  isAutoTimeSyncEnabled(): boolean {
+    const value = this.getSetting('autoTimeSyncEnabled');
+    return value === 'true';
+  }
+
+  /**
+   * Enable or disable auto time sync
+   */
+  setAutoTimeSyncEnabled(enabled: boolean): void {
+    this.setSetting('autoTimeSyncEnabled', enabled ? 'true' : 'false');
+  }
+
+  /**
+   * Get auto time sync interval in minutes
+   */
+  getAutoTimeSyncIntervalMinutes(): number {
+    const value = this.getSetting('autoTimeSyncIntervalMinutes');
+    return value ? parseInt(value, 10) : 15;
+  }
+
+  /**
+   * Set auto time sync interval in minutes
+   */
+  setAutoTimeSyncIntervalMinutes(minutes: number): void {
+    this.setSetting('autoTimeSyncIntervalMinutes', String(minutes));
+  }
+
+  /**
+   * Get auto time sync expiration hours
+   */
+  getAutoTimeSyncExpirationHours(): number {
+    const value = this.getSetting('autoTimeSyncExpirationHours');
+    return value ? parseInt(value, 10) : 24;
+  }
+
+  /**
+   * Set auto time sync expiration hours
+   */
+  setAutoTimeSyncExpirationHours(hours: number): void {
+    this.setSetting('autoTimeSyncExpirationHours', String(hours));
+  }
+
+  /**
+   * Check if auto time sync node filter is enabled
+   */
+  isAutoTimeSyncNodeFilterEnabled(): boolean {
+    const value = this.getSetting('autoTimeSyncNodeFilterEnabled');
+    return value === 'true';
+  }
+
+  /**
+   * Enable or disable auto time sync node filter
+   */
+  setAutoTimeSyncNodeFilterEnabled(enabled: boolean): void {
+    this.setSetting('autoTimeSyncNodeFilterEnabled', enabled ? 'true' : 'false');
+  }
+
+  /**
+   * Get auto time sync nodes
+   */
+  async getAutoTimeSyncNodesAsync(): Promise<number[]> {
+    if (this.miscRepo) {
+      return await this.miscRepo.getAutoTimeSyncNodes();
+    }
+    return [];
+  }
+
+  /**
+   * Set auto time sync nodes
+   */
+  async setAutoTimeSyncNodesAsync(nodeNums: number[]): Promise<void> {
+    if (this.miscRepo) {
+      await this.miscRepo.setAutoTimeSyncNodes(nodeNums);
+      logger.debug(`✅ Set auto-time-sync filter to ${nodeNums.length} nodes`);
+    }
+  }
+
+  /**
+   * Get time sync filter settings
+   */
+  async getTimeSyncFilterSettingsAsync(): Promise<{
+    enabled: boolean;
+    nodeNums: number[];
+    filterEnabled: boolean;
+    expirationHours: number;
+    intervalMinutes: number;
+  }> {
+    const nodeNums = await this.getAutoTimeSyncNodesAsync();
+    return {
+      enabled: this.isAutoTimeSyncEnabled(),
+      nodeNums,
+      filterEnabled: this.isAutoTimeSyncNodeFilterEnabled(),
+      expirationHours: this.getAutoTimeSyncExpirationHours(),
+      intervalMinutes: this.getAutoTimeSyncIntervalMinutes(),
+    };
+  }
+
+  /**
+   * Set time sync filter settings
+   */
+  async setTimeSyncFilterSettingsAsync(settings: {
+    enabled?: boolean;
+    nodeNums?: number[];
+    filterEnabled?: boolean;
+    expirationHours?: number;
+    intervalMinutes?: number;
+  }): Promise<void> {
+    if (settings.enabled !== undefined) {
+      this.setAutoTimeSyncEnabled(settings.enabled);
+    }
+    if (settings.nodeNums !== undefined) {
+      await this.setAutoTimeSyncNodesAsync(settings.nodeNums);
+    }
+    if (settings.filterEnabled !== undefined) {
+      this.setAutoTimeSyncNodeFilterEnabled(settings.filterEnabled);
+    }
+    if (settings.expirationHours !== undefined) {
+      this.setAutoTimeSyncExpirationHours(settings.expirationHours);
+    }
+    if (settings.intervalMinutes !== undefined) {
+      this.setAutoTimeSyncIntervalMinutes(settings.intervalMinutes);
+    }
+    logger.debug('✅ Updated time sync filter settings');
+  }
+
+  /**
+   * Get a node that needs time sync
+   */
+  async getNodeNeedingTimeSyncAsync(): Promise<DbNode | null> {
+    if (!this.nodesRepo) {
+      return null;
+    }
+
+    const activeHours = 48; // Only consider nodes heard in last 48 hours
+    // lastHeard is stored in seconds, so convert cutoff to seconds
+    const activeNodeCutoff = Math.floor((Date.now() - (activeHours * 60 * 60 * 1000)) / 1000);
+    const expirationHours = this.getAutoTimeSyncExpirationHours();
+    // lastTimeSync is stored in milliseconds
+    const expirationMsAgo = Date.now() - (expirationHours * 60 * 60 * 1000);
+
+    // Get filter settings
+    let filterNodeNums: number[] | undefined;
+    if (this.isAutoTimeSyncNodeFilterEnabled()) {
+      filterNodeNums = await this.getAutoTimeSyncNodesAsync();
+      if (filterNodeNums.length === 0) {
+        // Filter is enabled but no nodes selected - skip
+        return null;
+      }
+    }
+
+    const node = await this.nodesRepo.getNodeNeedingTimeSyncAsync(
+      activeNodeCutoff,
+      expirationMsAgo,
+      filterNodeNums
+    );
+    return node as DbNode | null;
+  }
+
+  /**
+   * Update a node's lastTimeSync timestamp
+   */
+  async updateNodeTimeSyncAsync(nodeNum: number, timestamp: number): Promise<void> {
+    if (this.nodesRepo) {
+      await this.nodesRepo.updateNodeTimeSyncAsync(nodeNum, timestamp);
+    }
   }
 }
 

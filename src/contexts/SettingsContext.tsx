@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, ReactNode } from 'react';
 import { type TemperatureUnit } from '../utils/temperature';
 import { type SortField, type SortDirection } from '../types/ui';
+import { type SortOption as DashboardSortOption } from '../components/Dashboard/types';
 import { logger } from '../utils/logger';
 import { useCsrf } from './CsrfContext';
 import { DEFAULT_TILESET_ID, type TilesetId, type CustomTileset } from '../config/tilesets';
@@ -8,6 +9,7 @@ import i18n from '../config/i18n';
 import { type TapbackEmoji, DEFAULT_TAPBACK_EMOJIS } from '../components/EmojiPickerModal/EmojiPickerModal';
 
 export type DistanceUnit = 'km' | 'mi';
+export type PositionHistoryLineStyle = 'linear' | 'spline';
 export type TimeFormat = '12' | '24';
 export type DateFormat = 'MM/DD/YYYY' | 'DD/MM/YYYY' | 'YYYY-MM-DD';
 export type MapPinStyle = 'meshmonitor' | 'official';
@@ -45,10 +47,12 @@ interface SettingsContextType {
   tracerouteIntervalMinutes: number;
   temperatureUnit: TemperatureUnit;
   distanceUnit: DistanceUnit;
+  positionHistoryLineStyle: PositionHistoryLineStyle;
   telemetryVisualizationHours: number;
   favoriteTelemetryStorageDays: number;
   preferredSortField: SortField;
   preferredSortDirection: SortDirection;
+  preferredDashboardSortOption: DashboardSortOption;
   timeFormat: TimeFormat;
   dateFormat: DateFormat;
   mapTileset: TilesetId;
@@ -79,10 +83,12 @@ interface SettingsContextType {
   setTracerouteIntervalMinutes: (minutes: number) => void;
   setTemperatureUnit: (unit: TemperatureUnit) => void;
   setDistanceUnit: (unit: DistanceUnit) => void;
+  setPositionHistoryLineStyle: (style: PositionHistoryLineStyle) => void;
   setTelemetryVisualizationHours: (hours: number) => void;
   setFavoriteTelemetryStorageDays: (days: number) => void;
   setPreferredSortField: (field: SortField) => void;
   setPreferredSortDirection: (direction: SortDirection) => void;
+  setPreferredDashboardSortOption: (option: DashboardSortOption) => void;
   setTimeFormat: (format: TimeFormat) => void;
   setDateFormat: (format: DateFormat) => void;
   setMapTileset: (tilesetId: TilesetId) => void;
@@ -152,6 +158,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     return (saved === 'mi' ? 'mi' : 'km') as DistanceUnit;
   });
 
+  const [positionHistoryLineStyle, setPositionHistoryLineStyleState] = useState<PositionHistoryLineStyle>(() => {
+    const saved = localStorage.getItem('positionHistoryLineStyle');
+    return (saved === 'linear' ? 'linear' : 'spline') as PositionHistoryLineStyle;
+  });
+
   const [telemetryVisualizationHours, setTelemetryVisualizationHoursState] = useState<number>(() => {
     const saved = localStorage.getItem('telemetryVisualizationHours');
     return saved ? parseInt(saved) : 24;
@@ -170,6 +181,12 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
   const [preferredSortDirection, setPreferredSortDirectionState] = useState<SortDirection>(() => {
     const saved = localStorage.getItem('preferredSortDirection');
     return (saved === 'desc' ? 'desc' : 'asc') as SortDirection;
+  });
+
+  const [preferredDashboardSortOption, setPreferredDashboardSortOptionState] = useState<DashboardSortOption>(() => {
+    const saved = localStorage.getItem('preferredDashboardSortOption');
+    const validOptions: DashboardSortOption[] = ['custom', 'node-asc', 'node-desc', 'type-asc', 'type-desc'];
+    return (saved && validOptions.includes(saved as DashboardSortOption) ? saved : 'custom') as DashboardSortOption;
   });
 
   const [timeFormat, setTimeFormatState] = useState<TimeFormat>(() => {
@@ -320,6 +337,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     localStorage.setItem('distanceUnit', unit);
   };
 
+  const setPositionHistoryLineStyle = (style: PositionHistoryLineStyle) => {
+    setPositionHistoryLineStyleState(style);
+    localStorage.setItem('positionHistoryLineStyle', style);
+  };
+
   const setTelemetryVisualizationHours = (hours: number) => {
     setTelemetryVisualizationHoursState(hours);
     localStorage.setItem('telemetryVisualizationHours', hours.toString());
@@ -338,6 +360,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
   const setPreferredSortDirection = (direction: SortDirection) => {
     setPreferredSortDirectionState(direction);
     localStorage.setItem('preferredSortDirection', direction);
+  };
+
+  const setPreferredDashboardSortOption = (option: DashboardSortOption) => {
+    setPreferredDashboardSortOptionState(option);
+    localStorage.setItem('preferredDashboardSortOption', option);
   };
 
   const setTimeFormat = (format: TimeFormat) => {
@@ -755,6 +782,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
             localStorage.setItem('distanceUnit', settings.distanceUnit);
           }
 
+          if (settings.positionHistoryLineStyle) {
+            setPositionHistoryLineStyleState(settings.positionHistoryLineStyle as PositionHistoryLineStyle);
+            localStorage.setItem('positionHistoryLineStyle', settings.positionHistoryLineStyle);
+          }
+
           if (settings.telemetryVisualizationHours) {
             const value = parseInt(settings.telemetryVisualizationHours);
             if (!isNaN(value)) {
@@ -779,6 +811,14 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
           if (settings.preferredSortDirection) {
             setPreferredSortDirectionState(settings.preferredSortDirection as SortDirection);
             localStorage.setItem('preferredSortDirection', settings.preferredSortDirection);
+          }
+
+          if (settings.preferredDashboardSortOption) {
+            const validOptions: DashboardSortOption[] = ['custom', 'node-asc', 'node-desc', 'type-asc', 'type-desc'];
+            if (validOptions.includes(settings.preferredDashboardSortOption as DashboardSortOption)) {
+              setPreferredDashboardSortOptionState(settings.preferredDashboardSortOption as DashboardSortOption);
+              localStorage.setItem('preferredDashboardSortOption', settings.preferredDashboardSortOption);
+            }
           }
 
           if (settings.timeFormat) {
@@ -950,10 +990,12 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     tracerouteIntervalMinutes,
     temperatureUnit,
     distanceUnit,
+    positionHistoryLineStyle,
     telemetryVisualizationHours,
     favoriteTelemetryStorageDays,
     preferredSortField,
     preferredSortDirection,
+    preferredDashboardSortOption,
     timeFormat,
     dateFormat,
     mapTileset,
@@ -984,10 +1026,12 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     setTracerouteIntervalMinutes,
     setTemperatureUnit,
     setDistanceUnit,
+    setPositionHistoryLineStyle,
     setTelemetryVisualizationHours,
     setFavoriteTelemetryStorageDays,
     setPreferredSortField,
     setPreferredSortDirection,
+    setPreferredDashboardSortOption,
     setTimeFormat,
     setDateFormat,
     setMapTileset,

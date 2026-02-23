@@ -43,6 +43,9 @@ interface FilterSettings {
   filterRegexEnabled: boolean;
   expirationHours: number;
   sortByHops: boolean;
+  scheduleEnabled: boolean;
+  scheduleStart: string;
+  scheduleEnd: string;
 }
 
 interface TracerouteLogEntry {
@@ -62,7 +65,7 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
   const csrfFetch = useCsrfFetch();
   const { showToast } = useToast();
   const [localEnabled, setLocalEnabled] = useState(intervalMinutes > 0);
-  const [localInterval, setLocalInterval] = useState(intervalMinutes > 0 ? intervalMinutes : 3);
+  const [localInterval, setLocalInterval] = useState(intervalMinutes > 0 ? intervalMinutes : 15);
   const [hasChanges, setHasChanges] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -87,6 +90,11 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
   // Sort by hops - prioritize closer nodes for traceroute
   const [sortByHops, setSortByHops] = useState(false);
 
+  // Schedule time window
+  const [scheduleEnabled, setScheduleEnabled] = useState(false);
+  const [scheduleStart, setScheduleStart] = useState('00:00');
+  const [scheduleEnd, setScheduleEnd] = useState('00:00');
+
   // Auto-traceroute log
   const [tracerouteLog, setTracerouteLog] = useState<TracerouteLogEntry[]>([]);
 
@@ -108,7 +116,7 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
   // Update local state when props change
   useEffect(() => {
     setLocalEnabled(intervalMinutes > 0);
-    setLocalInterval(intervalMinutes > 0 ? intervalMinutes : 3);
+    setLocalInterval(intervalMinutes > 0 ? intervalMinutes : 15);
   }, [intervalMinutes]);
 
   // Fetch available nodes
@@ -127,13 +135,17 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
     fetchNodes();
   }, [baseUrl, csrfFetch]);
 
-  // Fetch current filter settings
+  // Fetch current filter settings and schedule settings together to avoid race conditions
   useEffect(() => {
-    const fetchFilterSettings = async () => {
+    const fetchAllSettings = async () => {
       try {
-        const response = await csrfFetch(`${baseUrl}/api/settings/traceroute-nodes`);
-        if (response.ok) {
-          const data: FilterSettings = await response.json();
+        const [filterResponse, settingsResponse] = await Promise.all([
+          csrfFetch(`${baseUrl}/api/settings/traceroute-nodes`),
+          csrfFetch(`${baseUrl}/api/settings`),
+        ]);
+
+        if (filterResponse.ok) {
+          const data: FilterSettings = await filterResponse.json();
           setFilterEnabled(data.enabled);
           setSelectedNodeNums(data.nodeNums || []);
           setFilterChannels(data.filterChannels || []);
@@ -150,13 +162,34 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
           setExpirationHours(data.expirationHours || 24);
           // Load sort by hops setting (default to false)
           setSortByHops(data.sortByHops || false);
-          setInitialSettings(data);
+
+          // Load schedule settings from general settings
+          let schedEnabled = false;
+          let schedStart = '00:00';
+          let schedEnd = '00:00';
+          if (settingsResponse.ok) {
+            const settingsData = await settingsResponse.json();
+            schedEnabled = settingsData.tracerouteScheduleEnabled === 'true';
+            schedStart = settingsData.tracerouteScheduleStart || '00:00';
+            schedEnd = settingsData.tracerouteScheduleEnd || '00:00';
+          }
+          setScheduleEnabled(schedEnabled);
+          setScheduleStart(schedStart);
+          setScheduleEnd(schedEnd);
+
+          // Set initial settings once with all data
+          setInitialSettings({
+            ...data,
+            scheduleEnabled: schedEnabled,
+            scheduleStart: schedStart,
+            scheduleEnd: schedEnd,
+          });
         }
       } catch (error) {
-        console.error('Failed to fetch filter settings:', error);
+        console.error('Failed to fetch settings:', error);
       }
     };
-    fetchFilterSettings();
+    fetchAllSettings();
   }, [baseUrl, csrfFetch]);
 
   // Fetch auto-traceroute log
@@ -212,17 +245,23 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
     // Check sort by hops change
     const sortByHopsChanged = sortByHops !== (initialSettings.sortByHops || false);
 
+    // Check schedule changes
+    const scheduleEnabledChanged = scheduleEnabled !== (initialSettings.scheduleEnabled || false);
+    const scheduleStartChanged = scheduleStart !== (initialSettings.scheduleStart || '00:00');
+    const scheduleEndChanged = scheduleEnd !== (initialSettings.scheduleEnd || '00:00');
+
     const changed = intervalChanged || filterEnabledChanged || nodesChanged || channelsChanged || rolesChanged || hwModelsChanged || regexChanged ||
       filterNodesEnabledChanged || filterChannelsEnabledChanged || filterRolesEnabledChanged || filterHwModelsEnabledChanged || filterRegexEnabledChanged ||
-      expirationHoursChanged || sortByHopsChanged;
+      expirationHoursChanged || sortByHopsChanged || scheduleEnabledChanged || scheduleStartChanged || scheduleEndChanged;
     setHasChanges(changed);
   }, [localEnabled, localInterval, intervalMinutes, filterEnabled, selectedNodeNums, filterChannels, filterRoles, filterHwModels, filterNameRegex, initialSettings,
-      filterNodesEnabled, filterChannelsEnabled, filterRolesEnabled, filterHwModelsEnabled, filterRegexEnabled, expirationHours, sortByHops]);
+      filterNodesEnabled, filterChannelsEnabled, filterRolesEnabled, filterHwModelsEnabled, filterRegexEnabled, expirationHours, sortByHops,
+      scheduleEnabled, scheduleStart, scheduleEnd]);
 
   // Reset local state to initial settings (used by SaveBar dismiss)
   const resetChanges = useCallback(() => {
     setLocalEnabled(intervalMinutes > 0);
-    setLocalInterval(intervalMinutes > 0 ? intervalMinutes : 3);
+    setLocalInterval(intervalMinutes > 0 ? intervalMinutes : 15);
     if (initialSettings) {
       setFilterEnabled(initialSettings.enabled);
       setSelectedNodeNums(initialSettings.nodeNums || []);
@@ -237,6 +276,9 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
       setFilterRegexEnabled(initialSettings.filterRegexEnabled !== false);
       setExpirationHours(initialSettings.expirationHours || 24);
       setSortByHops(initialSettings.sortByHops || false);
+      setScheduleEnabled(initialSettings.scheduleEnabled || false);
+      setScheduleStart(initialSettings.scheduleStart || '00:00');
+      setScheduleEnd(initialSettings.scheduleEnd || '00:00');
     }
   }, [intervalMinutes, initialSettings]);
 
@@ -381,12 +423,15 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
     try {
       const intervalToSave = localEnabled ? localInterval : 0;
 
-      // Save traceroute interval
+      // Save traceroute interval and schedule settings
       const intervalResponse = await csrfFetch(`${baseUrl}/api/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tracerouteIntervalMinutes: intervalToSave
+          tracerouteIntervalMinutes: intervalToSave,
+          tracerouteScheduleEnabled: scheduleEnabled.toString(),
+          tracerouteScheduleStart: scheduleStart,
+          tracerouteScheduleEnd: scheduleEnd,
         })
       });
 
@@ -443,6 +488,9 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
         filterRegexEnabled,
         expirationHours,
         sortByHops,
+        scheduleEnabled,
+        scheduleStart,
+        scheduleEnd,
       });
 
       setHasChanges(false);
@@ -453,7 +501,7 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
     } finally {
       setIsSaving(false);
     }
-  }, [localEnabled, localInterval, filterEnabled, selectedNodeNums, filterChannels, filterRoles, filterHwModels, filterNameRegex, filterNodesEnabled, filterChannelsEnabled, filterRolesEnabled, filterHwModelsEnabled, filterRegexEnabled, expirationHours, sortByHops, baseUrl, csrfFetch, showToast, t, onIntervalChange]);
+  }, [localEnabled, localInterval, filterEnabled, selectedNodeNums, filterChannels, filterRoles, filterHwModels, filterNameRegex, filterNodesEnabled, filterChannelsEnabled, filterRolesEnabled, filterHwModelsEnabled, filterRegexEnabled, expirationHours, sortByHops, scheduleEnabled, scheduleStart, scheduleEnd, baseUrl, csrfFetch, showToast, t, onIntervalChange]);
 
   // Register with SaveBar
   useSaveBar({
@@ -626,6 +674,50 @@ const AutoTracerouteSection: React.FC<AutoTracerouteSectionProps> = ({
               </span>
             </label>
           </div>
+        </div>
+
+        {/* Schedule Time Window */}
+        <div className="setting-item" style={{ marginTop: '1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <input
+              type="checkbox"
+              id="tracerouteScheduleEnabled"
+              checked={scheduleEnabled}
+              onChange={(e) => setScheduleEnabled(e.target.checked)}
+              disabled={!localEnabled}
+              style={{ width: 'auto', margin: 0, marginRight: '0.5rem', cursor: 'pointer' }}
+            />
+            <label htmlFor="tracerouteScheduleEnabled" style={{ margin: 0, cursor: 'pointer' }}>
+              {t('automation.auto_traceroute.schedule_window')}
+              <span className="setting-description" style={{ display: 'block', marginTop: '0.25rem' }}>
+                {t('automation.auto_traceroute.schedule_window_description')}
+              </span>
+            </label>
+          </div>
+          {scheduleEnabled && localEnabled && (
+            <div style={{ display: 'flex', gap: '1rem', marginTop: '0.75rem', marginLeft: '1.75rem', alignItems: 'center' }}>
+              <label style={{ margin: 0, fontSize: '13px' }}>
+                {t('automation.schedule.starting_at')}
+                <input
+                  type="time"
+                  value={scheduleStart}
+                  onChange={(e) => setScheduleStart(e.target.value)}
+                  style={{ marginLeft: '0.5rem' }}
+                  className="setting-input"
+                />
+              </label>
+              <label style={{ margin: 0, fontSize: '13px' }}>
+                {t('automation.schedule.ending_at')}
+                <input
+                  type="time"
+                  value={scheduleEnd}
+                  onChange={(e) => setScheduleEnd(e.target.value)}
+                  style={{ marginLeft: '0.5rem' }}
+                  className="setting-input"
+                />
+              </label>
+            </div>
+          )}
         </div>
 
         {/* Node Filter Section */}

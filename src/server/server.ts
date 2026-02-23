@@ -362,6 +362,9 @@ systemRestoreService.markRestoreStarted();
 // Initialize Meshtastic connection
 setTimeout(async () => {
   try {
+    // Wait for database initialization (critical for PostgreSQL/MySQL where repos are async)
+    await databaseService.waitForReady();
+
     // Load saved traceroute interval from database before connecting
     const savedInterval = databaseService.getSetting('tracerouteIntervalMinutes');
     if (savedInterval !== null) {
@@ -404,6 +407,11 @@ setTimeout(async () => {
     // This is now handled when autoWelcomeEnabled is first changed to 'true'
     // via the settings endpoint. This prevents welcoming existing nodes when
     // the feature is enabled after nodes are already in the database.
+
+    // Clear any runtime IP/port overrides from previous sessions
+    // These are temporary settings that should reset on container restart
+    await databaseService.setSettingAsync('meshtasticNodeIpOverride', '');
+    await databaseService.setSettingAsync('meshtasticTcpPortOverride', '');
 
     await meshtasticManager.connect();
     logger.debug('Meshtastic manager connected successfully');
@@ -628,9 +636,12 @@ import messageRoutes from './routes/messageRoutes.js';
 import linkPreviewRoutes from './routes/linkPreviewRoutes.js';
 import scriptContentRoutes from './routes/scriptContentRoutes.js';
 import apiTokenRoutes from './routes/apiTokenRoutes.js';
+import mfaRoutes from './routes/mfaRoutes.js';
 import channelDatabaseRoutes from './routes/channelDatabaseRoutes.js';
 import newsRoutes from './routes/newsRoutes.js';
+import tileServerRoutes from './routes/tileServerTest.js';
 import v1Router from './routes/v1/index.js';
+import meshcoreRoutes from './routes/meshcoreRoutes.js';
 
 // CSRF token endpoint (must be before CSRF protection middleware)
 apiRouter.get('/csrf-token', csrfTokenEndpoint);
@@ -675,6 +686,9 @@ apiRouter.use('/auth', authRoutes);
 // API Token management routes (requires auth)
 apiRouter.use('/token', apiTokenRoutes);
 
+// MFA management routes (requires auth)
+apiRouter.use('/mfa', mfaRoutes);
+
 // v1 API routes (requires API token)
 apiRouter.use('/v1', v1Router);
 
@@ -705,11 +719,21 @@ apiRouter.use('/upgrade', upgradeRoutes);
 // Message routes (requires appropriate write permissions)
 apiRouter.use('/messages', optionalAuth(), messageRoutes);
 
+// MeshCore routes (for MeshCore device monitoring)
+// Authentication handled per-route in meshcoreRoutes.ts
+// Enable with MESHCORE_ENABLED=true in .env
+if (process.env.MESHCORE_ENABLED === 'true') {
+  apiRouter.use('/meshcore', meshcoreRoutes);
+}
+
 // Link preview routes
 apiRouter.use('/', linkPreviewRoutes);
 
 // Script content proxy routes (for User Scripts Gallery)
 apiRouter.use('/', scriptContentRoutes);
+
+// Tile server testing routes (for Custom Tileset Manager autodetect)
+apiRouter.use('/tile-server', optionalAuth(), tileServerRoutes);
 
 // API Routes
 /**
@@ -774,7 +798,11 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
 
     // Allow hours parameter for future use, but default to fetching ALL position history
     // This ensures we capture movement that may have happened long ago
-    const hoursParam = req.query.hours ? parseInt(req.query.hours as string) : null;
+    // Validate hours: must be positive integer, max 8760 (1 year)
+    const rawHours = req.query.hours ? parseInt(req.query.hours as string) : null;
+    const hoursParam = rawHours !== null && !isNaN(rawHours) && rawHours > 0
+      ? Math.min(rawHours, 8760)
+      : null;
     const cutoffTime = hoursParam ? Date.now() - hoursParam * 60 * 60 * 1000 : 0;
 
     // Check privacy for position history
@@ -787,11 +815,11 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
       return;
     }
 
-    // Get only position-related telemetry (lat/lon/alt) for the node - much more efficient!
-    const positionTelemetry = databaseService.getPositionTelemetryByNode(nodeId, 1500, cutoffTime);
+    // Get only position-related telemetry (lat/lon/alt/speed/track) for the node - much more efficient!
+    const positionTelemetry = await databaseService.getPositionTelemetryByNodeAsync(nodeId, 1500, cutoffTime);
 
-    // Group by timestamp to get lat/lon pairs
-    const positionMap = new Map<number, { lat?: number; lon?: number; alt?: number }>();
+    // Group by timestamp to get lat/lon pairs with optional speed/track
+    const positionMap = new Map<number, { lat?: number; lon?: number; alt?: number; groundSpeed?: number; groundTrack?: number }>();
 
     positionTelemetry.forEach(t => {
       if (!positionMap.has(t.timestamp)) {
@@ -805,6 +833,10 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
         pos.lon = t.value;
       } else if (t.telemetryType === 'altitude') {
         pos.alt = t.value;
+      } else if (t.telemetryType === 'ground_speed') {
+        pos.groundSpeed = t.value;
+      } else if (t.telemetryType === 'ground_track') {
+        pos.groundTrack = t.value;
       }
     });
 
@@ -816,6 +848,8 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
         latitude: pos.lat!,
         longitude: pos.lon!,
         altitude: pos.alt,
+        groundSpeed: pos.groundSpeed,
+        groundTrack: pos.groundTrack,
       }))
       .sort((a, b) => a.timestamp - b.timestamp);
 
@@ -827,13 +861,13 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
 });
 
 // Alternative endpoint with limit parameter for fetching positions
-apiRouter.get('/nodes/:nodeId/positions', optionalAuth(), (req, res) => {
+apiRouter.get('/nodes/:nodeId/positions', optionalAuth(), async (req, res) => {
   try {
     const { nodeId } = req.params;
     const limit = req.query.limit ? parseInt(req.query.limit as string) : 2000;
 
     // Get only position-related telemetry (lat/lon/alt) for the node
-    const positionTelemetry = databaseService.getPositionTelemetryByNode(nodeId, limit);
+    const positionTelemetry = await databaseService.getPositionTelemetryByNodeAsync(nodeId, limit);
 
     // Group by timestamp to get lat/lon pairs
     const positionMap = new Map<number, { lat?: number; lon?: number; alt?: number }>();
@@ -882,7 +916,7 @@ interface ApiErrorResponse {
 apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), async (req, res) => {
   try {
     const { nodeId } = req.params;
-    const { isFavorite, syncToDevice = true } = req.body;
+    const { isFavorite, syncToDevice = true, destinationNodeNum } = req.body;
 
     if (typeof isFavorite !== 'boolean') {
       const errorResponse: ApiErrorResponse = {
@@ -976,9 +1010,9 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
     if (syncToDevice) {
       try {
         if (isFavorite) {
-          await meshtasticManager.sendFavoriteNode(nodeNum);
+          await meshtasticManager.sendFavoriteNode(nodeNum, destinationNodeNum);
         } else {
-          await meshtasticManager.sendRemoveFavoriteNode(nodeNum);
+          await meshtasticManager.sendRemoveFavoriteNode(nodeNum, destinationNodeNum);
         }
         deviceSyncStatus = 'success';
         logger.debug(`✅ Synced favorite status to device for node ${nodeNum}`);
@@ -1023,7 +1057,7 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
 apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), async (req, res) => {
   try {
     const { nodeId } = req.params;
-    const { isIgnored, syncToDevice = true } = req.body;
+    const { isIgnored, syncToDevice = true, destinationNodeNum } = req.body;
 
     if (typeof isIgnored !== 'boolean') {
       const errorResponse: ApiErrorResponse = {
@@ -1117,9 +1151,9 @@ apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), as
     if (syncToDevice) {
       try {
         if (isIgnored) {
-          await meshtasticManager.sendIgnoredNode(nodeNum);
+          await meshtasticManager.sendIgnoredNode(nodeNum, destinationNodeNum);
         } else {
-          await meshtasticManager.sendRemoveIgnoredNode(nodeNum);
+          await meshtasticManager.sendRemoveIgnoredNode(nodeNum, destinationNodeNum);
         }
         deviceSyncStatus = 'success';
         logger.debug(`✅ Synced ignored status to device for node ${nodeNum}`);
@@ -1153,6 +1187,65 @@ apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), as
     logger.error('Error setting node ignored:', error);
     const errorResponse: ApiErrorResponse = {
       error: 'Failed to set node ignored',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Get persistent ignored nodes list
+apiRouter.get('/ignored-nodes', requirePermission('nodes', 'read'), async (_req, res) => {
+  try {
+    const ignoredNodes = await databaseService.getIgnoredNodesAsync();
+    res.json(ignoredNodes);
+  } catch (error) {
+    logger.error('Error fetching ignored nodes:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to fetch ignored nodes',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Remove node from persistent ignore list and un-ignore it
+apiRouter.delete('/ignored-nodes/:nodeId', requirePermission('nodes', 'write'), async (req, res) => {
+  try {
+    const { nodeId } = req.params;
+
+    // Convert nodeId (hex string like !a1b2c3d4) to nodeNum (integer)
+    const nodeNumStr = nodeId.replace('!', '');
+
+    // Validate hex string format (must be exactly 8 hex characters)
+    if (!/^[0-9a-fA-F]{8}$/.test(nodeNumStr)) {
+      const errorResponse: ApiErrorResponse = {
+        error: 'Invalid nodeId format',
+        code: 'INVALID_NODE_ID',
+        details: 'nodeId must be in format !XXXXXXXX (8 hex characters)',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    const nodeNum = parseInt(nodeNumStr, 16);
+
+    // Remove from persistent ignore list
+    await databaseService.removeIgnoredNodeAsync(nodeNum);
+
+    // Also un-ignore the node record if it still exists
+    try {
+      databaseService.setNodeIgnored(nodeNum, false);
+    } catch {
+      // Node may not exist in nodes table - that's OK
+    }
+
+    res.json({ success: true, nodeNum });
+  } catch (error) {
+    logger.error('Error removing ignored node:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to remove ignored node',
       code: 'INTERNAL_ERROR',
       details: error instanceof Error ? error.message : 'Unknown error occurred',
     };
@@ -1822,18 +1915,16 @@ apiRouter.get('/messages/unread-counts', optionalAuth(), async (req, res) => {
       result.channels = await databaseService.getUnreadCountsByChannelAsync(userId, localNodeInfo?.nodeId);
     }
 
-    // Get DM unread counts if user has messages permission
+    // Get DM unread counts if user has messages permission (batch query)
     if (hasMessagesRead && localNodeInfo) {
-      const directMessages: { [nodeId: string]: number } = {};
-      // Get all nodes that have DMs, filtered by channel permission
+      const allUnreadDMs = await databaseService.getBatchUnreadDMCountsAsync(localNodeInfo.nodeId, userId);
       const allNodes = meshtasticManager.getAllNodes();
       const visibleNodes = await filterNodesByChannelPermission(allNodes, req.user);
-      for (const node of visibleNodes) {
-        if (node.user?.id) {
-          const count = await databaseService.getUnreadDMCountAsync(localNodeInfo.nodeId, node.user.id, userId);
-          if (count > 0) {
-            directMessages[node.user.id] = count;
-          }
+      const visibleNodeIds = new Set(visibleNodes.map(n => n.user?.id).filter(Boolean));
+      const directMessages: { [nodeId: string]: number } = {};
+      for (const [nodeId, count] of Object.entries(allUnreadDMs)) {
+        if (visibleNodeIds.has(nodeId) && count > 0) {
+          directMessages[nodeId] = count;
         }
       }
       result.directMessages = directMessages;
@@ -2322,6 +2413,8 @@ apiRouter.post('/channels/import-config', requirePermission('configuration', 'wr
     try {
       logger.info(`🔄 Beginning edit settings transaction for import`);
       await meshtasticManager.beginEditSettings();
+      // Allow device time to enter edit mode before sending config messages
+      await new Promise((resolve) => setTimeout(resolve, 500));
       logger.info(`✅ Edit settings transaction started`);
     } catch (error) {
       logger.error(`❌ Failed to begin edit settings transaction:`, error);
@@ -2352,6 +2445,8 @@ apiRouter.post('/channels/import-config', requirePermission('configuration', 'wr
             positionPrecision: channel.positionPrecision,
           });
 
+          // Allow device time to process channel config before sending the next message
+          await new Promise((resolve) => setTimeout(resolve, 300));
           importedChannels.push({ index: i, name: channel.name || '(unnamed)' });
           logger.info(`✅ Imported channel ${i}`);
         } catch (error) {
@@ -2378,6 +2473,9 @@ apiRouter.post('/channels/import-config', requirePermission('configuration', 'wr
 
         logger.info(`📥 LoRa config with txEnabled defaulted: txEnabled=${loraConfigToImport.txEnabled}`);
         await meshtasticManager.setLoRaConfig(loraConfigToImport);
+        // LoRa config triggers heavier processing (frequency calculations, radio reconfiguration)
+        // so allow extra time before committing
+        await new Promise((resolve) => setTimeout(resolve, 500));
         loraImported = true;
         requiresReboot = true; // LoRa config requires reboot when committed
         logger.info(`✅ Imported LoRa config`);
@@ -2844,7 +2942,7 @@ apiRouter.get('/traceroutes/recent', (req, res) => {
 });
 
 // Get traceroute history for a specific source-destination pair
-apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', (req, res) => {
+apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', async (req, res) => {
   try {
     const fromNodeNum = parseInt(req.params.fromNodeNum);
     const toNodeNum = parseInt(req.params.toNodeNum);
@@ -2868,7 +2966,7 @@ apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', (req, res) => {
       return;
     }
 
-    const traceroutes = databaseService.getTraceroutesByNodes(fromNodeNum, toNodeNum, limit);
+    const traceroutes = await databaseService.getTraceroutesByNodesAsync(fromNodeNum, toNodeNum, limit);
 
     const traceroutesWithHops = traceroutes.map(tr => {
       let hopCount = 999;
@@ -2895,9 +2993,9 @@ apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', (req, res) => {
 });
 
 // Get longest active route segment (within last 7 days)
-apiRouter.get('/route-segments/longest-active', requirePermission('info', 'read'), (_req, res) => {
+apiRouter.get('/route-segments/longest-active', requirePermission('info', 'read'), async (_req, res) => {
   try {
-    const segment = databaseService.getLongestActiveRouteSegment();
+    const segment = await databaseService.getLongestActiveRouteSegmentAsync();
     if (!segment) {
       res.json(null);
       return;
@@ -2921,9 +3019,9 @@ apiRouter.get('/route-segments/longest-active', requirePermission('info', 'read'
 });
 
 // Get record holder route segment
-apiRouter.get('/route-segments/record-holder', requirePermission('info', 'read'), (_req, res) => {
+apiRouter.get('/route-segments/record-holder', requirePermission('info', 'read'), async (_req, res) => {
   try {
-    const segment = databaseService.getRecordHolderRouteSegment();
+    const segment = await databaseService.getRecordHolderRouteSegmentAsync();
     if (!segment) {
       res.json(null);
       return;
@@ -3406,6 +3504,17 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       traceroutes?: any[];
     } = {};
 
+    // Pre-compute shared values used across multiple sections
+    const user = (req as any).user;
+    const userId = req.user?.id ?? null;
+    const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+    const allMemoryNodes = meshtasticManager.getAllNodes();
+    const filteredMemoryNodes = await filterNodesByChannelPermission(allMemoryNodes, user);
+    const hasChannelsRead = req.user?.isAdmin || await hasPermission(req.user!, 'channel_0', 'read');
+    const hasMessagesRead = req.user?.isAdmin || await hasPermission(req.user!, 'messages', 'read');
+    const hasInfoRead = req.user?.isAdmin || await hasPermission(req.user!, 'info', 'read');
+    const canViewPrivate = user ? await hasPermission(user, 'nodes_private', 'read') : false;
+
     // 1. Connection status (always available)
     try {
       const connectionStatus = meshtasticManager.getConnectionStatus();
@@ -3423,12 +3532,8 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 2. Nodes (always available with optionalAuth, filtered by channel permissions)
     try {
-      const allNodes = meshtasticManager.getAllNodes();
       const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
-
-      // Filter nodes based on channel read permissions
-      const filteredNodes = await filterNodesByChannelPermission(allNodes, (req as any).user);
-      result.nodes = await Promise.all(filteredNodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions)));
+      result.nodes = await Promise.all(filteredMemoryNodes.map(node => enhanceNodeForClient(node, user, estimatedPositions, canViewPrivate)));
     } catch (error) {
       logger.error('Error fetching nodes in poll:', error);
       result.nodes = [];
@@ -3436,9 +3541,6 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 3. Messages (requires any channel permission OR messages permission)
     try {
-      const hasChannelsRead = req.user?.isAdmin || await hasPermission(req.user!, 'channel_0', 'read');
-      const hasMessagesRead = req.user?.isAdmin || await hasPermission(req.user!, 'messages', 'read');
-
       if (hasChannelsRead || hasMessagesRead) {
         let messages = meshtasticManager.getRecentMessages(100);
 
@@ -3457,10 +3559,6 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 4. Unread counts (requires channels OR messages permission)
     try {
-      const userId = req.user?.id ?? null;
-      const localNodeInfo = meshtasticManager.getLocalNodeInfo();
-      const hasMessagesRead = req.user?.isAdmin || await hasPermission(req.user!, 'messages', 'read');
-
       const unreadResult: {
         channels?: { [channelId: number]: number };
         directMessages?: { [nodeId: string]: number };
@@ -3483,17 +3581,14 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       }
       unreadResult.channels = filteredUnreadChannels;
 
+      // Batch DM unread counts (single query instead of N+1)
       if (hasMessagesRead && localNodeInfo) {
+        const allUnreadDMs = await databaseService.getBatchUnreadDMCountsAsync(localNodeInfo.nodeId, userId);
+        const visibleNodeIds = new Set(filteredMemoryNodes.map(n => n.user?.id).filter(Boolean));
         const directMessages: { [nodeId: string]: number } = {};
-        const allNodes = meshtasticManager.getAllNodes();
-        // Filter nodes by channel permission
-        const visibleNodes = await filterNodesByChannelPermission(allNodes, req.user);
-        for (const node of visibleNodes) {
-          if (node.user?.id) {
-            const count = await databaseService.getUnreadDMCountAsync(localNodeInfo.nodeId, node.user.id, userId);
-            if (count > 0) {
-              directMessages[node.user.id] = count;
-            }
+        for (const [nodeId, count] of Object.entries(allUnreadDMs)) {
+          if (visibleNodeIds.has(nodeId) && count > 0) {
+            directMessages[nodeId] = count;
           }
         }
         unreadResult.directMessages = directMessages;
@@ -3556,11 +3651,10 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 6. Telemetry availability (requires info:read permission, filtered by channel permissions)
     try {
-      const hasInfoRead = req.user?.isAdmin || await hasPermission(req.user!, 'info', 'read');
       if (hasInfoRead) {
-        const allNodes = databaseService.getAllNodes();
-        // Filter nodes based on channel read permissions
-        const nodes = await filterNodesByChannelPermission(allNodes, req.user);
+        // Use DB nodes for telemetry (has telemetryTypes), filtered by channel permissions
+        const allDbNodes = databaseService.getAllNodes();
+        const dbNodes = await filterNodesByChannelPermission(allDbNodes, req.user);
 
         const nodesWithTelemetry: string[] = [];
         const nodesWithWeather: string[] = [];
@@ -3571,7 +3665,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
         const nodeTelemetryTypes = databaseService.getAllNodesTelemetryTypes();
 
-        nodes.forEach(node => {
+        dbNodes.forEach(node => {
           const telemetryTypes = nodeTelemetryTypes.get(node.nodeId);
           if (telemetryTypes && telemetryTypes.length > 0) {
             nodesWithTelemetry.push(node.nodeId);
@@ -3591,7 +3685,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
         });
 
         const nodesWithPKC: string[] = [];
-        nodes.forEach(node => {
+        dbNodes.forEach(node => {
           if (node.hasPKC || node.publicKey) {
             nodesWithPKC.push(node.nodeId);
           }
@@ -3759,6 +3853,71 @@ apiRouter.post('/connection/reconnect', requirePermission('connection', 'write')
   } catch (error) {
     logger.error('Error reconnecting:', error);
     res.status(500).json({ error: 'Failed to reconnect' });
+  }
+});
+
+// Get detailed connection info (authenticated users only)
+apiRouter.get('/connection/info', requireAuth(), (_req, res) => {
+  try {
+    const status = meshtasticManager.getConnectionStatus();
+    const env = getEnvironmentConfig();
+    const ipOverride = databaseService.getSetting('meshtasticNodeIpOverride');
+    const portOverride = databaseService.getSetting('meshtasticTcpPortOverride');
+
+    res.json({
+      ...status,
+      defaultIp: env.meshtasticNodeIp,
+      defaultPort: env.meshtasticTcpPort,
+      isOverridden: !!(ipOverride || portOverride),
+      tcpPort: portOverride ? parseInt(portOverride, 10) : env.meshtasticTcpPort
+    });
+  } catch (error) {
+    logger.error('Error getting connection info:', error);
+    res.status(500).json({ error: 'Failed to get connection info' });
+  }
+});
+
+// Configure connection IP address (admin only)
+apiRouter.post('/connection/configure', requireAdmin(), async (req, res) => {
+  try {
+    const { nodeIp } = req.body;
+
+    // Validate IP format (IPv4 address or hostname, with optional port)
+    // Accepts: 192.168.1.100, 192.168.1.100:4403, hostname, hostname:4403
+    const ipRegex = /^(?:(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)|[\w.-]+)(?::\d{1,5})?$/;
+    if (!nodeIp || !ipRegex.test(nodeIp)) {
+      return res.status(400).json({ error: 'Invalid IP address or hostname' });
+    }
+
+    // Validate port range if specified
+    const portMatch = nodeIp.match(/:(\d+)$/);
+    if (portMatch) {
+      const port = parseInt(portMatch[1], 10);
+      if (port < 1 || port > 65535) {
+        return res.status(400).json({ error: 'Port must be between 1 and 65535' });
+      }
+    }
+
+    // Set the override
+    await meshtasticManager.setNodeIpOverride(nodeIp);
+
+    // Audit log
+    databaseService.auditLog(
+      req.user!.id,
+      'connection_address_changed',
+      'connection',
+      JSON.stringify({ address: nodeIp }),
+      req.ip || null
+    );
+
+    res.json({
+      success: true,
+      message: 'Node address updated. Reconnecting...',
+      nodeIp
+    });
+  } catch (error) {
+    logger.error('Error configuring connection:', error);
+    res.status(500).json({ error: 'Failed to configure connection' });
   }
 });
 
@@ -4463,6 +4622,165 @@ apiRouter.get('/settings/traceroute-log', requirePermission('settings', 'read'),
   }
 });
 
+// Get auto time sync settings
+apiRouter.get('/settings/time-sync-nodes', requirePermission('settings', 'read'), async (_req, res) => {
+  try {
+    const settings = await databaseService.getTimeSyncFilterSettingsAsync();
+    res.json(settings);
+  } catch (error) {
+    logger.error('Error fetching auto time sync settings:', error);
+    res.status(500).json({ error: 'Failed to fetch auto time sync settings' });
+  }
+});
+
+// Update auto time sync settings
+apiRouter.post('/settings/time-sync-nodes', requirePermission('settings', 'write'), async (req, res) => {
+  try {
+    const { enabled, nodeNums, filterEnabled, expirationHours, intervalMinutes } = req.body;
+
+    // Validate input
+    if (enabled !== undefined && typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'Invalid enabled value. Must be a boolean.' });
+    }
+
+    if (nodeNums !== undefined && !Array.isArray(nodeNums)) {
+      return res.status(400).json({ error: 'Invalid nodeNums value. Must be an array.' });
+    }
+
+    // Validate all node numbers are valid integers
+    if (nodeNums) {
+      for (const nodeNum of nodeNums) {
+        if (!Number.isInteger(nodeNum) || nodeNum < 0) {
+          return res.status(400).json({ error: 'All node numbers must be positive integers.' });
+        }
+      }
+    }
+
+    if (filterEnabled !== undefined && typeof filterEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'Invalid filterEnabled value. Must be a boolean.' });
+    }
+
+    if (expirationHours !== undefined) {
+      const hours = Number(expirationHours);
+      if (!Number.isInteger(hours) || hours < 1 || hours > 24) {
+        return res.status(400).json({ error: 'Expiration hours must be an integer between 1 and 24.' });
+      }
+    }
+
+    if (intervalMinutes !== undefined) {
+      const minutes = Number(intervalMinutes);
+      if (!Number.isInteger(minutes) || (minutes !== 0 && (minutes < 15 || minutes > 1440))) {
+        return res.status(400).json({ error: 'Interval must be 0 (disabled) or between 15 and 1440 minutes.' });
+      }
+    }
+
+    // Update settings
+    await databaseService.setTimeSyncFilterSettingsAsync({
+      enabled,
+      nodeNums,
+      filterEnabled,
+      expirationHours: expirationHours !== undefined ? Number(expirationHours) : undefined,
+      intervalMinutes: intervalMinutes !== undefined ? Number(intervalMinutes) : undefined,
+    });
+
+    // Update the meshtastic manager interval if connected
+    if (intervalMinutes !== undefined) {
+      meshtasticManager.setTimeSyncInterval(enabled ? Number(intervalMinutes) : 0);
+    } else if (enabled !== undefined) {
+      // If only enabled/disabled changed, use existing interval
+      const currentInterval = databaseService.getAutoTimeSyncIntervalMinutes();
+      meshtasticManager.setTimeSyncInterval(enabled ? currentInterval : 0);
+    }
+
+    // Get the updated settings to return
+    const updatedSettings = await databaseService.getTimeSyncFilterSettingsAsync();
+
+    res.json({
+      success: true,
+      ...updatedSettings,
+    });
+  } catch (error) {
+    logger.error('Error updating auto time sync settings:', error);
+    res.status(500).json({ error: 'Failed to update auto time sync settings' });
+  }
+});
+
+// Get auto-ping settings and active sessions
+apiRouter.get('/settings/auto-ping', requirePermission('settings', 'read'), (_req, res) => {
+  try {
+    const settings = {
+      autoPingEnabled: databaseService.getSetting('autoPingEnabled') === 'true',
+      autoPingIntervalSeconds: parseInt(databaseService.getSetting('autoPingIntervalSeconds') || '30', 10),
+      autoPingMaxPings: parseInt(databaseService.getSetting('autoPingMaxPings') || '20', 10),
+      autoPingTimeoutSeconds: parseInt(databaseService.getSetting('autoPingTimeoutSeconds') || '60', 10),
+    };
+    const sessions = meshtasticManager.getAutoPingSessions();
+    res.json({ settings, sessions });
+  } catch (error) {
+    logger.error('Error fetching auto-ping settings:', error);
+    res.status(500).json({ error: 'Failed to fetch auto-ping settings' });
+  }
+});
+
+// Update auto-ping settings
+apiRouter.post('/settings/auto-ping', requirePermission('settings', 'write'), (req, res) => {
+  try {
+    const { autoPingEnabled, autoPingIntervalSeconds, autoPingMaxPings, autoPingTimeoutSeconds } = req.body;
+
+    if (autoPingEnabled !== undefined) {
+      databaseService.setSetting('autoPingEnabled', String(autoPingEnabled));
+    }
+    if (autoPingIntervalSeconds !== undefined) {
+      const val = parseInt(String(autoPingIntervalSeconds), 10);
+      if (isNaN(val) || val < 10) {
+        return res.status(400).json({ error: 'Interval must be at least 10 seconds.' });
+      }
+      databaseService.setSetting('autoPingIntervalSeconds', String(val));
+    }
+    if (autoPingMaxPings !== undefined) {
+      const val = parseInt(String(autoPingMaxPings), 10);
+      if (isNaN(val) || val < 1 || val > 100) {
+        return res.status(400).json({ error: 'Max pings must be between 1 and 100.' });
+      }
+      databaseService.setSetting('autoPingMaxPings', String(val));
+    }
+    if (autoPingTimeoutSeconds !== undefined) {
+      const val = parseInt(String(autoPingTimeoutSeconds), 10);
+      if (isNaN(val) || val < 10) {
+        return res.status(400).json({ error: 'Timeout must be at least 10 seconds.' });
+      }
+      databaseService.setSetting('autoPingTimeoutSeconds', String(val));
+    }
+
+    const settings = {
+      autoPingEnabled: databaseService.getSetting('autoPingEnabled') === 'true',
+      autoPingIntervalSeconds: parseInt(databaseService.getSetting('autoPingIntervalSeconds') || '30', 10),
+      autoPingMaxPings: parseInt(databaseService.getSetting('autoPingMaxPings') || '20', 10),
+      autoPingTimeoutSeconds: parseInt(databaseService.getSetting('autoPingTimeoutSeconds') || '60', 10),
+    };
+
+    res.json({ success: true, settings });
+  } catch (error) {
+    logger.error('Error updating auto-ping settings:', error);
+    res.status(500).json({ error: 'Failed to update auto-ping settings' });
+  }
+});
+
+// Force-stop an active auto-ping session
+apiRouter.post('/auto-ping/stop/:nodeNum', requirePermission('settings', 'write'), (req, res) => {
+  try {
+    const nodeNum = parseInt(req.params.nodeNum, 10);
+    if (isNaN(nodeNum)) {
+      return res.status(400).json({ error: 'Invalid node number.' });
+    }
+    meshtasticManager.stopAutoPingSession(nodeNum, 'force_stopped');
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Error stopping auto-ping session:', error);
+    res.status(500).json({ error: 'Failed to stop auto-ping session' });
+  }
+});
+
 // Get auto key repair log (recent key repair attempts with success/fail status)
 apiRouter.get('/settings/key-repair-log', requirePermission('settings', 'read'), (_req, res) => {
   try {
@@ -4577,6 +4895,7 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'tracerouteIntervalMinutes',
       'temperatureUnit',
       'distanceUnit',
+      'positionHistoryLineStyle',
       'telemetryVisualizationHours',
       'telemetryFavorites',
       'telemetryCustomOrder',
@@ -4592,6 +4911,13 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'autoAckSkipIncompleteNodes',
       'autoAckTapbackEnabled',
       'autoAckReplyEnabled',
+      'autoAckDirectEnabled',
+      'autoAckDirectTapbackEnabled',
+      'autoAckDirectReplyEnabled',
+      'autoAckMultihopEnabled',
+      'autoAckMultihopTapbackEnabled',
+      'autoAckMultihopReplyEnabled',
+      'autoAckTestMessages',
       'customTapbackEmojis',
       'autoAnnounceEnabled',
       'autoAnnounceIntervalHours',
@@ -4600,6 +4926,9 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'autoAnnounceOnStart',
       'autoAnnounceUseSchedule',
       'autoAnnounceSchedule',
+      'autoAnnounceNodeInfoEnabled',
+      'autoAnnounceNodeInfoChannels',
+      'autoAnnounceNodeInfoDelaySeconds',
       'autoWelcomeEnabled',
       'autoWelcomeMessage',
       'autoWelcomeTarget',
@@ -4611,6 +4940,7 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'timerTriggers',
       'preferredSortField',
       'preferredSortDirection',
+      'preferredDashboardSortOption',
       'timeFormat',
       'dateFormat',
       'mapTileset',
@@ -4643,7 +4973,17 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
       'autoKeyManagementAutoPurge',
       'remoteAdminScannerIntervalMinutes',
       'remoteAdminScannerExpirationHours',
+      'tracerouteScheduleEnabled',
+      'tracerouteScheduleStart',
+      'tracerouteScheduleEnd',
+      'remoteAdminScheduleEnabled',
+      'remoteAdminScheduleStart',
+      'remoteAdminScheduleEnd',
       'geofenceTriggers',
+      'autoPingEnabled',
+      'autoPingIntervalSeconds',
+      'autoPingMaxPings',
+      'autoPingTimeoutSeconds',
     ];
     const filteredSettings: Record<string, string> = {};
 
@@ -4903,9 +5243,9 @@ apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) =
             }
           }
 
-          // Validate channel ('dm' or number 0-7)
-          if (trigger.channel !== 'dm' && (typeof trigger.channel !== 'number' || trigger.channel < 0 || trigger.channel > 7)) {
-            return res.status(400).json({ error: 'Geofence channel must be "dm" or a number between 0 and 7' });
+          // Validate channel ('dm', 'none', or number 0-7)
+          if (trigger.channel !== 'dm' && trigger.channel !== 'none' && (typeof trigger.channel !== 'number' || trigger.channel < 0 || trigger.channel > 7)) {
+            return res.status(400).json({ error: 'Geofence channel must be "dm", "none", or a number between 0 and 7' });
           }
 
           // Validate nodeFilter
@@ -5200,10 +5540,10 @@ apiRouter.post('/user/map-preferences', requireAuth(), (req, res) => {
       return res.status(403).json({ error: 'Cannot save preferences for anonymous user' });
     }
 
-    const { mapTileset, showPaths, showNeighborInfo, showRoute, showMotion, showMqttNodes, showAnimations } = req.body;
+    const { mapTileset, showPaths, showNeighborInfo, showRoute, showMotion, showMqttNodes, showMeshCoreNodes, showAnimations, showAccuracyRegions, showEstimatedPositions, positionHistoryHours } = req.body;
 
     // Validate boolean values
-    const booleanFields = { showPaths, showNeighborInfo, showRoute, showMotion, showMqttNodes, showAnimations };
+    const booleanFields = { showPaths, showNeighborInfo, showRoute, showMotion, showMqttNodes, showMeshCoreNodes, showAnimations, showAccuracyRegions, showEstimatedPositions };
     for (const [key, value] of Object.entries(booleanFields)) {
       if (value !== undefined && typeof value !== 'boolean') {
         return res.status(400).json({ error: `${key} must be a boolean` });
@@ -5215,6 +5555,11 @@ apiRouter.post('/user/map-preferences', requireAuth(), (req, res) => {
       return res.status(400).json({ error: 'mapTileset must be a string or null' });
     }
 
+    // Validate positionHistoryHours (optional number or null)
+    if (positionHistoryHours !== undefined && positionHistoryHours !== null && typeof positionHistoryHours !== 'number') {
+      return res.status(400).json({ error: 'positionHistoryHours must be a number or null' });
+    }
+
     // Save preferences
     databaseService.userModel.saveMapPreferences(req.user!.id, {
       mapTileset,
@@ -5223,7 +5568,11 @@ apiRouter.post('/user/map-preferences', requireAuth(), (req, res) => {
       showRoute,
       showMotion,
       showMqttNodes,
+      showMeshCoreNodes,
       showAnimations,
+      showAccuracyRegions,
+      showEstimatedPositions,
+      positionHistoryHours,
     });
 
     res.json({ success: true, message: 'Map preferences saved successfully' });
@@ -5430,6 +5779,21 @@ apiRouter.get('/announce/last', requirePermission('automation', 'read'), (_req, 
   } catch (error) {
     logger.error('Error fetching last announcement time:', error);
     res.status(500).json({ error: 'Failed to fetch last announcement time' });
+  }
+});
+
+// Announce preview endpoint - expands message template with real values
+apiRouter.get('/announce/preview', requirePermission('automation', 'read'), async (req, res) => {
+  try {
+    const message = req.query.message as string;
+    if (!message) {
+      return res.status(400).json({ error: 'Missing message parameter' });
+    }
+    const preview = await meshtasticManager.previewAnnouncementMessage(message);
+    res.json({ preview });
+  } catch (error) {
+    logger.error('Error generating announcement preview:', error);
+    res.status(500).json({ error: 'Failed to generate preview' });
   }
 });
 
@@ -5749,7 +6113,10 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
           'bluetooth': { type: 6, isModule: false }, // BLUETOOTH_CONFIG
           'security': { type: 7, isModule: false },  // SECURITY_CONFIG
           'mqtt': { type: 0, isModule: true },        // MQTT_CONFIG (module)
-          'neighborinfo': { type: 9, isModule: true } // NEIGHBORINFO_CONFIG (module)
+          'telemetry': { type: 5, isModule: true },  // TELEMETRY_CONFIG (module)
+          'neighborinfo': { type: 9, isModule: true }, // NEIGHBORINFO_CONFIG (module)
+          'statusmessage': { type: 13, isModule: true }, // STATUSMESSAGE_CONFIG (module)
+          'trafficmanagement': { type: 14, isModule: true } // TRAFFICMANAGEMENT_CONFIG (module)
         };
 
         const configInfo = configTypeMap[configType];
@@ -5775,7 +6142,9 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
               'neighborinfo': 'neighborInfo',
               'ambientlighting': 'ambientLighting',
               'detectionsensor': 'detectionSensor',
-              'paxcounter': 'paxcounter'
+              'paxcounter': 'paxcounter',
+              'statusmessage': 'statusmessage',
+              'trafficmanagement': 'trafficManagement'
             };
             const moduleKey = moduleConfigMap[configType];
             if (moduleKey && !currentConfig?.moduleConfig?.[moduleKey]) needsRequest = true;
@@ -5977,6 +6346,8 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
           case 'ambientlighting':
           case 'detectionsensor':
           case 'paxcounter':
+          case 'statusmessage':
+          case 'trafficmanagement':
             const moduleConfigMap: { [key: string]: string } = {
               'serial': 'serial',
               'extnotif': 'externalNotification',
@@ -5989,7 +6360,9 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
               'neighborinfo': 'neighborInfo',
               'ambientlighting': 'ambientLighting',
               'detectionsensor': 'detectionSensor',
-              'paxcounter': 'paxcounter'
+              'paxcounter': 'paxcounter',
+              'statusmessage': 'statusmessage',
+              'trafficmanagement': 'trafficManagement'
             };
             const moduleKey = moduleConfigMap[configType];
             if (moduleKey && finalConfig.moduleConfig?.[moduleKey]) {
@@ -6028,7 +6401,9 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
           'neighborinfo': { type: 9, isModule: true }, // NEIGHBORINFO_CONFIG (module)
           'ambientlighting': { type: 10, isModule: true }, // AMBIENTLIGHTING_CONFIG (module)
           'detectionsensor': { type: 11, isModule: true }, // DETECTIONSENSOR_CONFIG (module)
-          'paxcounter': { type: 12, isModule: true } // PAXCOUNTER_CONFIG (module)
+          'paxcounter': { type: 12, isModule: true }, // PAXCOUNTER_CONFIG (module)
+          'statusmessage': { type: 13, isModule: true }, // STATUSMESSAGE_CONFIG (module)
+          'trafficmanagement': { type: 14, isModule: true } // TRAFFICMANAGEMENT_CONFIG (module)
         };
 
         const configInfo = configTypeMap[configType];
@@ -6166,6 +6541,8 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
           case 'ambientlighting':
           case 'detectionsensor':
           case 'paxcounter':
+          case 'statusmessage':
+          case 'trafficmanagement':
             config = remoteConfig || { enabled: false };
             break;
         }
@@ -6484,6 +6861,40 @@ apiRouter.post('/admin/get-device-metadata', requireAdmin(), async (req, res) =>
   } catch (error: any) {
     logger.error('Error getting device metadata:', error);
     res.status(500).json({ error: error.message || 'Failed to get device metadata' });
+  }
+});
+
+// Admin reboot endpoint - sends reboot command to a node
+apiRouter.post('/admin/reboot', requireAdmin(), async (req, res) => {
+  try {
+    const { nodeNum, seconds = 5 } = req.body;
+
+    const destinationNodeNum = nodeNum !== undefined ? Number(nodeNum) : (meshtasticManager.getLocalNodeInfo()?.nodeNum || 0);
+
+    await meshtasticManager.sendRebootCommand(destinationNodeNum, Number(seconds));
+
+    logger.info(`✅ Sent reboot command to node ${destinationNodeNum} (in ${seconds} seconds)`);
+    res.json({ success: true, message: `Reboot command sent (node will reboot in ${seconds} seconds)` });
+  } catch (error: any) {
+    logger.error('Error sending reboot command:', error);
+    res.status(500).json({ error: error.message || 'Failed to send reboot command' });
+  }
+});
+
+// Admin set-time endpoint - sets time on a node to current server time
+apiRouter.post('/admin/set-time', requireAdmin(), async (req, res) => {
+  try {
+    const { nodeNum } = req.body;
+
+    const destinationNodeNum = nodeNum !== undefined ? Number(nodeNum) : (meshtasticManager.getLocalNodeInfo()?.nodeNum || 0);
+
+    await meshtasticManager.sendSetTimeCommand(destinationNodeNum);
+
+    logger.info(`✅ Sent set-time command to node ${destinationNodeNum}`);
+    res.json({ success: true, message: 'Time sync command sent successfully' });
+  } catch (error: any) {
+    logger.error('Error sending set-time command:', error);
+    res.status(500).json({ error: error.message || 'Failed to send set-time command' });
   }
 });
 
@@ -6834,12 +7245,28 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
         }
         adminMessage = protobufService.createSetLoRaConfigMessage(params.config, sessionPasskey || undefined);
         break;
-      case 'setPositionConfig':
+      case 'setPositionConfig': {
         if (!params.config) {
           return res.status(400).json({ error: 'config is required for setPositionConfig' });
         }
-        adminMessage = protobufService.createSetPositionConfigMessage(params.config, sessionPasskey || undefined);
+        // Extract position coordinates from config - these must be sent via a separate
+        // setFixedPosition admin message, as Config.PositionConfig has no lat/lon/alt fields.
+        // Per protobuf docs, set_fixed_position automatically sets fixedPosition=true on the device.
+        // No delay needed: the local node queues both packets and the mesh protocol guarantees
+        // FIFO delivery from the same source, with natural spacing from radio transmission time.
+        const { latitude, longitude, altitude, ...positionConfig } = params.config;
+        if (latitude !== undefined && longitude !== undefined && positionConfig.fixedPosition) {
+          const setPositionMsg = protobufService.createSetFixedPositionMessage(
+            latitude,
+            longitude,
+            altitude || 0,
+            sessionPasskey || undefined
+          );
+          await meshtasticManager.sendAdminCommand(setPositionMsg, destinationNodeNum);
+        }
+        adminMessage = protobufService.createSetPositionConfigMessage(positionConfig, sessionPasskey || undefined);
         break;
+      }
       case 'setMQTTConfig':
         if (!params.config) {
           return res.status(400).json({ error: 'config is required for setMQTTConfig' });
@@ -6869,6 +7296,18 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
           return res.status(400).json({ error: 'config is required for setTelemetryConfig' });
         }
         adminMessage = protobufService.createSetModuleConfigMessageGeneric('telemetry', params.config, sessionPasskey || undefined);
+        break;
+      case 'setStatusMessageConfig':
+        if (!params.config) {
+          return res.status(400).json({ error: 'config is required for setStatusMessageConfig' });
+        }
+        adminMessage = protobufService.createSetModuleConfigMessageGeneric('statusmessage', params.config, sessionPasskey || undefined);
+        break;
+      case 'setTrafficManagementConfig':
+        if (!params.config) {
+          return res.status(400).json({ error: 'config is required for setTrafficManagementConfig' });
+        }
+        adminMessage = protobufService.createSetModuleConfigMessageGeneric('trafficmanagement', params.config, sessionPasskey || undefined);
         break;
       case 'setSecurityConfig':
         if (!params.config) {
@@ -8075,12 +8514,45 @@ if (BASE_URL) {
 app.get('/api/scripts', scriptsEndpoint);
 
 // Script test endpoint - allows testing script execution with sample parameters
+// Supports triggerType: 'auto-responder' (default), 'geofence', or 'timer'
 apiRouter.post('/scripts/test', requirePermission('settings', 'read'), async (req, res) => {
+  const startTime = Date.now();
   try {
-    const { script, trigger, testMessage } = req.body;
+    const {
+      script,
+      triggerType = 'auto-responder',
+      // Auto-responder specific
+      trigger,
+      testMessage,
+      scriptArgs,
+      // Geofence specific
+      geofenceName,
+      geofenceId,
+      eventType,
+      nodeLat,
+      nodeLon,
+      // Timer specific
+      timerName,
+      timerId,
+      // Mock node info (optional)
+      mockNode,
+    } = req.body;
 
-    if (!script || !trigger || !testMessage) {
-      return res.status(400).json({ error: 'Missing required fields: script, trigger, testMessage' });
+    // Validate based on trigger type
+    if (triggerType === 'auto-responder') {
+      if (!script || !trigger || !testMessage) {
+        return res.status(400).json({ error: 'Missing required fields: script, trigger, testMessage' });
+      }
+    } else if (triggerType === 'geofence') {
+      if (!script) {
+        return res.status(400).json({ error: 'Missing required field: script' });
+      }
+    } else if (triggerType === 'timer') {
+      if (!script) {
+        return res.status(400).json({ error: 'Missing required field: script' });
+      }
+    } else {
+      return res.status(400).json({ error: `Invalid triggerType: ${triggerType}. Expected 'auto-responder', 'geofence', or 'timer'` });
     }
 
     // Validate script path (security check)
@@ -8099,132 +8571,134 @@ apiRouter.post('/scripts/test', requirePermission('settings', 'read'), async (re
       return res.status(404).json({ error: 'Script file not found' });
     }
 
-    // Extract parameters from test message using trigger pattern
-    // Handle both string and array types for trigger
-    const patterns = normalizeTriggerPatterns(trigger);
     let matchedPattern: string | null = null;
     let extractedParams: Record<string, string> = {};
 
-    // Try each pattern until one matches
-    for (const patternStr of patterns) {
-      interface ParamSpec {
-        name: string;
-        pattern?: string;
-      }
-      const params: ParamSpec[] = [];
-      let i = 0;
+    // Auto-responder: Extract parameters from test message using trigger pattern
+    if (triggerType === 'auto-responder') {
+      const patterns = normalizeTriggerPatterns(trigger);
 
-      // Extract parameter specifications
-      while (i < patternStr.length) {
-        if (patternStr[i] === '{') {
-          const startPos = i + 1;
-          let depth = 1;
-          let colonPos = -1;
-          let endPos = -1;
+      // Try each pattern until one matches
+      for (const patternStr of patterns) {
+        interface ParamSpec {
+          name: string;
+          pattern?: string;
+        }
+        const params: ParamSpec[] = [];
+        let i = 0;
 
-          for (let j = startPos; j < patternStr.length && depth > 0; j++) {
-            if (patternStr[j] === '{') {
-              depth++;
-            } else if (patternStr[j] === '}') {
-              depth--;
-              if (depth === 0) {
-                endPos = j;
+        // Extract parameter specifications
+        while (i < patternStr.length) {
+          if (patternStr[i] === '{') {
+            const startPos = i + 1;
+            let depth = 1;
+            let colonPos = -1;
+            let endPos = -1;
+
+            for (let j = startPos; j < patternStr.length && depth > 0; j++) {
+              if (patternStr[j] === '{') {
+                depth++;
+              } else if (patternStr[j] === '}') {
+                depth--;
+                if (depth === 0) {
+                  endPos = j;
+                }
+              } else if (patternStr[j] === ':' && depth === 1 && colonPos === -1) {
+                colonPos = j;
               }
-            } else if (patternStr[j] === ':' && depth === 1 && colonPos === -1) {
-              colonPos = j;
-            }
-          }
-
-          if (endPos !== -1) {
-            const paramName =
-              colonPos !== -1 ? patternStr.substring(startPos, colonPos) : patternStr.substring(startPos, endPos);
-            const paramPattern = colonPos !== -1 ? patternStr.substring(colonPos + 1, endPos) : undefined;
-
-            if (!params.find(p => p.name === paramName)) {
-              params.push({ name: paramName, pattern: paramPattern });
             }
 
-            i = endPos + 1;
+            if (endPos !== -1) {
+              const paramName =
+                colonPos !== -1 ? patternStr.substring(startPos, colonPos) : patternStr.substring(startPos, endPos);
+              const paramPattern = colonPos !== -1 ? patternStr.substring(colonPos + 1, endPos) : undefined;
+
+              if (!params.find(p => p.name === paramName)) {
+                params.push({ name: paramName, pattern: paramPattern });
+              }
+
+              i = endPos + 1;
+            } else {
+              i++;
+            }
           } else {
             i++;
           }
-        } else {
-          i++;
         }
-      }
 
-      // Build regex pattern
-      let regexPattern = '';
-      const replacements: Array<{ start: number; end: number; replacement: string }> = [];
-      i = 0;
+        // Build regex pattern
+        let regexPattern = '';
+        const replacements: Array<{ start: number; end: number; replacement: string }> = [];
+        i = 0;
 
-      while (i < patternStr.length) {
-        if (patternStr[i] === '{') {
-          const startPos = i;
-          let depth = 1;
-          let endPos = -1;
+        while (i < patternStr.length) {
+          if (patternStr[i] === '{') {
+            const startPos = i;
+            let depth = 1;
+            let endPos = -1;
 
-          for (let j = i + 1; j < patternStr.length && depth > 0; j++) {
-            if (patternStr[j] === '{') {
-              depth++;
-            } else if (patternStr[j] === '}') {
-              depth--;
-              if (depth === 0) {
-                endPos = j;
+            for (let j = i + 1; j < patternStr.length && depth > 0; j++) {
+              if (patternStr[j] === '{') {
+                depth++;
+              } else if (patternStr[j] === '}') {
+                depth--;
+                if (depth === 0) {
+                  endPos = j;
+                }
               }
             }
-          }
 
-          if (endPos !== -1) {
-            const paramIndex = replacements.length;
-            if (paramIndex < params.length) {
-              const paramRegex = params[paramIndex].pattern || '[^\\s]+';
-              replacements.push({
-                start: startPos,
-                end: endPos + 1,
-                replacement: `(${paramRegex})`,
-              });
+            if (endPos !== -1) {
+              const paramIndex = replacements.length;
+              if (paramIndex < params.length) {
+                const paramRegex = params[paramIndex].pattern || '[^\\s]+';
+                replacements.push({
+                  start: startPos,
+                  end: endPos + 1,
+                  replacement: `(${paramRegex})`,
+                });
+              }
+              i = endPos + 1;
+            } else {
+              i++;
             }
-            i = endPos + 1;
           } else {
             i++;
           }
-        } else {
-          i++;
         }
-      }
 
-      // Build the final pattern by replacing placeholders
-      for (let i = 0; i < patternStr.length; i++) {
-        const replacement = replacements.find(r => r.start === i);
-        if (replacement) {
-          regexPattern += replacement.replacement;
-          i = replacement.end - 1;
-        } else {
-          const char = patternStr[i];
-          if (/[.*+?^${}()|[\]\\]/.test(char)) {
-            regexPattern += '\\' + char;
+        // Build the final pattern by replacing placeholders
+        for (let i = 0; i < patternStr.length; i++) {
+          const replacement = replacements.find(r => r.start === i);
+          if (replacement) {
+            regexPattern += replacement.replacement;
+            i = replacement.end - 1;
           } else {
-            regexPattern += char;
+            const char = patternStr[i];
+            if (/[.*+?^${}()|[\]\\]/.test(char)) {
+              regexPattern += '\\' + char;
+            } else {
+              regexPattern += char;
+            }
           }
         }
+
+        const triggerRegex = new RegExp(`^${regexPattern}$`, 'i');
+        const triggerMatch = testMessage.match(triggerRegex);
+
+        if (triggerMatch) {
+          extractedParams = {};
+          params.forEach((param, index) => {
+            extractedParams[param.name] = triggerMatch[index + 1];
+          });
+          matchedPattern = patternStr;
+          break;
+        }
       }
 
-      const triggerRegex = new RegExp(`^${regexPattern}$`, 'i');
-      const triggerMatch = testMessage.match(triggerRegex);
-
-      if (triggerMatch) {
-        extractedParams = {};
-        params.forEach((param, index) => {
-          extractedParams[param.name] = triggerMatch[index + 1];
-        });
-        matchedPattern = patternStr;
-        break;
+      if (!matchedPattern) {
+        return res.status(400).json({ error: `Test message does not match trigger pattern: "${trigger}"` });
       }
-    }
-
-    if (!matchedPattern) {
-      return res.status(400).json({ error: `Test message does not match trigger pattern: "${trigger}"` });
     }
 
     // Determine interpreter based on file extension
@@ -8239,7 +8713,7 @@ apiRouter.post('/scripts/test', requirePermission('settings', 'read'), async (re
         interpreter = isDev ? 'node' : '/usr/local/bin/node';
         break;
       case 'py':
-        interpreter = isDev ? 'python' : '/usr/bin/python';
+        interpreter = isDev ? 'python' : '/opt/apprise-venv/bin/python3';
         break;
       case 'sh':
         interpreter = isDev ? 'sh' : '/bin/sh';
@@ -8253,43 +8727,147 @@ apiRouter.post('/scripts/test', requirePermission('settings', 'read'), async (re
     const { promisify } = await import('util');
     const execFileAsync = promisify(execFile);
 
-    // Prepare environment variables (same as in meshtasticManager)
+    // Prepare base environment variables
     const scriptEnv: Record<string, string> = {
       ...(process.env as Record<string, string>),
-      MESSAGE: testMessage,
-      FROM_NODE: '12345', // Test node number
-      FROM_SHORT_NAME: 'TEST', // Test short name
-      FROM_LONG_NAME: 'Test Node', // Test long name
-      PACKET_ID: '99999', // Test packet ID
-      TRIGGER: trigger,
     };
 
-    // Add extracted parameters as PARAM_* environment variables
-    Object.entries(extractedParams).forEach(([key, value]) => {
-      scriptEnv[`PARAM_${key}`] = value;
-    });
+    // Default mock node info
+    const mockNodeNum = mockNode?.nodeNum?.toString() || '12345';
+    const mockShortName = mockNode?.shortName || 'TEST';
+    const mockLongName = mockNode?.longName || 'Test Node';
+    const mockNodeLat = mockNode?.lat?.toString() || nodeLat?.toString() || '37.7749';
+    const mockNodeLon = mockNode?.lon?.toString() || nodeLon?.toString() || '-122.4194';
+
+    // Set environment variables based on trigger type
+    if (triggerType === 'auto-responder') {
+      scriptEnv.MESSAGE = testMessage;
+      scriptEnv.FROM_NODE = mockNodeNum;
+      scriptEnv.FROM_SHORT_NAME = mockShortName;
+      scriptEnv.FROM_LONG_NAME = mockLongName;
+      scriptEnv.PACKET_ID = '99999';
+      scriptEnv.TRIGGER = Array.isArray(trigger) ? trigger.join(', ') : trigger;
+      // Add extracted parameters as PARAM_* environment variables
+      Object.entries(extractedParams).forEach(([key, value]) => {
+        scriptEnv[`PARAM_${key}`] = value;
+      });
+    } else if (triggerType === 'geofence') {
+      scriptEnv.GEOFENCE_NAME = geofenceName || 'Test Geofence';
+      scriptEnv.GEOFENCE_ID = geofenceId || 'test-geofence-id';
+      scriptEnv.GEOFENCE_EVENT = eventType || 'entry';
+      scriptEnv.EVENT = eventType || 'entry';
+      scriptEnv.NODE_LAT = mockNodeLat;
+      scriptEnv.NODE_LON = mockNodeLon;
+      scriptEnv.NODE_NUM = mockNodeNum;
+      scriptEnv.NODE_ID = mockNodeNum;
+      scriptEnv.SHORT_NAME = mockShortName;
+      scriptEnv.LONG_NAME = mockLongName;
+      scriptEnv.DISTANCE_TO_CENTER = '0.5'; // Test distance in km
+    } else if (triggerType === 'timer') {
+      scriptEnv.TIMER_NAME = timerName || 'Test Timer';
+      scriptEnv.TIMER_ID = timerId || 'test-timer-id';
+      scriptEnv.TIMER_SCRIPT = script;
+    }
+
+    // Common environment variables for all trigger types
+    // When Virtual Node is enabled, route scripts through it to avoid opening a
+    // second TCP connection to the physical node (which kills MeshMonitor's connection)
+    let meshtasticIp: string;
+    let meshtasticPort: string;
+    if (env.enableVirtualNode) {
+      meshtasticIp = '127.0.0.1';
+      meshtasticPort = String(env.virtualNodePort);
+    } else {
+      meshtasticIp = process.env.MESHTASTIC_NODE_IP || process.env.MESHTASTIC_IP || process.env.NODE_IP || '127.0.0.1';
+      meshtasticPort = process.env.MESHTASTIC_NODE_PORT || process.env.MESHTASTIC_PORT || process.env.NODE_PORT || '4403';
+    }
+    scriptEnv.IP = meshtasticIp;
+    scriptEnv.PORT = meshtasticPort;
+    scriptEnv.MESHTASTIC_IP = meshtasticIp;
+    scriptEnv.MESHTASTIC_PORT = meshtasticPort;
+    scriptEnv.VERSION = process.env.VERSION || 'test';
+
+    // Build script arguments if provided
+    const scriptArgList: string[] = [resolvedPath];
+    if (scriptArgs) {
+      // Token expansion for script args (basic expansion for test)
+      let expandedArgs = scriptArgs
+        .replace(/\{IP\}/g, scriptEnv.IP)
+        .replace(/\{PORT\}/g, scriptEnv.PORT)
+        .replace(/\{VERSION\}/g, scriptEnv.VERSION)
+        .replace(/\{NODE_ID\}/g, mockNodeNum)
+        .replace(/\{NODE_NUM\}/g, mockNodeNum)
+        .replace(/\{SHORT_NAME\}/g, mockShortName)
+        .replace(/\{LONG_NAME\}/g, mockLongName);
+
+      if (triggerType === 'geofence') {
+        expandedArgs = expandedArgs
+          .replace(/\{GEOFENCE_NAME\}/g, scriptEnv.GEOFENCE_NAME)
+          .replace(/\{EVENT\}/g, scriptEnv.GEOFENCE_EVENT)
+          .replace(/\{NODE_LAT\}/g, mockNodeLat)
+          .replace(/\{NODE_LON\}/g, mockNodeLon);
+      }
+
+      // Split args respecting both single and double quotes
+      const argParts = expandedArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+      scriptArgList.push(...argParts.map((arg: string) => arg.replace(/^["']|["']$/g, '')));
+    }
 
     try {
-      const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath], {
-        timeout: 10000,
+      const { stdout, stderr } = await execFileAsync(interpreter, scriptArgList, {
+        timeout: 30000,
         env: scriptEnv,
         maxBuffer: 1024 * 1024, // 1MB max output
       });
 
-      // Return both stdout and stderr
+      const executionTimeMs = Date.now() - startTime;
       const output = stdout.trim();
       const errorOutput = stderr.trim();
 
+      // Parse JSON output to extract "would send" messages
+      let wouldSendMessages: string[] = [];
+      let returnValue: unknown = null;
+
+      if (output) {
+        try {
+          const parsed = JSON.parse(output);
+          returnValue = parsed;
+          // Look for response/responses fields that indicate messages to send
+          if (parsed.response) {
+            wouldSendMessages = Array.isArray(parsed.response) ? parsed.response : [parsed.response];
+          } else if (parsed.responses) {
+            wouldSendMessages = Array.isArray(parsed.responses) ? parsed.responses : [parsed.responses];
+          } else if (typeof parsed === 'string') {
+            wouldSendMessages = [parsed];
+          }
+        } catch {
+          // Not JSON - the output itself might be the message
+          if (output && output !== '(no output)') {
+            wouldSendMessages = [output];
+          }
+        }
+      }
+
       return res.json({
-        output: output || '(no output)',
+        success: true,
+        stdout: output || '(no output)',
         stderr: errorOutput || undefined,
-        params: extractedParams,
-        matchedPattern: matchedPattern,
+        wouldSendMessages,
+        returnValue,
+        extractedParams: triggerType === 'auto-responder' ? extractedParams : undefined,
+        matchedPattern: triggerType === 'auto-responder' ? matchedPattern : undefined,
+        executionTimeMs,
       });
     } catch (error: any) {
+      const executionTimeMs = Date.now() - startTime;
+
       // Handle execution errors
       if (error.code === 'ETIMEDOUT' || error.signal === 'SIGTERM') {
-        return res.status(408).json({ error: 'Script execution timed out after 10 seconds' });
+        return res.status(408).json({
+          success: false,
+          error: 'Script execution timed out after 30 seconds',
+          executionTimeMs,
+        });
       }
 
       // Handle Windows EPERM errors gracefully (process may have already terminated)
@@ -8297,28 +8875,59 @@ apiRouter.post('/scripts/test', requirePermission('settings', 'read'), async (re
         // On Windows, EPERM can occur when trying to kill a process that's already dead
         // If we got stdout/stderr before the error, return that
         if (error.stdout || error.stderr) {
+          const output = error.stdout?.toString().trim() || '';
+          let wouldSendMessages: string[] = [];
+          let returnValue: unknown = null;
+
+          if (output) {
+            try {
+              const parsed = JSON.parse(output);
+              returnValue = parsed;
+              if (parsed.response) {
+                wouldSendMessages = Array.isArray(parsed.response) ? parsed.response : [parsed.response];
+              } else if (parsed.responses) {
+                wouldSendMessages = Array.isArray(parsed.responses) ? parsed.responses : [parsed.responses];
+              }
+            } catch {
+              if (output) wouldSendMessages = [output];
+            }
+          }
+
           return res.json({
-            output: error.stdout?.toString().trim() || '(no output)',
+            success: true,
+            stdout: output || '(no output)',
             stderr: error.stderr?.toString().trim() || undefined,
-            params: extractedParams,
-            matchedPattern: matchedPattern,
+            wouldSendMessages,
+            returnValue,
+            extractedParams: triggerType === 'auto-responder' ? extractedParams : undefined,
+            matchedPattern: triggerType === 'auto-responder' ? matchedPattern : undefined,
+            executionTimeMs,
           });
         }
         // Otherwise, return a more user-friendly error
         return res.status(500).json({
+          success: false,
           error: 'Script execution completed but encountered a cleanup error (this is usually harmless)',
           stderr: error.stderr?.toString() || undefined,
+          executionTimeMs,
         });
       }
 
       return res.status(500).json({
+        success: false,
         error: error.message || 'Script execution failed',
         stderr: error.stderr?.toString() || undefined,
+        executionTimeMs,
       });
     }
   } catch (error: any) {
+    const executionTimeMs = Date.now() - startTime;
     logger.error('❌ Error testing script:', error);
-    return res.status(500).json({ error: error.message || 'Internal server error' });
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error',
+      executionTimeMs,
+    });
   }
 });
 

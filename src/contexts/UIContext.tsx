@@ -55,6 +55,20 @@ interface UIContextType {
   setAutoAckTapbackEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   autoAckReplyEnabled: boolean;
   setAutoAckReplyEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckDirectEnabled: boolean;
+  setAutoAckDirectEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckDirectTapbackEnabled: boolean;
+  setAutoAckDirectTapbackEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckDirectReplyEnabled: boolean;
+  setAutoAckDirectReplyEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckMultihopEnabled: boolean;
+  setAutoAckMultihopEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckMultihopTapbackEnabled: boolean;
+  setAutoAckMultihopTapbackEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckMultihopReplyEnabled: boolean;
+  setAutoAckMultihopReplyEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  autoAckTestMessages: string;
+  setAutoAckTestMessages: React.Dispatch<React.SetStateAction<string>>;
   autoAnnounceEnabled: boolean;
   setAutoAnnounceEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   autoAnnounceIntervalHours: number;
@@ -109,6 +123,8 @@ interface UIContextType {
   setIsNodeListCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
   showIgnoredNodes: boolean;
   setShowIgnoredNodes: React.Dispatch<React.SetStateAction<boolean>>;
+  filterRemoteAdminOnly: boolean;
+  setFilterRemoteAdminOnly: React.Dispatch<React.SetStateAction<boolean>>;
 }
 
 const UIContext = createContext<UIContextType | undefined>(undefined);
@@ -118,7 +134,7 @@ interface UIProviderProps {
 }
 
 // Valid tab types for hash validation
-const VALID_TABS: TabType[] = ['nodes', 'channels', 'messages', 'info', 'settings', 'automation', 'dashboard', 'configuration', 'notifications', 'users', 'audit', 'security', 'themes', 'admin'];
+const VALID_TABS: TabType[] = ['nodes', 'channels', 'messages', 'info', 'settings', 'automation', 'dashboard', 'configuration', 'notifications', 'users', 'audit', 'security', 'themes', 'admin', 'meshcore'];
 
 // Helper to get tab from URL hash
 const getTabFromHash = (): TabType => {
@@ -173,6 +189,13 @@ export const UIProvider: React.FC<UIProviderProps> = ({ children }) => {
   const [autoAckSkipIncompleteNodes, setAutoAckSkipIncompleteNodes] = useState<boolean>(false);
   const [autoAckTapbackEnabled, setAutoAckTapbackEnabled] = useState<boolean>(false);
   const [autoAckReplyEnabled, setAutoAckReplyEnabled] = useState<boolean>(true); // Default true for backward compatibility
+  const [autoAckDirectEnabled, setAutoAckDirectEnabled] = useState<boolean>(true);
+  const [autoAckDirectTapbackEnabled, setAutoAckDirectTapbackEnabled] = useState<boolean>(true);
+  const [autoAckDirectReplyEnabled, setAutoAckDirectReplyEnabled] = useState<boolean>(true);
+  const [autoAckMultihopEnabled, setAutoAckMultihopEnabled] = useState<boolean>(true);
+  const [autoAckMultihopTapbackEnabled, setAutoAckMultihopTapbackEnabled] = useState<boolean>(true);
+  const [autoAckMultihopReplyEnabled, setAutoAckMultihopReplyEnabled] = useState<boolean>(true);
+  const [autoAckTestMessages, setAutoAckTestMessages] = useState<string>('');
   const [autoAnnounceEnabled, setAutoAnnounceEnabled] = useState<boolean>(false);
   const [autoAnnounceIntervalHours, setAutoAnnounceIntervalHours] = useState<number>(6);
   const [autoAnnounceMessage, setAutoAnnounceMessage] = useState<string>('MeshMonitor {VERSION} online for {DURATION} {FEATURES}');
@@ -204,6 +227,7 @@ export const UIProvider: React.FC<UIProviderProps> = ({ children }) => {
   });
   // Default to hiding ignored nodes
   const [showIgnoredNodes, setShowIgnoredNodes] = useState<boolean>(false);
+  const [filterRemoteAdminOnly, setFilterRemoteAdminOnly] = useState<boolean>(false);
 
   // Wrapper setter for showMqttMessages that persists to localStorage
   const setShowMqttMessages = React.useCallback((value: React.SetStateAction<boolean>) => {
@@ -285,6 +309,20 @@ export const UIProvider: React.FC<UIProviderProps> = ({ children }) => {
         setAutoAckTapbackEnabled,
         autoAckReplyEnabled,
         setAutoAckReplyEnabled,
+        autoAckDirectEnabled,
+        setAutoAckDirectEnabled,
+        autoAckDirectTapbackEnabled,
+        setAutoAckDirectTapbackEnabled,
+        autoAckDirectReplyEnabled,
+        setAutoAckDirectReplyEnabled,
+        autoAckMultihopEnabled,
+        setAutoAckMultihopEnabled,
+        autoAckMultihopTapbackEnabled,
+        setAutoAckMultihopTapbackEnabled,
+        autoAckMultihopReplyEnabled,
+        setAutoAckMultihopReplyEnabled,
+        autoAckTestMessages,
+        setAutoAckTestMessages,
         autoAnnounceEnabled,
         setAutoAnnounceEnabled,
         autoAnnounceIntervalHours,
@@ -339,6 +377,8 @@ export const UIProvider: React.FC<UIProviderProps> = ({ children }) => {
         setIsNodeListCollapsed,
         showIgnoredNodes,
         setShowIgnoredNodes,
+        filterRemoteAdminOnly,
+        setFilterRemoteAdminOnly,
       }}
     >
       {children}

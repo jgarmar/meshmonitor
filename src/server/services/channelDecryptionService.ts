@@ -29,6 +29,35 @@ interface CachedChannel {
   name: string;
   psk: Buffer;
   pskLength: number;
+  enforceNameValidation: boolean;
+  expectedChannelHash?: number;
+  sortOrder: number;
+}
+
+/**
+ * Compute XOR hash of bytes (Meshtastic channel hash algorithm)
+ * @param bytes The buffer to hash
+ * @returns 8-bit XOR hash
+ */
+function xorHash(bytes: Buffer): number {
+  let hash = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+  }
+  return hash & 0xff;
+}
+
+/**
+ * Compute the expected channel hash from name and PSK
+ * Meshtastic formula: hash = xorHash(name_bytes) ^ xorHash(psk_bytes)
+ *
+ * @param name Channel name (will be UTF-8 encoded)
+ * @param psk Pre-shared key buffer
+ * @returns 8-bit channel hash (0-255)
+ */
+function computeChannelHash(name: string, psk: Buffer): number {
+  const nameBytes = Buffer.from(name, 'utf8');
+  return xorHash(nameBytes) ^ xorHash(psk);
 }
 
 class ChannelDecryptionService {
@@ -107,11 +136,20 @@ class ChannelDecryptionService {
             continue;
           }
 
+          // Compute expected channel hash if name validation is enabled
+          const enforceNameValidation = channel.enforceNameValidation ?? false;
+          const expectedChannelHash = enforceNameValidation
+            ? computeChannelHash(channel.name, pskBuffer)
+            : undefined;
+
           this.channelCache.set(channel.id, {
             id: channel.id,
             name: channel.name,
             psk: pskBuffer,
             pskLength: channel.pskLength,
+            enforceNameValidation,
+            expectedChannelHash,
+            sortOrder: channel.sortOrder ?? 0,
           });
         } catch (err) {
           logger.warn(`Failed to process channel "${channel.name}" (id=${channel.id}):`, err);
@@ -235,12 +273,14 @@ class ChannelDecryptionService {
    * @param encryptedPayload The encrypted packet payload
    * @param packetId The packet's unique ID
    * @param fromNode The sender's node number
+   * @param channelHash Optional 8-bit channel hash from packet (meshPacket.channel)
    * @returns DecryptionResult with success status and decoded data if successful
    */
   async tryDecrypt(
     encryptedPayload: Uint8Array,
     packetId: number,
-    fromNode: number
+    fromNode: number,
+    channelHash?: number
   ): Promise<DecryptionResult> {
     if (!this.enabled) {
       return { success: false, error: 'Server-side decryption is disabled' };
@@ -260,9 +300,24 @@ class ChannelDecryptionService {
     // Build the nonce once (same for all attempts)
     const nonce = this.buildNonce(packetId, fromNode);
 
-    // Try each channel, up to maxDecryptionAttempts
+    // Try each channel in sortOrder, up to maxDecryptionAttempts
+    // Sort by sortOrder to ensure proper decryption priority
+    const sortedChannels = Array.from(this.channelCache.entries())
+      .sort(([, a], [, b]) => a.sortOrder - b.sortOrder);
+
     let attempts = 0;
-    for (const [id, channel] of this.channelCache) {
+    for (const [id, channel] of sortedChannels) {
+      // If channel has name validation enabled and packet has a channel hash,
+      // skip this channel if the hash doesn't match (don't count as an attempt)
+      if (
+        channel.enforceNameValidation &&
+        channel.expectedChannelHash !== undefined &&
+        channelHash !== undefined &&
+        channel.expectedChannelHash !== channelHash
+      ) {
+        continue;
+      }
+
       if (attempts >= this.maxDecryptionAttempts) {
         logger.debug(
           `Decryption attempt limit reached (${this.maxDecryptionAttempts}) for packet ${packetId}`
@@ -369,3 +424,6 @@ class ChannelDecryptionService {
 // Export singleton instance
 export const channelDecryptionService = new ChannelDecryptionService();
 export default channelDecryptionService;
+
+// Export hash functions for testing
+export { xorHash, computeChannelHash };

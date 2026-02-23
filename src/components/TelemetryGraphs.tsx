@@ -12,6 +12,21 @@ import { formatChartAxisTimestamp, formatTime } from '../utils/datetime';
 import { useSettings } from '../contexts/SettingsContext';
 import { ChartData } from '../types/ui';
 
+/** Telemetry types that represent discrete integer values where fractional display is meaningless */
+const INTEGER_TELEMETRY_TYPES = new Set([
+  'sats_in_view',
+  'messageHops',
+  'batteryLevel',
+  'numOnlineNodes', 'numTotalNodes',
+  'numPacketsTx', 'numPacketsRx', 'numPacketsRxBad',
+  'numRxDupe', 'numTxRelay', 'numTxRelayCanceled', 'numTxDropped',
+  'systemNodeCount', 'systemDirectNodeCount',
+  'paxcounterWifi', 'paxcounterBle',
+  'particles03um', 'particles05um', 'particles10um',
+  'particles25um', 'particles50um', 'particles100um',
+  'co2', 'iaq',
+]);
+
 interface TelemetryGraphsProps {
   nodeId: string;
   temperatureUnit?: TemperatureUnit;
@@ -422,6 +437,10 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
         numTxDropped: 'Dropped TX (Device)',
         heapTotalBytes: 'Heap Total (Device)',
         heapFreeBytes: 'Heap Free (Device)',
+        // MeshMonitor system metrics (calculated by MeshMonitor)
+        systemNodeCount: 'Active Nodes (MeshMonitor)',
+        systemDirectNodeCount: 'Direct Nodes (MeshMonitor)',
+        timeOffset: 'Clock Offset (Server \u2212 Node)',
         // HostMetrics (for Linux devices)
         hostUptimeSeconds: 'Host Uptime',
         hostFreememBytes: 'Host Free Memory',
@@ -503,6 +522,10 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
         paxcounterWifi: '#ff9500', // Orange
         paxcounterBle: '#17c0fa', // Cyan
         paxcounterUptime: '#9c88ff', // Purple
+        // MeshMonitor system metrics
+        systemNodeCount: '#89b4fa', // Blue - system active nodes
+        systemDirectNodeCount: '#a6e3a1', // Green - system direct nodes
+        timeOffset: '#f2cdcd', // Catppuccin flamingo - clock offset
         // Extended Environment metrics
         gasResistance: '#cba6f7', // Mauve - air quality related
         iaq: '#f38ba8', // Red - important air quality indicator
@@ -580,6 +603,11 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
         return false;
       }
 
+      // paxcounterBle is combined into the paxcounterWifi chart
+      if (type === 'paxcounterBle') {
+        return false;
+      }
+
       // For altitude, only show if values have changed
       if (type === 'altitude') {
         const values = data.map(d => d.value);
@@ -596,11 +624,42 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
         <h3 className="telemetry-title">{t('telemetry.title', { count: telemetryHours })}</h3>
         <div className="graphs-grid">
           {filteredData.map(([type, data]) => {
+            const isPaxcounterCombined = type === 'paxcounterWifi';
             const isTemperature = type === 'temperature';
             const chartData = prepareChartData(data, isTemperature, globalMinTime);
             const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : data[0]?.unit || '';
-            const label = getTelemetryLabel(type);
+            const label = isPaxcounterCombined ? 'Paxcounter' : getTelemetryLabel(type);
             const color = getColor(type);
+
+            // For paxcounter combined chart, merge BLE data into the same chart data
+            if (isPaxcounterCombined) {
+              const bleData = groupedData.get('paxcounterBle');
+              // Re-key: rename 'value' to 'paxWifi', add 'paxBle' from BLE data
+              const bleByTimestamp = new Map<number, number>();
+              if (bleData) {
+                bleData.forEach(item => bleByTimestamp.set(item.timestamp, item.value));
+              }
+              chartData.forEach(point => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const p = point as any;
+                p.paxWifi = point.value;
+                p.paxBle = bleByTimestamp.get(point.timestamp) ?? null;
+                bleByTimestamp.delete(point.timestamp);
+              });
+              // Add BLE-only timestamps
+              bleByTimestamp.forEach((value, timestamp) => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const point: any = {
+                  timestamp,
+                  value: null,
+                  time: formatTime(new Date(timestamp), timeFormat),
+                  paxWifi: null,
+                  paxBle: value,
+                };
+                chartData.push(point);
+              });
+              chartData.sort((a, b) => a.timestamp - b.timestamp);
+            }
 
             return (
               <div key={type} className="graph-container">
@@ -660,7 +719,13 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
                       tick={{ fontSize: 12 }}
                       tickFormatter={timestamp => formatChartAxisTimestamp(timestamp, globalTimeRange, timeFormat)}
                     />
-                    <YAxis yAxisId="left" tick={{ fontSize: 12 }} domain={['auto', 'auto']} />
+                    <YAxis
+                      yAxisId="left"
+                      tick={{ fontSize: 12 }}
+                      domain={['auto', 'auto']}
+                      allowDecimals={!INTEGER_TELEMETRY_TYPES.has(type)}
+                      tickFormatter={INTEGER_TELEMETRY_TYPES.has(type) ? (v: number) => Math.round(v).toString() : undefined}
+                    />
                     <YAxis
                       yAxisId="right"
                       orientation="right"
@@ -701,16 +766,43 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
                         isAnimationActive={false}
                       />
                     )}
-                    <Line
-                      yAxisId="left"
-                      type="monotone"
-                      dataKey="value"
-                      stroke={color}
-                      strokeWidth={2}
-                      dot={{ fill: color, r: 3 }}
-                      activeDot={{ r: 5 }}
-                      connectNulls={true}
-                    />
+                    {isPaxcounterCombined ? (
+                      <>
+                        <Line
+                          yAxisId="left"
+                          type="monotone"
+                          dataKey="paxWifi"
+                          name="WiFi"
+                          stroke={getColor('paxcounterWifi')}
+                          strokeWidth={2}
+                          dot={{ fill: getColor('paxcounterWifi'), r: 3 }}
+                          activeDot={{ r: 5 }}
+                          connectNulls={true}
+                        />
+                        <Line
+                          yAxisId="left"
+                          type="monotone"
+                          dataKey="paxBle"
+                          name="BLE"
+                          stroke={getColor('paxcounterBle')}
+                          strokeWidth={2}
+                          dot={{ fill: getColor('paxcounterBle'), r: 3 }}
+                          activeDot={{ r: 5 }}
+                          connectNulls={true}
+                        />
+                      </>
+                    ) : (
+                      <Line
+                        yAxisId="left"
+                        type="monotone"
+                        dataKey="value"
+                        stroke={color}
+                        strokeWidth={2}
+                        dot={{ fill: color, r: 3 }}
+                        activeDot={{ r: 5 }}
+                        connectNulls={true}
+                      />
+                    )}
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>

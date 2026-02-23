@@ -90,6 +90,9 @@ const TELEMETRY_LABELS: Record<string, string> = {
   numTxDropped: 'Dropped TX (Device)',
   heapTotalBytes: 'Heap Total (Device)',
   heapFreeBytes: 'Heap Free (Device)',
+  // MeshMonitor system metrics (calculated by MeshMonitor)
+  systemNodeCount: 'Active Nodes (MeshMonitor)',
+  systemDirectNodeCount: 'Direct Nodes (MeshMonitor)',
 };
 
 // Export for external use (returns English labels for sorting/filtering compatibility)
@@ -108,6 +111,9 @@ const TELEMETRY_COLORS: Record<string, string> = {
   paxcounterWifi: '#ff9500',
   paxcounterBle: '#17c0fa',
   paxcounterUptime: '#9c88ff',
+  // MeshMonitor system metrics
+  systemNodeCount: '#89b4fa',
+  systemDirectNodeCount: '#a6e3a1',
 };
 
 const getColor = (type: string): string => TELEMETRY_COLORS[type] || '#8884d8';
@@ -239,11 +245,19 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
       enabled: true,
     });
 
+    const isPaxcounterCombined = favorite.telemetryType === 'paxcounterWifi';
+
     // Filter data to only the specific telemetry type
     const telemetryData = useMemo(() => {
       if (!rawTelemetryData) return [];
       return rawTelemetryData.filter(d => d.telemetryType === favorite.telemetryType);
     }, [rawTelemetryData, favorite.telemetryType]);
+
+    // For combined paxcounter chart, also get BLE data
+    const paxBleData = useMemo(() => {
+      if (!isPaxcounterCombined || !rawTelemetryData) return [];
+      return rawTelemetryData.filter(d => d.telemetryType === 'paxcounterBle');
+    }, [rawTelemetryData, isPaxcounterCombined]);
 
     // Notify parent of loaded data for global time range calculation
     React.useEffect(() => {
@@ -274,7 +288,7 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
     const nodeName = formatNodeName(node, favorite.nodeId);
     const isTemperature = favorite.telemetryType === 'temperature';
     const color = getColor(favorite.telemetryType);
-    const label = getTranslatedLabel(favorite.telemetryType);
+    const label = isPaxcounterCombined ? 'Paxcounter' : getTranslatedLabel(favorite.telemetryType);
 
     // Loading state
     if (isLoading) {
@@ -352,6 +366,31 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
     const chartData = prepareChartData(telemetryData, isTemperature, temperatureUnit, solarEstimates, globalMinTime, timeFormat);
     const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : telemetryData[0]?.unit || '';
 
+    // For combined paxcounter chart, merge BLE data
+    if (isPaxcounterCombined) {
+      const bleByTimestamp = new Map<number, number>();
+      paxBleData.forEach(item => bleByTimestamp.set(item.timestamp, item.value));
+      chartData.forEach(point => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const p = point as any;
+        p.paxWifi = point.value;
+        p.paxBle = bleByTimestamp.get(point.timestamp) ?? null;
+        bleByTimestamp.delete(point.timestamp);
+      });
+      bleByTimestamp.forEach((value, timestamp) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const point: any = {
+          timestamp,
+          value: null,
+          time: formatTime(new Date(timestamp), timeFormat),
+          paxWifi: null,
+          paxBle: value,
+        };
+        chartData.push(point);
+      });
+      chartData.sort((a, b) => a.timestamp - b.timestamp);
+    }
+
     return (
       <div ref={setNodeRef} style={style} className="dashboard-chart-container">
         <div className="dashboard-chart-header">
@@ -427,16 +466,43 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                 isAnimationActive={false}
               />
             )}
-            <Line
-              yAxisId="left"
-              type="monotone"
-              dataKey="value"
-              stroke={color}
-              strokeWidth={2}
-              dot={{ fill: color, r: 3 }}
-              activeDot={{ r: 5 }}
-              connectNulls={true}
-            />
+            {isPaxcounterCombined ? (
+              <>
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="paxWifi"
+                  name="WiFi"
+                  stroke={getColor('paxcounterWifi')}
+                  strokeWidth={2}
+                  dot={{ fill: getColor('paxcounterWifi'), r: 3 }}
+                  activeDot={{ r: 5 }}
+                  connectNulls={true}
+                />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="paxBle"
+                  name="BLE"
+                  stroke={getColor('paxcounterBle')}
+                  strokeWidth={2}
+                  dot={{ fill: getColor('paxcounterBle'), r: 3 }}
+                  activeDot={{ r: 5 }}
+                  connectNulls={true}
+                />
+              </>
+            ) : (
+              <Line
+                yAxisId="left"
+                type="monotone"
+                dataKey="value"
+                stroke={color}
+                strokeWidth={2}
+                dot={{ fill: color, r: 3 }}
+                activeDot={{ r: 5 }}
+                connectNulls={true}
+              />
+            )}
           </ComposedChart>
         </ResponsiveContainer>
       </div>

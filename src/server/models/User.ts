@@ -78,6 +78,7 @@ export class UserModel {
         id, username, password_hash as passwordHash, email, display_name as displayName,
         auth_provider as authProvider, oidc_subject as oidcSubject,
         is_admin as isAdmin, is_active as isActive, password_locked as passwordLocked,
+        mfa_enabled as mfaEnabled, mfa_secret as mfaSecret, mfa_backup_codes as mfaBackupCodes,
         created_at as createdAt, last_login_at as lastLoginAt, created_by as createdBy
       FROM users
       WHERE id = ?
@@ -98,6 +99,7 @@ export class UserModel {
         id, username, password_hash as passwordHash, email, display_name as displayName,
         auth_provider as authProvider, oidc_subject as oidcSubject,
         is_admin as isAdmin, is_active as isActive, password_locked as passwordLocked,
+        mfa_enabled as mfaEnabled, mfa_secret as mfaSecret, mfa_backup_codes as mfaBackupCodes,
         created_at as createdAt, last_login_at as lastLoginAt, created_by as createdBy
       FROM users
       WHERE username = ?
@@ -118,6 +120,7 @@ export class UserModel {
         id, username, password_hash as passwordHash, email, display_name as displayName,
         auth_provider as authProvider, oidc_subject as oidcSubject,
         is_admin as isAdmin, is_active as isActive, password_locked as passwordLocked,
+        mfa_enabled as mfaEnabled, mfa_secret as mfaSecret, mfa_backup_codes as mfaBackupCodes,
         created_at as createdAt, last_login_at as lastLoginAt, created_by as createdBy
       FROM users
       WHERE oidc_subject = ?
@@ -138,6 +141,7 @@ export class UserModel {
         id, username, password_hash as passwordHash, email, display_name as displayName,
         auth_provider as authProvider, oidc_subject as oidcSubject,
         is_admin as isAdmin, is_active as isActive, password_locked as passwordLocked,
+        mfa_enabled as mfaEnabled, mfa_secret as mfaSecret, mfa_backup_codes as mfaBackupCodes,
         created_at as createdAt, last_login_at as lastLoginAt, created_by as createdBy
       FROM users
       ORDER BY created_at DESC
@@ -172,6 +176,21 @@ export class UserModel {
     if (input.passwordLocked !== undefined) {
       updates.push('password_locked = ?');
       params.push(input.passwordLocked ? 1 : 0);
+    }
+
+    if (input.mfaEnabled !== undefined) {
+      updates.push('mfa_enabled = ?');
+      params.push(input.mfaEnabled ? 1 : 0);
+    }
+
+    if (input.mfaSecret !== undefined) {
+      updates.push('mfa_secret = ?');
+      params.push(input.mfaSecret);
+    }
+
+    if (input.mfaBackupCodes !== undefined) {
+      updates.push('mfa_backup_codes = ?');
+      params.push(input.mfaBackupCodes);
     }
 
     if (updates.length === 0) {
@@ -286,6 +305,7 @@ export class UserModel {
         id, username, password_hash as passwordHash, email, display_name as displayName,
         auth_provider as authProvider, oidc_subject as oidcSubject,
         is_admin as isAdmin, is_active as isActive, password_locked as passwordLocked,
+        mfa_enabled as mfaEnabled, mfa_secret as mfaSecret, mfa_backup_codes as mfaBackupCodes,
         created_at as createdAt, last_login_at as lastLoginAt, created_by as createdBy
       FROM users
       WHERE LOWER(email) = LOWER(?)
@@ -383,7 +403,11 @@ export class UserModel {
         show_route as showRoute,
         show_motion as showMotion,
         show_mqtt_nodes as showMqttNodes,
-        show_animations as showAnimations
+        show_meshcore_nodes as showMeshCoreNodes,
+        show_animations as showAnimations,
+        show_accuracy_regions as showAccuracyRegions,
+        show_estimated_positions as showEstimatedPositions,
+        position_history_hours as positionHistoryHours
       FROM user_map_preferences
       WHERE user_id = ?
     `);
@@ -398,7 +422,11 @@ export class UserModel {
       showRoute: Boolean(row.showRoute),
       showMotion: Boolean(row.showMotion),
       showMqttNodes: Boolean(row.showMqttNodes),
-      showAnimations: Boolean(row.showAnimations)
+      showMeshCoreNodes: Boolean(row.showMeshCoreNodes),
+      showAnimations: Boolean(row.showAnimations),
+      showAccuracyRegions: Boolean(row.showAccuracyRegions),
+      showEstimatedPositions: Boolean(row.showEstimatedPositions),
+      positionHistoryHours: row.positionHistoryHours ?? null,
     };
   }
 
@@ -412,7 +440,11 @@ export class UserModel {
     showRoute?: boolean;
     showMotion?: boolean;
     showMqttNodes?: boolean;
+    showMeshCoreNodes?: boolean;
     showAnimations?: boolean;
+    showAccuracyRegions?: boolean;
+    showEstimatedPositions?: boolean;
+    positionHistoryHours?: number | null;
   }): void {
     const now = Date.now();
 
@@ -448,9 +480,25 @@ export class UserModel {
         updates.push('show_mqtt_nodes = ?');
         params.push(preferences.showMqttNodes ? 1 : 0);
       }
+      if (preferences.showMeshCoreNodes !== undefined) {
+        updates.push('show_meshcore_nodes = ?');
+        params.push(preferences.showMeshCoreNodes ? 1 : 0);
+      }
       if (preferences.showAnimations !== undefined) {
         updates.push('show_animations = ?');
         params.push(preferences.showAnimations ? 1 : 0);
+      }
+      if (preferences.showAccuracyRegions !== undefined) {
+        updates.push('show_accuracy_regions = ?');
+        params.push(preferences.showAccuracyRegions ? 1 : 0);
+      }
+      if (preferences.showEstimatedPositions !== undefined) {
+        updates.push('show_estimated_positions = ?');
+        params.push(preferences.showEstimatedPositions ? 1 : 0);
+      }
+      if (preferences.positionHistoryHours !== undefined) {
+        updates.push('position_history_hours = ?');
+        params.push(preferences.positionHistoryHours);
       }
 
       if (updates.length > 0) {
@@ -470,9 +518,10 @@ export class UserModel {
       const stmt = this.db.prepare(`
         INSERT INTO user_map_preferences (
           user_id, map_tileset, show_paths, show_neighbor_info,
-          show_route, show_motion, show_mqtt_nodes, show_animations,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          show_route, show_motion, show_mqtt_nodes, show_meshcore_nodes, show_animations,
+          show_accuracy_regions, show_estimated_positions,
+          position_history_hours, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       stmt.run(
@@ -483,7 +532,11 @@ export class UserModel {
         preferences.showRoute !== undefined ? (preferences.showRoute ? 1 : 0) : 1, // default true
         preferences.showMotion !== undefined ? (preferences.showMotion ? 1 : 0) : 1, // default true
         preferences.showMqttNodes !== undefined ? (preferences.showMqttNodes ? 1 : 0) : 1, // default true
+        preferences.showMeshCoreNodes !== undefined ? (preferences.showMeshCoreNodes ? 1 : 0) : 1, // default true
         preferences.showAnimations ? 1 : 0,
+        preferences.showAccuracyRegions ? 1 : 0, // default false
+        preferences.showEstimatedPositions !== undefined ? (preferences.showEstimatedPositions ? 1 : 0) : 1, // default true
+        preferences.positionHistoryHours ?? null,
         now,
         now
       );
@@ -505,6 +558,9 @@ export class UserModel {
       isAdmin: Boolean(row.isAdmin),
       isActive: Boolean(row.isActive),
       passwordLocked: Boolean(row.passwordLocked),
+      mfaEnabled: Boolean(row.mfaEnabled || row.mfa_enabled),
+      mfaSecret: row.mfaSecret || row.mfa_secret || null,
+      mfaBackupCodes: row.mfaBackupCodes || row.mfa_backup_codes || null,
       createdAt: row.createdAt,
       lastLoginAt: row.lastLoginAt || null,
       createdBy: row.createdBy || null

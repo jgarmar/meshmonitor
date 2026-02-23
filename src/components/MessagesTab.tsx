@@ -5,7 +5,7 @@
  * Handles the Messages/DM tab with node list and conversation view.
  */
 
-import React, { useRef, useCallback, useState, useMemo } from 'react';
+import React, { useRef, useCallback, useState, useMemo, useEffect } from 'react';
 import { useResizable } from '../hooks/useResizable';
 import { useTranslation, Trans } from 'react-i18next';
 import { DeviceInfo } from '../types/device';
@@ -33,7 +33,10 @@ import NodeDetailsBlock from './NodeDetailsBlock';
 import TelemetryGraphs from './TelemetryGraphs';
 import SmartHopsGraphs from './SmartHopsGraphs';
 import LinkQualityGraph from './LinkQualityGraph';
-import { NodeFilterPopup } from './NodeFilterPopup';
+import PacketStatsChart, { ChartDataEntry, DISTRIBUTION_COLORS } from './PacketStatsChart';
+import { getNodePacketDistribution } from '../services/packetApi';
+import { PacketDistributionStats } from '../types/packet';
+
 import { MessageStatusIndicator } from './MessageStatusIndicator';
 import RelayNodeModal from './RelayNodeModal';
 import TelemetryRequestModal, { TelemetryType } from './TelemetryRequestModal';
@@ -216,8 +219,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   securityFilter,
   channelFilter,
   showIncompleteNodes,
-  showNodeFilterPopup,
-  setShowNodeFilterPopup,
+  showNodeFilterPopup: _showNodeFilterPopup,
+  setShowNodeFilterPopup: _setShowNodeFilterPopup,
   isMessagesNodeListCollapsed,
   setIsMessagesNodeListCollapsed,
   tracerouteLoading,
@@ -337,7 +340,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
       nodeNum: node.nodeNum,
       nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
       longName: node.user?.longName || `Node ${node.nodeNum}`,
-      shortName: node.user?.shortName || node.nodeNum.toString(16).substring(0, 4),
+      shortName: node.user?.shortName || node.nodeNum.toString(16).padStart(8, '0').slice(-4),
       hopsAway: node.hopsAway,
       role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
       avgDirectRssi: stats?.avgRssi,
@@ -360,7 +363,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   const getNodeShortName = useCallback(
     (nodeId: string): string => {
       const node = nodes.find(n => n.user?.id === nodeId);
-      return (node?.user?.shortName && node.user.shortName.trim()) || nodeId.substring(1, 5);
+      return (node?.user?.shortName && node.user.shortName.trim()) || nodeId.slice(-4);
     },
     [nodes]
   );
@@ -443,6 +446,45 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
     },
     [nodes, baseUrl, csrfFetch, showToast, t]
   );
+
+  // Packet type distribution for selected node (last 24h)
+  const selectedNodeInfo = useMemo(() => {
+    if (!selectedDMNode) return undefined;
+    const node = nodes.find(n => n.user?.id === selectedDMNode);
+    if (!node) return undefined;
+    return { nodeNum: node.nodeNum, nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}` };
+  }, [selectedDMNode, nodes]);
+
+  const [nodePacketDistribution, setNodePacketDistribution] = useState<PacketDistributionStats | null>(null);
+
+  const fetchNodePacketDistribution = useCallback(async () => {
+    if (!selectedNodeInfo) {
+      setNodePacketDistribution(null);
+      return;
+    }
+    try {
+      const since = Math.floor(Date.now() / 1000) - 86400; // Last 24 hours
+      const distribution = await getNodePacketDistribution(selectedNodeInfo.nodeId, selectedNodeInfo.nodeNum, since);
+      setNodePacketDistribution(distribution);
+    } catch (error) {
+      console.error('Failed to fetch node packet distribution:', error);
+    }
+  }, [selectedNodeInfo]);
+
+  useEffect(() => {
+    fetchNodePacketDistribution();
+    const interval = setInterval(fetchNodePacketDistribution, 60000);
+    return () => clearInterval(interval);
+  }, [fetchNodePacketDistribution]);
+
+  const nodePacketTypeData: ChartDataEntry[] = useMemo(() => {
+    if (!nodePacketDistribution?.byType) return [];
+    return nodePacketDistribution.byType.map((p, i) => ({
+      name: p.portnum_name.replace(/_APP$/, '').replace(/_/g, ' '),
+      value: p.count,
+      color: DISTRIBUTION_COLORS[i % DISTRIBUTION_COLORS.length],
+    }));
+  }, [nodePacketDistribution]);
 
   // Permission check
   if (!hasPermission('messages', 'read')) {
@@ -606,13 +648,25 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           )}
           {!isMessagesNodeListCollapsed && (
             <div className="node-controls">
-              <input
-                type="text"
-                placeholder={t('messages.filter_placeholder')}
-                value={messagesNodeFilter}
-                onChange={e => setMessagesNodeFilter(e.target.value)}
-                className="filter-input-small"
-              />
+              <div className="filter-input-wrapper">
+                <input
+                  type="text"
+                  placeholder={t('messages.filter_placeholder')}
+                  value={messagesNodeFilter}
+                  onChange={e => setMessagesNodeFilter(e.target.value)}
+                  className="filter-input-small"
+                />
+                {messagesNodeFilter && (
+                  <button
+                    className="filter-clear-btn"
+                    onClick={() => setMessagesNodeFilter('')}
+                    title={t('common.clear_filter')}
+                    type="button"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
               <div className="sort-controls">
                 <select
                   value={dmFilter}
@@ -633,7 +687,6 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           )}
         </div>
 
-        <NodeFilterPopup isOpen={showNodeFilterPopup} onClose={() => setShowNodeFilterPopup(false)} />
 
         {!isMessagesNodeListCollapsed && (
           <div className="nodes-list">
@@ -652,9 +705,26 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       <div className="node-header">
                         <div className="node-name">
                           {node.isFavorite && <span className="favorite-indicator">⭐</span>}
-                          <span className="node-name-text">{node.user?.longName || t('messages.node_fallback', { nodeNum: node.nodeNum })}</span>
+                          <div className="node-name-text">
+                            <div className="node-longname">{node.user?.longName || t('messages.node_fallback', { nodeNum: node.nodeNum })}</div>
+                          </div>
                         </div>
                         <div className="node-actions">
+                          {node.position && node.position.latitude != null && node.position.longitude != null && (
+                            <span className="node-indicator-icon" title={t('nodes.location')}>📍</span>
+                          )}
+                          {node.viaMqtt && (
+                            <span className="node-indicator-icon" title={t('nodes.via_mqtt')}>🌐</span>
+                          )}
+                          {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
+                            <span className="node-indicator-icon" title={t('nodes.has_telemetry')}>📊</span>
+                          )}
+                          {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
+                            <span className="node-indicator-icon" title={t('nodes.has_weather')}>☀️</span>
+                          )}
+                          {node.user?.id && nodesWithPKC.has(node.user.id) && (
+                            <span className="node-indicator-icon" title={t('nodes.has_pkc')}>🔐</span>
+                          )}
                           {(node.keyIsLowEntropy || node.duplicateKeyDetected || node.keySecurityIssueDetails) && (
                             <span
                               className="security-warning-icon"
@@ -768,38 +838,6 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                         />
                       </div>
 
-                      <div className="node-indicators">
-                        {node.position && node.position.latitude != null && node.position.longitude != null && (
-                          <div className="node-location" title={t('nodes.location')}>
-                            📍
-                            {node.isMobile && (
-                              <span title={t('nodes.mobile_node')} style={{ marginLeft: '4px' }}>
-                                🚶
-                              </span>
-                            )}
-                            {node.position.altitude != null && (
-                              <span title={t('nodes.elevation')} style={{ marginLeft: '4px' }}>
-                                ⛰️ {Math.round(node.position.altitude)}m
-                              </span>
-                            )}
-                          </div>
-                        )}
-                        {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
-                          <div className="node-telemetry" title={t('nodes.has_telemetry')}>
-                            📊
-                          </div>
-                        )}
-                        {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
-                          <div className="node-weather" title={t('nodes.has_weather')}>
-                            ☀️
-                          </div>
-                        )}
-                        {node.user?.id && nodesWithPKC.has(node.user.id) && (
-                          <div className="node-pkc" title={t('nodes.has_pkc')}>
-                            🔐
-                          </div>
-                        )}
-                      </div>
                     </div>
                   ))}
                 </>
@@ -1221,7 +1259,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                 {reactions.map(reaction => (
                                   <span
                                     key={reaction.id}
-                                    className="reaction"
+                                    className={`reaction ${isMyMessage(reaction) ? 'mine' : 'theirs'}`}
                                     title={t('messages.reaction_tooltip', { name: getNodeShortName(reaction.from) })}
                                     onClick={() => handleSendTapback(reaction.text, msg)}
                                   >
@@ -1669,6 +1707,14 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                 telemetryHours={telemetryVisualizationHours}
                 baseUrl={baseUrl}
               />
+              {nodePacketDistribution?.enabled && nodePacketTypeData.length > 0 && (
+                <PacketStatsChart
+                  title={t('messages.packet_type_distribution')}
+                  data={nodePacketTypeData}
+                  total={nodePacketDistribution.total}
+                  chartId="node-packet-type"
+                />
+              )}
             </div>
             {/* End of dm-send-section */}
           </div>

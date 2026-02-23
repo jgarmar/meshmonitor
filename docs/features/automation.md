@@ -68,6 +68,36 @@ When enabled, MeshMonitor monitors all incoming messages for patterns matching t
 
 **Token Insertion**: Click on any token button to insert it at your cursor position, making it easy to build complex templates.
 
+**Sample Message Preview**: The interface shows a live preview of what your auto-ack response will look like with example token values filled in. Separate previews are shown for direct and multi-hop messages, so you can see exactly how each template will render before saving.
+
+### Channel Selection
+
+Control which channels and message types trigger auto-acknowledgment:
+
+**Direct Messages**: A separate toggle enables or disables auto-ack responses for direct messages (DMs). When disabled, DMs are ignored even if they match the pattern.
+
+**Channels 0–7**: Individual checkboxes for each channel allow you to enable or disable auto-ack on a per-channel basis. Only messages received on enabled channels will trigger a response.
+
+This granular control lets you respond on your primary channel while ignoring traffic on other channels, or vice versa.
+
+### Response Modes
+
+Auto Acknowledge supports two independent response modes, each with separate toggles for **direct** and **multi-hop** messages:
+
+**Tapback (Emoji Reaction)**: React to the triggering message with an emoji instead of (or in addition to) a text reply:
+- Direct messages receive a 🎯 reaction
+- Multi-hop messages receive a keycap digit emoji indicating the hop count (0️⃣ through 7️⃣)
+
+**Text Reply**: Send the configured message template as a text response. This is the traditional auto-ack behavior.
+
+Both modes can be enabled simultaneously — for example, you can send a tapback reaction *and* a text reply to every matched message. Each mode has independent toggles for direct and multi-hop, giving you full control over which connection types get which response.
+
+### Always Use Direct Message
+
+When enabled, auto-ack responses are sent as direct messages (DMs) to the sender, even when the triggering message was received on a channel.
+
+**Use case**: Avoid cluttering shared channels with automated responses. For example, if someone sends "ping" on a busy group channel, the auto-ack reply goes only to them instead of the entire channel.
+
 ### Skip Incomplete Nodes {#skip-incomplete-nodes-ack}
 
 **Description**: When enabled, Auto Acknowledge will not respond to messages from incomplete nodes.
@@ -159,6 +189,104 @@ When enabled, MeshMonitor periodically sends traceroute requests to all nodes in
 Traceroute uses Meshtastic's routing protocol. For more information:
 - [Meshtastic Routing Documentation](https://meshtastic.org/docs/overview/mesh-algo#routing)
 - [Traceroute Request Documentation](https://meshtastic.org/docs/configuration/module/traceroute)
+
+## Auto Ping {#auto-ping}
+
+Allows mesh users to trigger automated ping sessions via direct message commands. This is useful for testing link quality, measuring round-trip times, and verifying connectivity to the MeshMonitor node over time.
+
+### How It Works
+
+When enabled, mesh users can send a direct message to the MeshMonitor node with the command `ping N` (where N is the number of pings). MeshMonitor then sends N pings back to the requesting node at the configured interval, tracking ACK/NAK/timeout results for each ping. After all pings complete (or the user cancels), MeshMonitor sends a summary DM with the results.
+
+Pings use Meshtastic's `NODEINFO_APP` request with `wantResponse: true`, which is the standard Meshtastic ping mechanism — the target must respond with an ACK and NodeInfo, giving round-trip confirmation.
+
+### DM Commands
+
+| Command | Description |
+|---------|-------------|
+| `ping N` | Start N pings to the MeshMonitor node (N is capped at the configured maximum) |
+| `ping stop` | Cancel an active ping session |
+
+**Examples**:
+- Send `ping 5` as a DM to start 5 pings at the configured interval
+- Send `ping stop` to cancel an active session before it completes
+
+### Configuration
+
+Navigate to **Settings > Automation** and find the **Auto Ping** section.
+
+**Enable/Disable**: Toggle the checkbox next to "Auto Ping"
+
+| Setting | Description | Default | Range |
+|---------|-------------|---------|-------|
+| **Enable** | Turn auto-ping on or off | Off | — |
+| **Ping Interval** | Time between each ping in a session (seconds) | 30 | 10–300 |
+| **Max Pings Per Session** | Maximum number of pings a user can request in a single session | 20 | 1–100 |
+| **Ping Timeout** | How long to wait for a response before marking a ping as timed out (seconds) | 60 | 10–300 |
+
+### Active Sessions
+
+The Auto Ping settings panel displays a live table of active ping sessions, showing:
+
+- **Requested By**: The node that initiated the ping session
+- **Progress**: How many pings have completed out of the total (e.g., 3/5)
+- **Successful**: Number of pings that received an ACK
+- **Failed**: Number of pings that received a NAK or timed out
+- **Elapsed**: Time since the session started
+- **Stop**: Button to force-stop a session from the UI
+
+Sessions update in real-time via WebSocket events. Admins can force-stop any active session from the UI.
+
+### Session Lifecycle
+
+1. A mesh user sends `ping 5` as a DM to MeshMonitor
+2. MeshMonitor confirms: "Starting 5 pings every 30s..."
+3. After one full interval, the first ping is sent
+4. Each ping waits for an ACK, NAK, or timeout before the next interval
+5. After all pings complete, MeshMonitor sends a summary DM: "Auto-ping complete: 4/5 successful (80%)"
+6. If the user sends `ping stop` during a session, the session is cancelled and a partial summary is sent
+
+### Side Effects
+
+- **Network Traffic**: Each ping generates a NODEINFO request and expects a response, using mesh airtime
+- **One Session Per User**: Each node can only have one active ping session at a time
+- **DM Only**: Auto-ping commands are only processed when received as direct messages
+- **Command Priority**: Auto-ping commands are processed before Auto Responder triggers, so `ping` patterns in Auto Responder won't conflict
+
+### Use Cases
+
+- **Link Quality Testing**: Measure packet delivery rates between a remote node and MeshMonitor over time
+- **Latency Measurement**: Track round-trip times across multiple pings to assess network performance
+- **Connectivity Verification**: Confirm that a node can reliably reach MeshMonitor through the mesh
+- **Troubleshooting**: Diagnose intermittent connectivity issues with repeated ping tests
+
+### Best Practices
+
+- **Interval Selection**: Use the default 30-second interval for most cases; shorter intervals increase airtime usage
+- **Ping Count**: Start with 5–10 pings for quick tests; use higher counts (20+) for sustained reliability testing
+- **Timeout**: The default 60-second timeout is generous enough for multi-hop networks; reduce it for direct connections
+- **Max Pings**: Set the maximum to a reasonable value (20–50) to prevent excessive network usage from long sessions
+
+### Troubleshooting
+
+**"ping 5" not working**:
+- Verify Auto Ping is enabled in the Automation settings
+- Ensure the command is sent as a direct message (not on a channel)
+- Check that the number doesn't exceed the configured maximum
+
+**All pings timing out**:
+- The target node may be out of range or unreachable
+- Check mesh connectivity to the MeshMonitor node
+- Try increasing the timeout value
+
+**Session not appearing in UI**:
+- Refresh the browser page
+- Verify you have `settings:read` permission to view the Automation tab
+
+### Permissions
+
+- **UI Settings**: Requires `settings:read` to view, `settings:write` to modify configuration or force-stop sessions
+- **DM Commands**: Any mesh user can trigger a ping session (feature gated by the `autoPingEnabled` setting)
 
 ## Remote Admin Scanner {#remote-admin-scanner}
 
@@ -258,6 +386,59 @@ Scan results appear in the Node Details panel for each node:
 
 - [Admin Commands](/features/admin-commands) - Use remote admin to configure nodes
 - [Security](/features/security) - Learn about node security and encryption
+
+## Auto Time Sync
+
+Automatically synchronizes the MeshMonitor server's clock to nodes in your mesh network that support remote administration. This keeps node clocks accurate, which is important for proper message ordering and timestamp display.
+
+### How It Works
+
+When enabled, MeshMonitor periodically selects one eligible node that needs a time sync and sends it a **Set Time** admin command with the server's current time. The scheduler processes one node per interval tick, cycling through all eligible nodes over time.
+
+A node is eligible for time sync if:
+- It has been discovered by the [Remote Admin Scanner](#remote-admin-scanner) (has remote admin capability), **or** it is the local node
+- Its last time sync is older than the configured **expiration** period (or it has never been synced)
+- Optionally, it is included in the node filter list (when filtering is enabled)
+
+### Configuration
+
+Navigate to **Settings > Automation** and find the **Auto Time Sync** section.
+
+| Setting | Description | Default | Range |
+|---------|-------------|---------|-------|
+| **Enable** | Turn auto time sync on or off | Off | - |
+| **Interval** | How often to sync the next eligible node (in minutes) | 60 | 15 - 1440 |
+| **Expiration** | How many hours before a previously synced node becomes eligible again | 24 | 1 - 24 |
+| **Filter to specific nodes** | When enabled, only sync nodes in the selected list | Off | - |
+
+### Node Filter
+
+When the node filter is enabled, you can select which specific nodes should receive time syncs. The node list shows only nodes with remote admin capability. Use the **Select All** / **Deselect All** buttons and the search field to manage the list.
+
+When the filter is disabled (default), all eligible nodes are included automatically.
+
+### Prerequisites
+
+- **Remote Admin Scanner** must be enabled and must have discovered nodes with remote admin capability before Auto Time Sync can target them
+- MeshMonitor must be connected to a Meshtastic node
+
+### Use Cases
+
+- **Keeping node clocks accurate** - Nodes without GPS or NTP may drift over time; periodic syncing corrects this
+- **Consistent timestamps** - Ensures messages across the mesh have accurate, comparable timestamps
+- **Automated maintenance** - Set it and forget it; the scheduler handles all nodes over time
+
+### Best Practices
+
+- Start with the default 60-minute interval; there is no need to sync more frequently unless nodes drift quickly
+- Use a 24-hour expiration so each node gets synced roughly once per day
+- If you have a large mesh, the scheduler will cycle through all nodes automatically — one per interval tick
+- Use the node filter if you only want to sync specific nodes (e.g., solar-powered nodes that lose time on reboot)
+
+### Related Documentation
+
+- [Remote Admin Scanner](#remote-admin-scanner) - Required to discover nodes with remote admin capability
+- [Admin Commands](/features/admin-commands) - Manual admin commands including Set Time
 
 ## Auto Welcome
 
@@ -527,10 +708,12 @@ You can specify custom regex patterns for parameters using `{paramName:regex}` s
 **HTTP Response**: Makes an HTTP GET request to an external service
 
 - URL can include extracted parameters using `{parameter}` syntax
+- URL also supports all acknowledgement/announcement tokens (e.g., `{NODE_ID}`, `{SHORT_NAME}`, `{HOPS}`, `{SNR}`, `{RSSI}`, `{CHANNEL}`, `{VERSION}`, etc.) - token values are automatically URI-encoded for URL safety
+- Extracted parameters from regex capture groups take precedence over built-in tokens of the same name
 - **Multiline Support**: Enable to automatically split long responses into multiple messages
 - Useful for triggering webhooks, APIs, or external automation
 - Example trigger: `alert {message}`
-- Example response: `https://api.example.com/alert?msg={message}`
+- Example response: `https://api.example.com/alert?msg={message}&node={NODE_ID}&snr={SNR}`
 
 **Script Response**: Executes a custom script for advanced logic
 
@@ -539,8 +722,44 @@ You can specify custom regex patterns for parameters using `{paramName:regex}` s
 - Scripts receive message data and parameters via environment variables
 - Can output single or multiple responses (see Script Response Details below)
 - 10-second execution timeout
+- **Script Arguments**: Optional command-line arguments with token expansion (see below)
 - Example trigger: `weather {location}`
 - Example response: `/data/scripts/weather.py`
+
+### Script Arguments (Auto Responder)
+
+When using Script responses, you can pass command-line arguments to scripts via the **Arguments** field. Arguments support token expansion, allowing dynamic values to be injected at runtime.
+
+**Example Arguments:**
+- `--reboot` - Pass a simple flag
+- `--set lora.region US` - Pass a setting and value
+- `--dest {NODE_ID} --reboot` - Use token expansion
+- `--ip {IP} --verbose` - Include the node IP address
+
+**Available Tokens:**
+
+| Token | Description | Example |
+|-------|-------------|---------|
+| `{NODE_ID}` | Sender's node ID | `!a1b2c3d4` |
+| `{LONG_NAME}` | Sender's long name | `Alice's Node` |
+| `{SHORT_NAME}` | Sender's short name | `ALI` |
+| `{IP}` | Meshtastic node IP | `192.168.1.100` |
+| `{PORT}` | Meshtastic TCP port | `4403` |
+| `{VERSION}` | MeshMonitor version | `v3.4.0` |
+| `{NODECOUNT}` | Active node count | `42` |
+| `{HOPS}` | Message hop count | `2` |
+| `{SNR}` | Signal-to-noise ratio | `7.5` |
+| `{RSSI}` | Signal strength | `-95` |
+
+**Example Configuration:**
+```
+Trigger: reboot {nodeid}
+Response Type: script
+Response: /data/scripts/remote-admin.py
+Arguments: --dest {nodeid} --reboot
+```
+
+When someone sends "reboot !abc12345", the script is called with arguments `--dest !abc12345 --reboot`.
 
 ### Multiline Support
 
@@ -1040,6 +1259,39 @@ Timer trigger scripts follow the same requirements as Auto Responder scripts:
 - Must output valid JSON to stdout with a `response` or `responses` field
 - 10-second execution timeout
 - Execute with container user permissions
+- **Script Arguments**: Optional command-line arguments with token expansion
+
+### Script Arguments (Timer Triggers)
+
+Timer triggers support passing command-line arguments to scripts via the **Arguments** field. Arguments support token expansion for dynamic values.
+
+**Example Arguments:**
+- `--ip {IP}` - Pass the node IP address
+- `--count {NODECOUNT}` - Pass the active node count
+- `--verbose --format json` - Pass multiple flags
+
+**Available Tokens:**
+
+| Token | Description | Example |
+|-------|-------------|---------|
+| `{IP}` | Meshtastic node IP | `192.168.1.100` |
+| `{PORT}` | Meshtastic TCP port | `4403` |
+| `{VERSION}` | MeshMonitor version | `v3.4.0` |
+| `{NODECOUNT}` | Active node count | `42` |
+| `{DIRECTCOUNT}` | Direct node count | `15` |
+| `{DURATION}` | Server uptime | `2 days, 5 hours` |
+| `{FEATURES}` | Enabled features | `🗺️ 🤖` |
+
+**Example Configuration:**
+```
+Name: Scheduled Remote Admin
+Schedule: 0 3 * * *
+Script: remote-admin.py
+Arguments: --ip {IP} --dest !abc12345 --reboot
+Channel: 0 (Primary)
+```
+
+This runs a remote admin command every day at 3 AM.
 
 **JSON Output Format**:
 
@@ -1138,7 +1390,7 @@ print(json.dumps(output))
 
 - **Network Traffic**: Each timer execution sends messages to the mesh network
 - **Airtime Usage**: Timer outputs consume LoRa airtime
-- **Script Execution**: Scripts run in the container with 10-second timeout
+- **Script Execution**: Scripts run in the container with 30-second timeout
 - **Queue Processing**: Multi-response scripts queue messages with 30-second intervals
 
 ### Use Cases
@@ -1177,6 +1429,380 @@ print(json.dumps(output))
 - Verify the selected channel is correct
 - Check that the script returns a `response` field
 - Ensure response text is under 200 characters
+
+## Geofence Triggers {#geofence-triggers}
+
+Trigger automated actions when nodes enter, exit, or remain inside defined geographic areas. This powerful feature enables location-based automation such as arrival notifications, area monitoring, or proximity alerts.
+
+### How It Works
+
+Geofence Triggers monitor node positions and compare them against defined geographic boundaries. When a node's position matches a trigger condition (entering, exiting, or remaining inside a zone), MeshMonitor automatically executes the configured response.
+
+### Configuration
+
+**Adding a Geofence Trigger**:
+
+1. Navigate to the Automation settings (Info tab)
+2. Scroll to the "Geofence Triggers" section
+3. Fill out the trigger configuration:
+   - **Name**: A descriptive name for the trigger (e.g., "Base Camp Entry Alert")
+   - **Shape**: Circle or polygon defining the geographic boundary
+   - **Event**: When to trigger (entry, exit, or while inside)
+   - **Node Filter**: Which nodes to monitor (all or selected)
+   - **Response Type**: Text message or script
+   - **Channel**: Where to send the response (channel or direct message)
+4. Click "Add Geofence Trigger"
+5. Click "Save" to persist your changes
+
+### Geofence Shapes
+
+**Circle**: Define a circular area by clicking on the map to set the center point and dragging to set the radius.
+
+- Displays radius in kilometers
+- Good for simple proximity monitoring
+- Easy to visualize and adjust
+
+**Polygon**: Define a custom-shaped area by clicking multiple points on the map to create vertices.
+
+- Supports complex boundary shapes
+- Useful for irregular areas like property boundaries
+- Click points to add vertices, close the polygon to complete
+
+The interactive map editor shows your current nodes with position data, making it easy to draw zones around specific locations.
+
+### Trigger Events
+
+**Entry**: Fires when a node enters the geofence zone.
+- Triggers once when position changes from outside to inside
+- Useful for arrival notifications
+
+**Exit**: Fires when a node leaves the geofence zone.
+- Triggers once when position changes from inside to outside
+- Useful for departure alerts
+
+**While Inside**: Fires periodically while a node remains inside the zone.
+- Configurable interval (in minutes)
+- Useful for ongoing presence monitoring
+- Example: Send status update every 5 minutes while node is in area
+
+### Node Filtering
+
+**All Nodes**: Monitor all nodes with position data.
+- Any node entering/exiting the zone triggers the action
+
+**Selected Nodes**: Monitor only specific nodes.
+- Choose which nodes to track from the node selector
+- Filter by node name or ID
+- Useful for monitoring specific assets or people
+
+### Response Types
+
+**Text Message**: Send a customizable message with dynamic tokens.
+
+Available tokens:
+- `{GEOFENCE_NAME}` - Name of the geofence trigger
+- `{EVENT}` - Event type (entry/exit/while_inside)
+- `{LONG_NAME}` - Node's long name
+- `{SHORT_NAME}` - Node's short name
+- `{NODE_ID}` - Node's ID (e.g., !a1b2c3d4)
+- `{NODE_LAT}` - Node's latitude
+- `{NODE_LON}` - Node's longitude
+- `{DISTANCE_TO_CENTER}` - Distance to geofence center in kilometers
+- `{VERSION}` - MeshMonitor version
+- `{NODECOUNT}` - Total active nodes
+
+**Example Messages**:
+```
+{LONG_NAME} entered {GEOFENCE_NAME}
+```
+```
+Alert: {SHORT_NAME} has left the monitored area
+```
+```
+{LONG_NAME} is {DISTANCE_TO_CENTER}km from base camp
+```
+
+**Script Response**: Execute a custom script for advanced logic.
+
+- Scripts must be in `/data/scripts/` directory
+- Supports Node.js, Python, and Shell scripts
+- Receives geofence data via environment variables
+- Same 10-second timeout as Auto Responder scripts
+- **Script Arguments**: Optional command-line arguments with token expansion
+
+### Script Arguments (Geofence Triggers)
+
+Geofence triggers support passing command-line arguments to scripts via the **Arguments** field. This is particularly useful with the `remote-admin.py` script for automated node management.
+
+**Example Arguments:**
+- `--reboot` - Reboot node on geofence entry
+- `--set lora.region US` - Change settings on exit
+- `--dest {NODE_ID} --reboot` - Target the triggering node
+- `--ip {IP} --dest {NODE_ID} --factory-reset` - Full reset with token expansion
+
+**Available Tokens:**
+
+| Token | Description | Example |
+|-------|-------------|---------|
+| `{NODE_ID}` | Triggering node ID | `!a1b2c3d4` |
+| `{NODE_NUM}` | Triggering node number | `123456789` |
+| `{LONG_NAME}` | Node's long name | `Alice's Node` |
+| `{SHORT_NAME}` | Node's short name | `ALI` |
+| `{NODE_LAT}` | Node's latitude | `40.7128` |
+| `{NODE_LON}` | Node's longitude | `-74.0060` |
+| `{GEOFENCE_NAME}` | Geofence name | `Base Camp` |
+| `{EVENT}` | Event type | `entry` |
+| `{DISTANCE_TO_CENTER}` | Distance in km | `2.5` |
+| `{IP}` | Meshtastic node IP | `192.168.1.100` |
+| `{PORT}` | Meshtastic TCP port | `4403` |
+| `{VERSION}` | MeshMonitor version | `v3.4.0` |
+| `{NODECOUNT}` | Active node count | `42` |
+
+**Example Configurations:**
+
+| Use Case | Script | Arguments |
+|----------|--------|-----------|
+| Reboot on entry | remote-admin.py | `--reboot` |
+| Change region on exit | remote-admin.py | `--set lora.region US` |
+| Set position | remote-admin.py | `--setlat 40.7128 --setlon -74.0060` |
+| Factory reset | remote-admin.py | `--factory-reset` |
+| Custom with tokens | remote-admin.py | `--dest {NODE_ID} --set device.role CLIENT` |
+
+**Example: Reboot Node on Geofence Entry**
+```
+Name: Reboot on Entry
+Shape: Circle (500m radius)
+Event: Entry
+Response Type: Script
+Script: /data/scripts/remote-admin.py
+Arguments: --reboot
+Channel: Direct Message
+```
+
+### Output Channel
+
+**Direct Message**: Send the response directly to the triggering node.
+- Private notification to the node owner
+- Good for personal alerts
+
+**Channel**: Send the response to a specific channel.
+- Public notification visible to channel members
+- Good for team/group awareness
+
+### Managing Triggers
+
+**Enable/Disable**: Toggle individual triggers without removing them.
+- Disabled triggers show reduced opacity
+- Quick way to temporarily pause monitoring
+
+**Edit**: Modify any trigger property.
+- Click "Edit" to load trigger into the form
+- Make changes and click "Save Changes"
+- Click "Cancel" to discard changes
+
+**Remove**: Delete a trigger permanently.
+- Confirmation dialog prevents accidental deletion
+
+**Status Display**: Each trigger shows:
+- Shape type and size (e.g., "Circle (2.5 km)")
+- Event type
+- Response preview
+- Node filter status
+- Last run time and result (if applicable)
+
+### Side Effects
+
+- **Position Monitoring**: Requires nodes to broadcast position data
+- **Processing Overhead**: Each position update is checked against all active triggers
+- **Network Traffic**: Text responses consume airtime on the mesh
+- **Script Execution**: Scripts run in the container with timeout limits
+
+### Use Cases
+
+**Arrival/Departure Notifications**:
+- Alert when family members arrive home
+- Notify team when assets reach destination
+- Track vehicle entry/exit from facilities
+
+**Area Monitoring**:
+- Monitor restricted areas for unauthorized access
+- Track node presence in work zones
+- Event perimeter monitoring
+
+**Proximity Alerts**:
+- Warn when nodes approach hazardous areas
+- Notify when nodes leave safe zones
+- Distance-based status updates
+
+**Asset Tracking**:
+- Confirm delivery arrivals
+- Monitor equipment location
+- Track personnel in field operations
+
+### Best Practices
+
+**Zone Design**:
+- Use appropriate buffer zones to avoid edge-case triggers
+- Consider GPS accuracy when sizing zones
+- Test triggers with actual node movement
+
+**Performance**:
+- Limit number of active triggers for better performance
+- Use node filtering when monitoring specific assets
+- Choose appropriate "while inside" intervals
+
+**Notifications**:
+- Keep messages concise for radio efficiency
+- Include relevant context (node name, location)
+- Consider privacy when using public channels
+
+### Troubleshooting
+
+**Trigger Not Firing**:
+- Verify node has recent position data
+- Check that node filter includes the target node
+- Ensure trigger is enabled
+- Verify geofence zone covers the expected area
+
+**False Triggers**:
+- GPS accuracy may cause edge-case triggers
+- Increase zone size to add buffer
+- Consider using "while inside" instead of entry/exit for stationary monitoring
+
+**Messages Not Sending**:
+- Check response text is under 200 characters
+- Verify channel selection is correct
+- Check for script errors in container logs
+
+## Auto Key Management {#auto-key-management}
+
+Automatically detects and repairs PKI (Public Key Infrastructure) key mismatches between nodes in your mesh network. Key mismatches can occur when a node's encryption key changes (e.g., after a factory reset or firmware update) but other nodes still have the old key cached. This prevents encrypted communication from working correctly.
+
+### How It Works
+
+When enabled, MeshMonitor periodically scans for nodes with key mismatches and attempts to repair them by exchanging node info. The exchange process forces nodes to share their current encryption keys, resolving stale key caches.
+
+The repair process for each node with a key mismatch:
+
+1. **Detect**: MeshMonitor identifies nodes whose cached public key doesn't match the key seen in recent packets
+2. **Exchange**: Sends a node info exchange request to trigger a fresh key exchange
+3. **Verify**: Waits for the exchange to complete and checks if the key mismatch is resolved
+4. **Retry**: If still mismatched, retries up to the configured maximum number of exchanges
+5. **Purge** (optional): If all exchanges fail and auto-purge is enabled, removes the node from the device database and sends one final exchange to re-establish the connection cleanly
+
+### Configuration
+
+Navigate to **Settings > Automation** and find the **Auto Key Management** section.
+
+**Enable/Disable**: Toggle the checkbox next to "Auto Key Management"
+
+| Setting | Description | Default | Range |
+|---------|-------------|---------|-------|
+| **Enable** | Turn auto key management on or off | Off | — |
+| **Interval Between Attempts** | Time to wait between node info exchange attempts for each node (minutes) | 5 | 1–60 |
+| **Maximum Exchange Attempts** | Number of node info exchanges to attempt before giving up on a node | 3 | 1–10 |
+| **Auto-Purge After Exhausting Attempts** | If enabled, automatically remove the node from the device database after all exchange attempts fail, then send one final node info exchange | Off | — |
+
+### Activity Log
+
+The Auto Key Management panel includes a real-time activity log showing recent repair activity:
+
+- **Time**: When the action occurred
+- **Node**: The node name or ID
+- **Action**: What was attempted
+  - **Exchange**: A node info exchange was sent
+  - **Fixed**: The key mismatch was resolved
+  - **Exhausted**: All exchange attempts were used without resolving the mismatch
+  - **Purge**: The node was removed from the device database (when auto-purge is enabled)
+- **Status**: Success or failure indicator
+
+The log refreshes automatically every 30 seconds.
+
+### Side Effects
+
+- **Network Traffic**: Each exchange attempt generates node info packets on the mesh
+- **Auto-Purge Risk**: Enabling auto-purge will remove nodes from the device database if exchanges fail — the node will need to be re-discovered
+- **Background Processing**: Runs on a timer; does not require user interaction after configuration
+
+### Use Cases
+
+- **Post-Firmware Update**: Repair key mismatches after nodes update their firmware and regenerate keys
+- **Factory Reset Recovery**: Automatically handle key changes when nodes are factory-reset
+- **Large Network Maintenance**: Keep encryption keys current across a large mesh without manual intervention
+- **Security Hygiene**: Ensure all nodes can communicate securely with current keys
+
+### Best Practices
+
+- Start with the default 5-minute interval and 3 exchange attempts
+- Enable auto-purge only if you're comfortable with nodes being temporarily removed and re-discovered
+- Monitor the activity log after enabling to verify repairs are succeeding
+- For more information about encryption keys and key mismatches, see [Duplicate Encryption Keys](/security-duplicate-keys)
+
+### Related Documentation
+
+- [Duplicate Encryption Keys](/security-duplicate-keys) - Understanding key mismatches and how to fix them manually
+- [Security](/features/security) - Learn about node security and encryption
+
+## Ignored Nodes {#ignored-nodes}
+
+Manages the persistent ignore list for nodes you want to exclude from your mesh monitoring. Ignored nodes are hidden from the node list and remain ignored even after being pruned by inactive node cleanup — when they reappear on the mesh, their ignored status is automatically restored.
+
+### How It Works
+
+When you ignore a node (via the Node Details panel), MeshMonitor records it in a persistent ignore list. This section of the Automation tab shows all currently ignored nodes and allows you to manage the list.
+
+Unlike simply hiding a node from the UI, the persistent ignore list ensures that:
+
+- **Survival across cleanup**: If an inactive node is pruned from the database and later reappears, it will automatically be re-ignored
+- **Consistent filtering**: Ignored nodes are hidden from the main Node List, advanced filters, and Admin Commands by default
+- **Network transparency**: Ignoring a node is purely a UI action — it does not affect message delivery or mesh network functionality
+
+### Viewing Ignored Nodes
+
+The Ignored Nodes panel displays:
+
+- **Total Count**: A summary showing how many nodes are currently ignored
+- **Node Table**: A detailed table with columns:
+  - **Node ID**: The hex ID of the ignored node (e.g., `!a1b2c3d4`)
+  - **Long Name**: The node's long name (if known)
+  - **Short Name**: The node's short name (if known)
+  - **Ignored At**: When the node was added to the ignore list
+  - **Actions**: Un-ignore button to remove the node from the list
+
+### How to Ignore a Node
+
+1. Select a node in the Node List to open its details
+2. In the Node Details panel, click the **Ignore Node** button
+3. The node will be added to the persistent ignore list and hidden from the Node List
+
+### How to Un-ignore a Node
+
+**From the Automation tab**:
+1. Navigate to **Settings > Automation > Ignored Nodes**
+2. Find the node in the table
+3. Click the **Un-ignore** button
+
+**From the Node List**:
+1. Enable "Show ignored nodes" in the Node List filter panel (🚫 icon)
+2. Find the ignored node in the list and select it
+3. In the Node Details panel, click the **Un-ignore Node** button
+
+### Use Cases
+
+- **Noise Reduction**: Hide spammy or malfunctioning nodes that clutter your node list
+- **Network Focus**: Narrow monitoring to only the nodes you care about
+- **Persistent Exclusion**: Ensure problematic nodes stay hidden even after database cleanup cycles
+- **Temporary Suppression**: Hide nodes during troubleshooting, then un-ignore them later
+
+### Permissions
+
+- Viewing the ignored nodes list requires `settings:read` permission
+- Ignoring or un-ignoring nodes requires appropriate admin permissions
+
+### Related Documentation
+
+- [Settings - Ignored Nodes Filter](/features/settings#ignored-nodes-filter) - UI filtering for ignored nodes in the Node List
+- [Admin Commands](/features/admin-commands) - Managing nodes through admin commands
 
 ## Configuration Storage
 

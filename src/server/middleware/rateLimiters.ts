@@ -24,9 +24,9 @@ const rateLimitConfig = {
 
 // Log rate limit configuration at startup
 logger.info('⏱️  Rate limit configuration:');
-logger.info(`   - API: ${env.rateLimitApi} requests per 15 minutes${env.rateLimitApiProvided ? ' (custom)' : ' (default)'}`);
-logger.info(`   - Auth: ${env.rateLimitAuth} attempts per 15 minutes${env.rateLimitAuthProvided ? ' (custom)' : ' (default)'}`);
-logger.info(`   - Messages: ${env.rateLimitMessages} messages per minute${env.rateLimitMessagesProvided ? ' (custom)' : ' (default)'}`);
+logger.info(`   - API: ${env.rateLimitApi === 0 ? 'unlimited (disabled)' : `${env.rateLimitApi} requests per 15 minutes`}${env.rateLimitApiProvided ? ' (custom)' : ' (default)'}`);
+logger.info(`   - Auth: ${env.rateLimitAuth === 0 ? 'unlimited (disabled)' : `${env.rateLimitAuth} attempts per 15 minutes`}${env.rateLimitAuthProvided ? ' (custom)' : ' (default)'}`);
+logger.info(`   - Messages: ${env.rateLimitMessages === 0 ? 'unlimited (disabled)' : `${env.rateLimitMessages} messages per minute`}${env.rateLimitMessagesProvided ? ' (custom)' : ' (default)'}`);
 
 // Log reverse proxy configuration warnings
 if (!env.trustProxyProvided && env.isProduction) {
@@ -50,6 +50,7 @@ export const apiLimiter = rateLimit({
     });
   },
   ...rateLimitConfig,
+  ...(env.rateLimitApi === 0 ? { skip: () => true } : {}),
 });
 
 // Strict rate limiting for authentication endpoints
@@ -70,6 +71,7 @@ export const authLimiter = rateLimit({
     });
   },
   ...rateLimitConfig,
+  ...(env.rateLimitAuth === 0 ? { skip: () => true } : {}),
 });
 
 // Moderate rate limiting for message sending
@@ -84,6 +86,25 @@ export const messageLimiter = rateLimit({
     logger.warn(`🚫 Rate limit exceeded for MESSAGES - IP: ${ip}`);
     res.status(429).json({
       error: 'Too many messages sent, please slow down',
+      retryAfter: '1 minute'
+    });
+  },
+  ...rateLimitConfig,
+  ...(env.rateLimitMessages === 0 ? { skip: () => true } : {}),
+});
+
+// Rate limiting for MeshCore device operations (connect, disconnect, config changes)
+// More restrictive than general API to prevent device abuse
+// Default: 10 operations per minute in production, 60 in development
+export const meshcoreDeviceLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: env.isProduction ? 10 : 60,
+  message: 'Too many device operations, please slow down',
+  handler: (req, res) => {
+    const ip = req.ip || 'unknown';
+    logger.warn(`🚫 Rate limit exceeded for MESHCORE DEVICE - IP: ${ip}, Path: ${req.path}`);
+    res.status(429).json({
+      error: 'Too many device operations, please slow down',
       retryAfter: '1 minute'
     });
   },

@@ -43,6 +43,8 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     setOwnerConfig,
     setDeviceConfig,
     setTelemetryConfig,
+    setStatusMessageConfig,
+    setTrafficManagementConfig,
   } = useAdminCommandsState();
 
   // UI and non-config state (keep as useState for now)
@@ -99,6 +101,8 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     network: 'idle',
     neighborinfo: 'idle',
     telemetry: 'idle',
+    statusmessage: 'idle',
+    trafficmanagement: 'idle',
     owner: 'idle',
     channels: 'idle'
   });
@@ -125,6 +129,10 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     hwModel: number;
     hasRemoteHardware: boolean;
   } | null>(null);
+
+  // Reboot and Set Time command states
+  const [isLoadingReboot, setIsLoadingReboot] = useState(false);
+  const [isLoadingSetTime, setIsLoadingSetTime] = useState(false);
 
   // Collapsible sections state - persist to localStorage
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>(() => {
@@ -385,13 +393,17 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       mqtt: 'loading',
       security: 'loading',
       bluetooth: 'loading',
+      network: 'loading',
       neighborinfo: 'loading',
+      telemetry: 'loading',
+      statusmessage: 'loading',
+      trafficmanagement: 'loading',
       owner: 'loading',
       channels: 'loading'
     });
     const errors: string[] = [];
     const loaded: string[] = [];
-    const totalConfigs = 9; // device, lora, position, mqtt, security, bluetooth, neighborinfo, owner, channels
+    const totalConfigs = 13; // device, lora, position, mqtt, security, bluetooth, network, neighborinfo, telemetry, statusmessage, trafficmanagement, owner, channels
 
     try {
       // Load all config types sequentially to avoid conflicts and timeouts
@@ -540,7 +552,24 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       });
       await new Promise(resolve => setTimeout(resolve, 200));
 
-      await loadConfig('neighborinfo', 7, (result) => {
+      await loadConfig('network', 7, (result) => {
+        const config = result.config;
+        const ipv4 = config.ipv4Config || {};
+        setNetworkConfig({
+          wifiEnabled: config.wifiEnabled || false,
+          wifiSsid: config.wifiSsid || '',
+          wifiPsk: config.wifiPsk || '',
+          ntpServer: config.ntpServer || '',
+          addressMode: config.addressMode || 0,
+          ipv4Address: ipv4.ip || '',
+          ipv4Gateway: ipv4.gateway || '',
+          ipv4Subnet: ipv4.subnet || '',
+          ipv4Dns: ipv4.dns || ''
+        });
+      });
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      await loadConfig('neighborinfo', 8, (result) => {
         const config = result.config;
         setNeighborInfoConfig({
           enabled: config.enabled,
@@ -550,12 +579,62 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       });
       await new Promise(resolve => setTimeout(resolve, 200));
 
+      await loadConfig('telemetry', 9, (result) => {
+        const config = result.config;
+        setTelemetryConfig({
+          deviceUpdateInterval: config.deviceUpdateInterval ?? 900,
+          deviceTelemetryEnabled: config.deviceTelemetryEnabled ?? false,
+          environmentUpdateInterval: config.environmentUpdateInterval ?? 900,
+          environmentMeasurementEnabled: config.environmentMeasurementEnabled ?? false,
+          environmentScreenEnabled: config.environmentScreenEnabled ?? false,
+          environmentDisplayFahrenheit: config.environmentDisplayFahrenheit ?? false,
+          airQualityEnabled: config.airQualityEnabled ?? false,
+          airQualityInterval: config.airQualityInterval ?? 900,
+          powerMeasurementEnabled: config.powerMeasurementEnabled ?? false,
+          powerUpdateInterval: config.powerUpdateInterval ?? 900,
+          powerScreenEnabled: config.powerScreenEnabled ?? false,
+          healthMeasurementEnabled: config.healthMeasurementEnabled ?? false,
+          healthUpdateInterval: config.healthUpdateInterval ?? 900,
+          healthScreenEnabled: config.healthScreenEnabled ?? false
+        });
+      });
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      await loadConfig('statusmessage', 10, (result) => {
+        const config = result.config;
+        setStatusMessageConfig({
+          nodeStatus: config.nodeStatus ?? ''
+        });
+      });
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      await loadConfig('trafficmanagement', 11, (result) => {
+        const config = result.config;
+        setTrafficManagementConfig({
+          enabled: config.enabled ?? false,
+          positionDedupEnabled: config.positionDedupEnabled ?? false,
+          positionDedupTimeSecs: config.positionDedupTimeSecs ?? 0,
+          positionDedupDistanceMeters: config.positionDedupDistanceMeters ?? 0,
+          nodeinfoDirectResponseEnabled: config.nodeinfoDirectResponseEnabled ?? false,
+          nodeinfoDirectResponseMyNodeOnly: config.nodeinfoDirectResponseMyNodeOnly ?? false,
+          rateLimitEnabled: config.rateLimitEnabled ?? false,
+          rateLimitMaxPerNode: config.rateLimitMaxPerNode ?? 0,
+          rateLimitWindowSecs: config.rateLimitWindowSecs ?? 0,
+          unknownPacketDropEnabled: config.unknownPacketDropEnabled ?? false,
+          unknownPacketGracePeriodSecs: config.unknownPacketGracePeriodSecs ?? 0,
+          hopExhaustionEnabled: config.hopExhaustionEnabled ?? false,
+          hopExhaustionMinHops: config.hopExhaustionMinHops ?? 0,
+          hopExhaustionMaxHops: config.hopExhaustionMaxHops ?? 0
+        });
+      });
+      await new Promise(resolve => setTimeout(resolve, 200));
+
       // Load owner info
-      await loadOwner(8);
+      await loadOwner(12);
       await new Promise(resolve => setTimeout(resolve, 200));
 
       // Load channels (extracted logic to avoid duplicate loading state and toasts)
-      setLoadingProgress({ current: 9, total: totalConfigs, configType: 'channels' });
+      setLoadingProgress({ current: 13, total: totalConfigs, configType: 'channels' });
       try {
         const localNodeNum = nodes.find(n => (n.user?.id || n.nodeId) === currentNodeId)?.nodeNum;
         const isLocalNode = selectedNodeNum === localNodeNum || selectedNodeNum === 0;
@@ -768,6 +847,52 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     }
   };
 
+  const handleSendReboot = async () => {
+    if (selectedNodeNum === null) {
+      showToast(t('admin_commands.please_select_node'), 'error');
+      return;
+    }
+
+    // Confirm before sending reboot
+    if (!window.confirm(t('admin_commands.confirm_reboot', 'Are you sure you want to reboot this node?'))) {
+      return;
+    }
+
+    setIsLoadingReboot(true);
+
+    try {
+      await apiService.post('/api/admin/reboot', {
+        nodeNum: selectedNodeNum,
+        seconds: 5
+      });
+      showToast(t('admin_commands.reboot_sent', 'Reboot command sent successfully'), 'success');
+    } catch (error: any) {
+      showToast(error.message || t('admin_commands.failed_reboot', 'Failed to send reboot command'), 'error');
+    } finally {
+      setIsLoadingReboot(false);
+    }
+  };
+
+  const handleSetTime = async () => {
+    if (selectedNodeNum === null) {
+      showToast(t('admin_commands.please_select_node'), 'error');
+      return;
+    }
+
+    setIsLoadingSetTime(true);
+
+    try {
+      await apiService.post('/api/admin/set-time', {
+        nodeNum: selectedNodeNum
+      });
+      showToast(t('admin_commands.set_time_sent', 'Time sync command sent successfully'), 'success');
+    } catch (error: any) {
+      showToast(error.message || t('admin_commands.failed_set_time', 'Failed to send set-time command'), 'error');
+    } finally {
+      setIsLoadingSetTime(false);
+    }
+  };
+
   // Individual section load handlers
   const handleLoadSingleConfig = async (configType: string) => {
     if (selectedNodeNum === null) {
@@ -972,6 +1097,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
               case 'telemetry':
                 setTelemetryConfig({
                   deviceUpdateInterval: config.deviceUpdateInterval ?? 900,
+                  deviceTelemetryEnabled: config.deviceTelemetryEnabled ?? false,
                   environmentUpdateInterval: config.environmentUpdateInterval ?? 900,
                   environmentMeasurementEnabled: config.environmentMeasurementEnabled ?? false,
                   environmentScreenEnabled: config.environmentScreenEnabled ?? false,
@@ -980,7 +1106,10 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
                   airQualityInterval: config.airQualityInterval ?? 900,
                   powerMeasurementEnabled: config.powerMeasurementEnabled ?? false,
                   powerUpdateInterval: config.powerUpdateInterval ?? 900,
-                  powerScreenEnabled: config.powerScreenEnabled ?? false
+                  powerScreenEnabled: config.powerScreenEnabled ?? false,
+                  healthMeasurementEnabled: config.healthMeasurementEnabled ?? false,
+                  healthUpdateInterval: config.healthUpdateInterval ?? 900,
+                  healthScreenEnabled: config.healthScreenEnabled ?? false
                 });
                 break;
             }
@@ -1635,6 +1764,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
   const handleSetTelemetryConfig = useCallback(async () => {
     const config: any = {
       deviceUpdateInterval: configState.telemetry.deviceUpdateInterval,
+      deviceTelemetryEnabled: configState.telemetry.deviceTelemetryEnabled,
       environmentUpdateInterval: configState.telemetry.environmentUpdateInterval,
       environmentMeasurementEnabled: configState.telemetry.environmentMeasurementEnabled,
       environmentScreenEnabled: configState.telemetry.environmentScreenEnabled,
@@ -1643,7 +1773,10 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       airQualityInterval: configState.telemetry.airQualityInterval,
       powerMeasurementEnabled: configState.telemetry.powerMeasurementEnabled,
       powerUpdateInterval: configState.telemetry.powerUpdateInterval,
-      powerScreenEnabled: configState.telemetry.powerScreenEnabled
+      powerScreenEnabled: configState.telemetry.powerScreenEnabled,
+      healthMeasurementEnabled: configState.telemetry.healthMeasurementEnabled,
+      healthUpdateInterval: configState.telemetry.healthUpdateInterval,
+      healthScreenEnabled: configState.telemetry.healthScreenEnabled
     };
 
     try {
@@ -1653,6 +1786,51 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       console.error('Set Telemetry config command failed:', error);
     }
   }, [configState.telemetry, executeCommand]);
+
+  const handleStatusMessageConfigChange = useCallback((field: string, value: any) => {
+    setStatusMessageConfig({ [field]: value });
+  }, [setStatusMessageConfig]);
+
+  const handleSetStatusMessageConfig = useCallback(async () => {
+    const config: any = {
+      nodeStatus: configState.statusMessage.nodeStatus
+    };
+
+    try {
+      await executeCommand('setStatusMessageConfig', { config });
+    } catch (error) {
+      console.error('Set StatusMessage config command failed:', error);
+    }
+  }, [configState.statusMessage, executeCommand]);
+
+  const handleTrafficManagementConfigChange = useCallback((field: string, value: any) => {
+    setTrafficManagementConfig({ [field]: value });
+  }, [setTrafficManagementConfig]);
+
+  const handleSetTrafficManagementConfig = useCallback(async () => {
+    const config: any = {
+      enabled: configState.trafficManagement.enabled,
+      positionDedupEnabled: configState.trafficManagement.positionDedupEnabled,
+      positionDedupTimeSecs: configState.trafficManagement.positionDedupTimeSecs,
+      positionDedupDistanceMeters: configState.trafficManagement.positionDedupDistanceMeters,
+      nodeinfoDirectResponseEnabled: configState.trafficManagement.nodeinfoDirectResponseEnabled,
+      nodeinfoDirectResponseMyNodeOnly: configState.trafficManagement.nodeinfoDirectResponseMyNodeOnly,
+      rateLimitEnabled: configState.trafficManagement.rateLimitEnabled,
+      rateLimitMaxPerNode: configState.trafficManagement.rateLimitMaxPerNode,
+      rateLimitWindowSecs: configState.trafficManagement.rateLimitWindowSecs,
+      unknownPacketDropEnabled: configState.trafficManagement.unknownPacketDropEnabled,
+      unknownPacketGracePeriodSecs: configState.trafficManagement.unknownPacketGracePeriodSecs,
+      hopExhaustionEnabled: configState.trafficManagement.hopExhaustionEnabled,
+      hopExhaustionMinHops: configState.trafficManagement.hopExhaustionMinHops,
+      hopExhaustionMaxHops: configState.trafficManagement.hopExhaustionMaxHops
+    };
+
+    try {
+      await executeCommand('setTrafficManagementConfig', { config });
+    } catch (error) {
+      console.error('Set TrafficManagement config command failed:', error);
+    }
+  }, [configState.trafficManagement, executeCommand]);
 
   const handleAdminKeyChange = (index: number, value: string) => {
     setAdminKey(index, value);
@@ -2229,6 +2407,33 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
             >
               {isLoadingDeviceMetadata ? t('common.loading') : t('admin_commands.retrieve_device_metadata', 'Retrieve Device Metadata')}
             </button>
+            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem', maxWidth: '600px', width: '100%' }}>
+              <button
+                onClick={handleSendReboot}
+                disabled={isLoadingReboot || selectedNodeNum === null}
+                className="save-button"
+                style={{
+                  flex: 1,
+                  opacity: (isLoadingReboot || selectedNodeNum === null) ? 0.5 : 1,
+                  cursor: (isLoadingReboot || selectedNodeNum === null) ? 'not-allowed' : 'pointer',
+                  backgroundColor: 'var(--ctp-red)'
+                }}
+              >
+                {isLoadingReboot ? t('common.loading') : t('admin_commands.send_reboot', 'Send Reboot')}
+              </button>
+              <button
+                onClick={handleSetTime}
+                disabled={isLoadingSetTime || selectedNodeNum === null}
+                className="save-button"
+                style={{
+                  flex: 1,
+                  opacity: (isLoadingSetTime || selectedNodeNum === null) ? 0.5 : 1,
+                  cursor: (isLoadingSetTime || selectedNodeNum === null) ? 'not-allowed' : 'pointer'
+                }}
+              >
+                {isLoadingSetTime ? t('common.loading') : t('admin_commands.set_time', 'Set Time')}
+              </button>
+            </div>
             {deviceMetadata && (
               <div
                 className="device-metadata-display"
@@ -2276,6 +2481,28 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
           </div>
         )}
       </div>
+
+      {selectedNode?.isLocal && (
+        <div style={{
+          padding: '0.75rem 1rem',
+          marginBottom: '1rem',
+          backgroundColor: 'var(--ctp-surface0)',
+          border: '1px solid var(--ctp-blue)',
+          borderRadius: '8px',
+          color: 'var(--ctp-subtext1)',
+          fontSize: '0.9rem',
+          lineHeight: '1.4'
+        }}>
+          {t('admin_commands.local_node_config_hint', 'All local device configuration, including many features not available in Remote Admin, is available on the')}{' '}
+          <a
+            href="#configuration"
+            style={{ color: 'var(--ctp-blue)', textDecoration: 'underline', cursor: 'pointer' }}
+          >
+            {t('admin_commands.device_configuration_page_link', 'Device Configuration')}
+          </a>{' '}
+          {t('admin_commands.local_node_config_hint_suffix', 'page.')}
+        </div>
+      )}
 
       {/* Radio Configuration Section */}
       <CollapsibleSection
@@ -2871,6 +3098,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
         onNeighborInfoConfigChange={handleNeighborInfoConfigChange}
         onSaveNeighborInfoConfig={handleSetNeighborInfoConfig}
         telemetryDeviceUpdateInterval={configState.telemetry.deviceUpdateInterval}
+        telemetryDeviceTelemetryEnabled={configState.telemetry.deviceTelemetryEnabled}
         telemetryEnvironmentUpdateInterval={configState.telemetry.environmentUpdateInterval}
         telemetryEnvironmentMeasurementEnabled={configState.telemetry.environmentMeasurementEnabled}
         telemetryEnvironmentScreenEnabled={configState.telemetry.environmentScreenEnabled}
@@ -2880,13 +3108,39 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
         telemetryPowerMeasurementEnabled={configState.telemetry.powerMeasurementEnabled}
         telemetryPowerUpdateInterval={configState.telemetry.powerUpdateInterval}
         telemetryPowerScreenEnabled={configState.telemetry.powerScreenEnabled}
+        telemetryHealthMeasurementEnabled={configState.telemetry.healthMeasurementEnabled}
+        telemetryHealthUpdateInterval={configState.telemetry.healthUpdateInterval}
+        telemetryHealthScreenEnabled={configState.telemetry.healthScreenEnabled}
         onTelemetryConfigChange={handleTelemetryConfigChange}
         onSaveTelemetryConfig={handleSetTelemetryConfig}
+        statusMessageNodeStatus={configState.statusMessage.nodeStatus}
+        onStatusMessageConfigChange={handleStatusMessageConfigChange}
+        onSaveStatusMessageConfig={handleSetStatusMessageConfig}
+        statusMessageIsDisabled={sectionLoadStatus.statusmessage === 'error'}
+        trafficManagementEnabled={configState.trafficManagement.enabled}
+        trafficManagementPositionDedupEnabled={configState.trafficManagement.positionDedupEnabled}
+        trafficManagementPositionDedupTimeSecs={configState.trafficManagement.positionDedupTimeSecs}
+        trafficManagementPositionDedupDistanceMeters={configState.trafficManagement.positionDedupDistanceMeters}
+        trafficManagementNodeinfoDirectResponseEnabled={configState.trafficManagement.nodeinfoDirectResponseEnabled}
+        trafficManagementNodeinfoDirectResponseMyNodeOnly={configState.trafficManagement.nodeinfoDirectResponseMyNodeOnly}
+        trafficManagementRateLimitEnabled={configState.trafficManagement.rateLimitEnabled}
+        trafficManagementRateLimitMaxPerNode={configState.trafficManagement.rateLimitMaxPerNode}
+        trafficManagementRateLimitWindowSecs={configState.trafficManagement.rateLimitWindowSecs}
+        trafficManagementUnknownPacketDropEnabled={configState.trafficManagement.unknownPacketDropEnabled}
+        trafficManagementUnknownPacketGracePeriodSecs={configState.trafficManagement.unknownPacketGracePeriodSecs}
+        trafficManagementHopExhaustionEnabled={configState.trafficManagement.hopExhaustionEnabled}
+        trafficManagementHopExhaustionMinHops={configState.trafficManagement.hopExhaustionMinHops}
+        trafficManagementHopExhaustionMaxHops={configState.trafficManagement.hopExhaustionMaxHops}
+        onTrafficManagementConfigChange={handleTrafficManagementConfigChange}
+        onSaveTrafficManagementConfig={handleSetTrafficManagementConfig}
+        trafficManagementIsDisabled={sectionLoadStatus.trafficmanagement === 'error'}
         isExecuting={isExecuting}
         selectedNodeNum={selectedNodeNum}
         mqttHeaderActions={renderSectionLoadButton('mqtt')}
         neighborInfoHeaderActions={renderSectionLoadButton('neighborinfo')}
         telemetryHeaderActions={renderSectionLoadButton('telemetry')}
+        statusMessageHeaderActions={renderSectionLoadButton('statusmessage')}
+        trafficManagementHeaderActions={renderSectionLoadButton('trafficmanagement')}
       />
 
       {/* Import/Export Configuration Section */}

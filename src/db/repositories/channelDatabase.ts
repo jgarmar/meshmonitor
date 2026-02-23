@@ -4,7 +4,7 @@
  * Handles all channel database operations for server-side decryption.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, and, asc } from 'drizzle-orm';
 import {
   channelDatabaseSqlite,
   channelDatabasePostgres,
@@ -26,6 +26,7 @@ export interface ChannelDatabaseInput {
   pskLength: number; // 16 for AES-128, 32 for AES-256
   description?: string | null;
   isEnabled?: boolean;
+  enforceNameValidation?: boolean;
   createdBy?: number | null;
 }
 
@@ -38,6 +39,16 @@ export interface ChannelDatabaseUpdate {
   pskLength?: number;
   description?: string | null;
   isEnabled?: boolean;
+  enforceNameValidation?: boolean;
+  sortOrder?: number;
+}
+
+/**
+ * Channel reorder entry
+ */
+export interface ChannelReorderEntry {
+  id: number;
+  sortOrder: number;
 }
 
 /**
@@ -99,7 +110,7 @@ export class ChannelDatabaseRepository extends BaseRepository {
   }
 
   /**
-   * Get all channel database entries
+   * Get all channel database entries (ordered by sortOrder, then id)
    */
   async getAllAsync(): Promise<DbChannelDatabase[]> {
     if (this.isSQLite()) {
@@ -107,7 +118,7 @@ export class ChannelDatabaseRepository extends BaseRepository {
       const results = await db
         .select()
         .from(channelDatabaseSqlite)
-        .orderBy(desc(channelDatabaseSqlite.createdAt));
+        .orderBy(asc(channelDatabaseSqlite.sortOrder), asc(channelDatabaseSqlite.id));
 
       return results.map(r => this.mapSqliteToDbChannelDatabase(r));
     } else if (this.isMySQL()) {
@@ -115,7 +126,7 @@ export class ChannelDatabaseRepository extends BaseRepository {
       const results = await db
         .select()
         .from(channelDatabaseMysql)
-        .orderBy(desc(channelDatabaseMysql.createdAt));
+        .orderBy(asc(channelDatabaseMysql.sortOrder), asc(channelDatabaseMysql.id));
 
       return results.map(r => this.mapMysqlToDbChannelDatabase(r));
     } else {
@@ -123,14 +134,14 @@ export class ChannelDatabaseRepository extends BaseRepository {
       const results = await db
         .select()
         .from(channelDatabasePostgres)
-        .orderBy(desc(channelDatabasePostgres.createdAt));
+        .orderBy(asc(channelDatabasePostgres.sortOrder), asc(channelDatabasePostgres.id));
 
       return results.map(r => this.mapPostgresToDbChannelDatabase(r));
     }
   }
 
   /**
-   * Get all enabled channel database entries (for decryption)
+   * Get all enabled channel database entries (for decryption, ordered by sortOrder)
    */
   async getEnabledAsync(): Promise<DbChannelDatabase[]> {
     if (this.isSQLite()) {
@@ -138,7 +149,8 @@ export class ChannelDatabaseRepository extends BaseRepository {
       const results = await db
         .select()
         .from(channelDatabaseSqlite)
-        .where(eq(channelDatabaseSqlite.isEnabled, true));
+        .where(eq(channelDatabaseSqlite.isEnabled, true))
+        .orderBy(asc(channelDatabaseSqlite.sortOrder), asc(channelDatabaseSqlite.id));
 
       return results.map(r => this.mapSqliteToDbChannelDatabase(r));
     } else if (this.isMySQL()) {
@@ -146,7 +158,8 @@ export class ChannelDatabaseRepository extends BaseRepository {
       const results = await db
         .select()
         .from(channelDatabaseMysql)
-        .where(eq(channelDatabaseMysql.isEnabled, true));
+        .where(eq(channelDatabaseMysql.isEnabled, true))
+        .orderBy(asc(channelDatabaseMysql.sortOrder), asc(channelDatabaseMysql.id));
 
       return results.map(r => this.mapMysqlToDbChannelDatabase(r));
     } else {
@@ -154,7 +167,8 @@ export class ChannelDatabaseRepository extends BaseRepository {
       const results = await db
         .select()
         .from(channelDatabasePostgres)
-        .where(eq(channelDatabasePostgres.isEnabled, true));
+        .where(eq(channelDatabasePostgres.isEnabled, true))
+        .orderBy(asc(channelDatabasePostgres.sortOrder), asc(channelDatabasePostgres.id));
 
       return results.map(r => this.mapPostgresToDbChannelDatabase(r));
     }
@@ -174,6 +188,7 @@ export class ChannelDatabaseRepository extends BaseRepository {
         pskLength: data.pskLength,
         description: data.description ?? null,
         isEnabled: data.isEnabled ?? true,
+        enforceNameValidation: data.enforceNameValidation ?? false,
         decryptedPacketCount: 0,
         lastDecryptedAt: null,
         createdBy: data.createdBy ?? null,
@@ -192,6 +207,7 @@ export class ChannelDatabaseRepository extends BaseRepository {
         pskLength: data.pskLength,
         description: data.description ?? null,
         isEnabled: data.isEnabled ?? true,
+        enforceNameValidation: data.enforceNameValidation ?? false,
         decryptedPacketCount: 0,
         lastDecryptedAt: null,
         createdBy: data.createdBy ?? null,
@@ -209,6 +225,7 @@ export class ChannelDatabaseRepository extends BaseRepository {
         pskLength: data.pskLength,
         description: data.description ?? null,
         isEnabled: data.isEnabled ?? true,
+        enforceNameValidation: data.enforceNameValidation ?? false,
         decryptedPacketCount: 0,
         lastDecryptedAt: null,
         createdBy: data.createdBy ?? null,
@@ -321,6 +338,42 @@ export class ChannelDatabaseRepository extends BaseRepository {
           .where(eq(channelDatabasePostgres.id, id));
       }
     }
+  }
+
+  /**
+   * Reorder multiple channel database entries
+   * Updates the sortOrder for each entry in the provided array
+   */
+  async reorderAsync(updates: ChannelReorderEntry[]): Promise<void> {
+    const now = this.now();
+
+    if (this.isSQLite()) {
+      const db = this.getSqliteDb();
+      for (const { id, sortOrder } of updates) {
+        await db
+          .update(channelDatabaseSqlite)
+          .set({ sortOrder, updatedAt: now })
+          .where(eq(channelDatabaseSqlite.id, id));
+      }
+    } else if (this.isMySQL()) {
+      const db = this.getMysqlDb();
+      for (const { id, sortOrder } of updates) {
+        await db
+          .update(channelDatabaseMysql)
+          .set({ sortOrder, updatedAt: now })
+          .where(eq(channelDatabaseMysql.id, id));
+      }
+    } else {
+      const db = this.getPostgresDb();
+      for (const { id, sortOrder } of updates) {
+        await db
+          .update(channelDatabasePostgres)
+          .set({ sortOrder, updatedAt: now })
+          .where(eq(channelDatabasePostgres.id, id));
+      }
+    }
+
+    logger.debug(`Reordered ${updates.length} channel database entries`);
   }
 
   // ============ PERMISSION METHODS ============
@@ -569,6 +622,8 @@ export class ChannelDatabaseRepository extends BaseRepository {
       pskLength: row.pskLength,
       description: row.description,
       isEnabled: Boolean(row.isEnabled),
+      enforceNameValidation: Boolean(row.enforceNameValidation),
+      sortOrder: row.sortOrder ?? 0,
       decryptedPacketCount: row.decryptedPacketCount,
       lastDecryptedAt: row.lastDecryptedAt,
       createdBy: row.createdBy,
@@ -585,6 +640,8 @@ export class ChannelDatabaseRepository extends BaseRepository {
       pskLength: row.pskLength,
       description: row.description,
       isEnabled: row.isEnabled,
+      enforceNameValidation: row.enforceNameValidation,
+      sortOrder: row.sortOrder ?? 0,
       decryptedPacketCount: row.decryptedPacketCount,
       lastDecryptedAt: row.lastDecryptedAt ? Number(row.lastDecryptedAt) : null,
       createdBy: row.createdBy,
@@ -601,6 +658,8 @@ export class ChannelDatabaseRepository extends BaseRepository {
       pskLength: row.pskLength,
       description: row.description,
       isEnabled: Boolean(row.isEnabled),
+      enforceNameValidation: Boolean(row.enforceNameValidation),
+      sortOrder: row.sortOrder ?? 0,
       decryptedPacketCount: row.decryptedPacketCount,
       lastDecryptedAt: row.lastDecryptedAt ? Number(row.lastDecryptedAt) : null,
       createdBy: row.createdBy,

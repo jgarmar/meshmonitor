@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, ReactNode, useRef } from 'react';
 import { DbTraceroute, DbNeighborInfo } from '../services/database';
 import api from '../services/api';
 import { useCsrf } from './CsrfContext';
@@ -7,6 +7,9 @@ export interface PositionHistoryItem {
   latitude: number;
   longitude: number;
   timestamp: number;
+  altitude?: number;
+  groundSpeed?: number;   // m/s
+  groundTrack?: number;   // degrees (0-360, 0=North)
 }
 
 export interface EnrichedNeighborInfo extends DbNeighborInfo {
@@ -20,6 +23,18 @@ export interface EnrichedNeighborInfo extends DbNeighborInfo {
   neighborLongitude?: number;
 }
 
+// MeshCore node for map display
+export interface MeshCoreMapNode {
+  publicKey: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  rssi?: number;
+  snr?: number;
+  lastSeen?: number;
+  advType?: number;
+}
+
 interface MapContextType {
   showPaths: boolean;
   setShowPaths: (show: boolean) => void;
@@ -31,12 +46,14 @@ interface MapContextType {
   setShowMotion: (show: boolean) => void;
   showMqttNodes: boolean;
   setShowMqttNodes: (show: boolean) => void;
+  showMeshCoreNodes: boolean;
+  setShowMeshCoreNodes: (show: boolean) => void;
   showAnimations: boolean;
   setShowAnimations: (show: boolean) => void;
   showEstimatedPositions: boolean;
   setShowEstimatedPositions: (show: boolean) => void;
-  showAccuracyCircles: boolean;
-  setShowAccuracyCircles: (show: boolean) => void;
+  showAccuracyRegions: boolean;
+  setShowAccuracyRegions: (show: boolean) => void;
   animatedNodes: Set<string>;
   triggerNodeAnimation: (nodeId: string) => void;
   mapCenterTarget: [number, number] | null;
@@ -53,6 +70,10 @@ interface MapContextType {
   setPositionHistory: (history: PositionHistoryItem[]) => void;
   selectedNodeId: string | null;
   setSelectedNodeId: (id: string | null) => void;
+  positionHistoryHours: number | null;
+  setPositionHistoryHours: (hours: number | null) => void;
+  meshCoreNodes: MeshCoreMapNode[];
+  setMeshCoreNodes: (nodes: MeshCoreMapNode[]) => void;
 }
 
 const MapContext = createContext<MapContextType | undefined>(undefined);
@@ -70,12 +91,14 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   const [showRoute, setShowRouteState] = useState<boolean>(true);
   const [showMotion, setShowMotionState] = useState<boolean>(true);
   const [showMqttNodes, setShowMqttNodesState] = useState<boolean>(true);
+  const [showMeshCoreNodes, setShowMeshCoreNodesState] = useState<boolean>(true);
   const [showAnimations, setShowAnimationsState] = useState<boolean>(false);
+  const [meshCoreNodes, setMeshCoreNodes] = useState<MeshCoreMapNode[]>([]);
   const [showEstimatedPositions, setShowEstimatedPositionsState] = useState<boolean>(() => {
     const saved = localStorage.getItem('showEstimatedPositions');
     return saved !== null ? saved === 'true' : true; // Default to true
   });
-  const [showAccuracyCircles, setShowAccuracyCirclesState] = useState<boolean>(false);
+  const [showAccuracyRegions, setShowAccuracyRegionsState] = useState<boolean>(false);
   const [animatedNodes, setAnimatedNodes] = useState<Set<string>>(new Set());
   const [mapCenterTarget, setMapCenterTarget] = useState<[number, number] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number] | null>(() => {
@@ -103,6 +126,7 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   const [neighborInfo, setNeighborInfo] = useState<EnrichedNeighborInfo[]>([]);
   const [positionHistory, setPositionHistory] = useState<PositionHistoryItem[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [positionHistoryHours, setPositionHistoryHoursState] = useState<number | null>(null);
 
   // Create wrapper setters that persist to server (no localStorage)
   const setShowPaths = React.useCallback((value: boolean) => {
@@ -131,6 +155,11 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     savePreferenceToServer({ showMqttNodes: value });
   }, []);
 
+  const setShowMeshCoreNodes = React.useCallback((value: boolean) => {
+    setShowMeshCoreNodesState(value);
+    savePreferenceToServer({ showMeshCoreNodes: value });
+  }, []);
+
   const setShowAnimations = React.useCallback((value: boolean) => {
     setShowAnimationsState(value);
     savePreferenceToServer({ showAnimations: value });
@@ -142,13 +171,13 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     savePreferenceToServer({ showEstimatedPositions: value });
   }, []);
 
-  const setShowAccuracyCircles = React.useCallback((value: boolean) => {
-    setShowAccuracyCirclesState(value);
-    savePreferenceToServer({ showAccuracyCircles: value });
+  const setShowAccuracyRegions = React.useCallback((value: boolean) => {
+    setShowAccuracyRegionsState(value);
+    savePreferenceToServer({ showAccuracyRegions: value });
   }, []);
 
   // Helper function to save preference to server
-  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean>) => {
+  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean | number | null>) => {
     try {
       const baseUrl = await api.getBaseUrl();
       const csrfToken = getCsrfToken();
@@ -180,6 +209,19 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     }
   }, [getCsrfToken]);
 
+  // Create wrapper setter for positionHistoryHours that persists to server with debouncing
+  const positionHistoryDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  const setPositionHistoryHours = React.useCallback((value: number | null) => {
+    setPositionHistoryHoursState(value);
+    // Debounce server save to avoid excessive API calls during slider dragging
+    if (positionHistoryDebounceRef.current) {
+      clearTimeout(positionHistoryDebounceRef.current);
+    }
+    positionHistoryDebounceRef.current = setTimeout(() => {
+      savePreferenceToServer({ positionHistoryHours: value });
+    }, 500);
+  }, [savePreferenceToServer]);
+
   // Load preferences from server on mount
   useEffect(() => {
     const loadServerPreferences = async () => {
@@ -209,14 +251,23 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
             if (preferences.showMqttNodes !== undefined) {
               setShowMqttNodesState(preferences.showMqttNodes);
             }
+            if (preferences.showMeshCoreNodes !== undefined) {
+              setShowMeshCoreNodesState(preferences.showMeshCoreNodes);
+            }
             if (preferences.showAnimations !== undefined) {
               setShowAnimationsState(preferences.showAnimations);
             }
             if (preferences.showEstimatedPositions !== undefined) {
               setShowEstimatedPositionsState(preferences.showEstimatedPositions);
             }
-            if (preferences.showAccuracyCircles !== undefined) {
-              setShowAccuracyCirclesState(preferences.showAccuracyCircles);
+            // Support both old 'showAccuracyCircles' and new 'showAccuracyRegions' for backward compatibility
+            if (preferences.showAccuracyRegions !== undefined) {
+              setShowAccuracyRegionsState(preferences.showAccuracyRegions);
+            } else if (preferences.showAccuracyCircles !== undefined) {
+              setShowAccuracyRegionsState(preferences.showAccuracyCircles);
+            }
+            if (preferences.positionHistoryHours !== undefined) {
+              setPositionHistoryHoursState(preferences.positionHistoryHours);
             }
           }
           // If preferences is null (anonymous user), initial defaults are already set
@@ -271,12 +322,16 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
         setShowMotion,
         showMqttNodes,
         setShowMqttNodes,
+        showMeshCoreNodes,
+        setShowMeshCoreNodes,
+        meshCoreNodes,
+        setMeshCoreNodes,
         showAnimations,
         setShowAnimations,
         showEstimatedPositions,
         setShowEstimatedPositions,
-        showAccuracyCircles,
-        setShowAccuracyCircles,
+        showAccuracyRegions,
+        setShowAccuracyRegions,
         animatedNodes,
         triggerNodeAnimation,
         mapCenterTarget,
@@ -293,6 +348,8 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
         setPositionHistory,
         selectedNodeId,
         setSelectedNodeId,
+        positionHistoryHours,
+        setPositionHistoryHours,
       }}
     >
       {children}

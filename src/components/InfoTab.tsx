@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
 import { DeviceInfo, Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
 import { ConnectionStatus } from '../types/ui';
@@ -15,90 +14,9 @@ import { formatDistance } from '../utils/distance';
 import { logger } from '../utils/logger';
 import { useToast } from './ToastContainer';
 import { getDeviceRoleName } from '../utils/deviceRole';
-
-// Chart data entry interface
-interface ChartDataEntry {
-  name: string;
-  value: number;
-  color: string;
-  [key: string]: string | number;  // Index signature for Recharts compatibility
-}
-
-// Reusable packet statistics chart component
-interface PacketStatsChartProps {
-  title: string;
-  data: ChartDataEntry[];
-  total: number;
-  chartId: string;
-}
-
-const PacketStatsChart: React.FC<PacketStatsChartProps> = React.memo(({ title, data, total, chartId }) => {
-  const filteredData = useMemo(() => data.filter(d => d.value > 0), [data]);
-
-  if (filteredData.length === 0) return null;
-
-  return (
-    <div className="info-section">
-      <h3>{title}</h3>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-        <div style={{ width: '140px', height: '140px' }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <PieChart>
-              <Pie
-                data={filteredData}
-                cx="50%"
-                cy="50%"
-                innerRadius={30}
-                outerRadius={55}
-                paddingAngle={2}
-                dataKey="value"
-              >
-                {filteredData.map((entry, index) => (
-                  <Cell key={`${chartId}-cell-${index}`} fill={entry.color} />
-                ))}
-              </Pie>
-              <Tooltip
-                formatter={(value) => {
-                  if (value === null || value === undefined) return ['-', ''];
-                  const numValue = typeof value === 'number' ? value : parseFloat(String(value));
-                  if (isNaN(numValue)) return ['-', ''];
-                  const pct = total > 0 ? ((numValue / total) * 100).toFixed(1) : '0';
-                  return [`${numValue.toLocaleString()} (${pct}%)`, ''];
-                }}
-                contentStyle={{
-                  backgroundColor: 'var(--ctp-surface0)',
-                  border: '1px solid var(--ctp-surface2)',
-                  borderRadius: '4px',
-                  fontSize: '0.85em',
-                }}
-              />
-            </PieChart>
-          </ResponsiveContainer>
-        </div>
-        <div style={{ fontSize: '0.85em' }}>
-          {filteredData.map((entry, index) => {
-            const pct = total > 0 ? ((entry.value / total) * 100).toFixed(1) : '0';
-            return (
-              <p key={`${chartId}-legend-${index}`} style={{ margin: '0.25rem 0' }}>
-                <span style={{
-                  display: 'inline-block',
-                  width: '10px',
-                  height: '10px',
-                  backgroundColor: entry.color,
-                  marginRight: '0.5rem',
-                  borderRadius: '2px'
-                }}></span>
-                {entry.name}: {pct}% ({entry.value.toLocaleString()})
-              </p>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-});
-
-PacketStatsChart.displayName = 'PacketStatsChart';
+import { getPacketDistributionStats } from '../services/packetApi';
+import { PacketDistributionStats } from '../types/packet';
+import PacketStatsChart, { ChartDataEntry, DISTRIBUTION_COLORS } from './PacketStatsChart';
 
 interface RouteSegment {
   id: number;
@@ -164,6 +82,13 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
   const [localStats, setLocalStats] = useState<any>(null);
   const [securityKeys, setSecurityKeys] = useState<{ publicKey: string | null; privateKey: string | null } | null>(null);
   const [loadingSecurityKeys, setLoadingSecurityKeys] = useState(false);
+  const [showPrivateKey, setShowPrivateKey] = useState(false);
+  const [packetDistribution, setPacketDistribution] = useState<PacketDistributionStats | null>(null);
+  const [distributionTimeRange, setDistributionTimeRange] = useState<'hour' | '24h' | 'all'>('24h');
+  const [loadingDistribution, setLoadingDistribution] = useState(false);
+  const [selectedPortnum, setSelectedPortnum] = useState<number | null>(4); // Default to NODEINFO_APP
+  const [portnumNodeDistribution, setPortnumNodeDistribution] = useState<PacketDistributionStats | null>(null);
+  const [loadingPortnumNodes, setLoadingPortnumNodes] = useState(false);
 
   const fetchVirtualNodeStatus = async () => {
     if (connectionStatus !== 'connected') return;
@@ -265,6 +190,52 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
     }
   };
 
+  const fetchPacketDistribution = useCallback(async () => {
+    if (connectionStatus !== 'connected') return;
+
+    setLoadingDistribution(true);
+    try {
+      // Calculate 'since' timestamp based on time range
+      let since: number | undefined;
+      const now = Math.floor(Date.now() / 1000);
+      if (distributionTimeRange === 'hour') {
+        since = now - 3600; // 1 hour ago
+      } else if (distributionTimeRange === '24h') {
+        since = now - 86400; // 24 hours ago
+      }
+      // 'all' = undefined (no since filter)
+
+      const distribution = await getPacketDistributionStats(since);
+      setPacketDistribution(distribution);
+    } catch (error) {
+      logger.error('Error fetching packet distribution:', error);
+    } finally {
+      setLoadingDistribution(false);
+    }
+  }, [connectionStatus, distributionTimeRange]);
+
+  const fetchPortnumNodeDistribution = useCallback(async () => {
+    if (connectionStatus !== 'connected' || selectedPortnum === null) return;
+
+    setLoadingPortnumNodes(true);
+    try {
+      let since: number | undefined;
+      const now = Math.floor(Date.now() / 1000);
+      if (distributionTimeRange === 'hour') {
+        since = now - 3600;
+      } else if (distributionTimeRange === '24h') {
+        since = now - 86400;
+      }
+
+      const distribution = await getPacketDistributionStats(since, undefined, selectedPortnum);
+      setPortnumNodeDistribution(distribution);
+    } catch (error) {
+      logger.error('Error fetching portnum node distribution:', error);
+    } finally {
+      setLoadingPortnumNodes(false);
+    }
+  }, [connectionStatus, selectedPortnum, distributionTimeRange]);
+
   const handleClearRecordHolder = async () => {
     setShowConfirmDialog(true);
   };
@@ -313,6 +284,20 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
     fetchSecurityKeys();
     // Only fetch once when connected and authenticated - keys don't change frequently
   }, [connectionStatus, isAuthenticated]);
+
+  useEffect(() => {
+    fetchPacketDistribution();
+    const interval = setInterval(fetchPacketDistribution, 60000); // Refresh every minute
+    return () => clearInterval(interval);
+  }, [fetchPacketDistribution]);
+
+  useEffect(() => {
+    if (selectedPortnum !== null) {
+      fetchPortnumNodeDistribution();
+      const interval = setInterval(fetchPortnumNodeDistribution, 60000);
+      return () => clearInterval(interval);
+    }
+  }, [fetchPortnumNodeDistribution, selectedPortnum]);
 
   // Helper function to format uptime
   const formatUptime = (uptimeSeconds: number): string => {
@@ -429,21 +414,44 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
                     </div>
                     <div>
                       <p><strong>{t('info.private_key')}</strong></p>
-                      <input
-                        type="text"
-                        readOnly
-                        value={securityKeys.privateKey || t('info.not_available')}
-                        style={{
-                          width: '100%',
-                          padding: '0.5rem',
-                          fontSize: '0.85rem',
-                          fontFamily: 'monospace',
-                          backgroundColor: 'var(--ctp-surface0)',
-                          border: '1px solid var(--ctp-surface2)',
-                          borderRadius: '4px',
-                          color: 'var(--ctp-text)'
-                        }}
-                      />
+                      <div style={{ position: 'relative' }}>
+                        <input
+                          type={showPrivateKey ? 'text' : 'password'}
+                          readOnly
+                          value={securityKeys.privateKey || t('info.not_available')}
+                          style={{
+                            width: '100%',
+                            padding: '0.5rem',
+                            paddingRight: '2.5rem',
+                            fontSize: '0.85rem',
+                            fontFamily: 'monospace',
+                            backgroundColor: 'var(--ctp-surface0)',
+                            border: '1px solid var(--ctp-surface2)',
+                            borderRadius: '4px',
+                            color: 'var(--ctp-text)'
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPrivateKey(!showPrivateKey)}
+                          title={showPrivateKey ? t('info.hide_private_key', 'Hide') : t('info.show_private_key', 'Show')}
+                          style={{
+                            position: 'absolute',
+                            right: '0.5rem',
+                            top: '50%',
+                            transform: 'translateY(-50%)',
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            padding: '0.25rem',
+                            fontSize: '1rem',
+                            color: 'var(--ctp-subtext0)',
+                            lineHeight: 1
+                          }}
+                        >
+                          {showPrivateKey ? '\u{1F648}' : '\u{1F441}\uFE0F'}
+                        </button>
+                      </div>
                     </div>
                   </>
                 )}
@@ -535,7 +543,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
           )}
         </div>
 
-        {localStats?.numPacketsRx > 0 && (() => {
+        {(localStats?.numPacketsRx > 0 || localStats?.numPacketsTx > 0) && (() => {
           const rxTotal = localStats.numPacketsRx || 0;
           const rxBad = localStats.numPacketsRxBad || 0;
           const rxDupe = localStats.numRxDupe || 0;
@@ -545,17 +553,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
             { name: t('info.rx_bad_short'), value: rxBad, color: '#f38ba8' },
             { name: t('info.rx_dupe_short'), value: rxDupe, color: '#fab387' },
           ];
-          return (
-            <PacketStatsChart
-              title={t('info.rx_statistics')}
-              data={rxData}
-              total={rxTotal}
-              chartId="rx"
-            />
-          );
-        })()}
 
-        {localStats?.numPacketsTx > 0 && (() => {
           const txTotal = localStats.numPacketsTx || 0;
           const txDropped = localStats.numTxDropped || 0;
           const txRelay = localStats.numTxRelay || 0;
@@ -567,15 +565,224 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
             { name: t('info.tx_relay_short'), value: txRelay, color: '#a6e3a1' },
             { name: t('info.tx_dropped_short'), value: txDropped, color: '#f38ba8' },
           ];
+
           return (
-            <PacketStatsChart
-              title={t('info.tx_statistics')}
-              data={txData}
-              total={txTotal}
-              chartId="tx"
-            />
+            <div className="info-section">
+              <h3>{t('info.radio_statistics', 'Radio Statistics')}</h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {rxTotal > 0 && (
+                  <PacketStatsChart
+                    title={t('info.rx_statistics')}
+                    data={rxData}
+                    total={rxTotal}
+                    chartId="rx"
+                    bare
+                  />
+                )}
+                {txTotal > 0 && (
+                  <PacketStatsChart
+                    title={t('info.tx_statistics')}
+                    data={txData}
+                    total={txTotal}
+                    chartId="tx"
+                    bare
+                  />
+                )}
+              </div>
+            </div>
           );
         })()}
+
+        {/* Packet Distribution Charts - only shown when packet monitor is enabled */}
+        {packetDistribution?.enabled && (() => {
+          // Prepare device data with "Other" grouping
+          const deviceData: ChartDataEntry[] = packetDistribution.byDevice.map((d, i) => ({
+            name: d.from_node_longName || d.from_node_id || `Node ${d.from_node}`,
+            value: d.count,
+            color: DISTRIBUTION_COLORS[i % DISTRIBUTION_COLORS.length]
+          }));
+
+          // Calculate "Other" if there are more devices beyond top 10
+          const deviceTotal = deviceData.reduce((sum, d) => sum + d.value, 0);
+          const otherCount = packetDistribution.total - deviceTotal;
+          if (otherCount > 0) {
+            deviceData.push({
+              name: t('info.other_devices'),
+              value: otherCount,
+              color: DISTRIBUTION_COLORS[10] // Use the gray color for "Other"
+            });
+          }
+
+          // Prepare type data
+          const typeData: ChartDataEntry[] = packetDistribution.byType.map((p, i) => ({
+            name: p.portnum_name.replace(/_APP$/, '').replace(/_/g, ' '),
+            value: p.count,
+            color: DISTRIBUTION_COLORS[i % DISTRIBUTION_COLORS.length]
+          }));
+
+          const timeRangeButtonStyle = (active: boolean): React.CSSProperties => ({
+            padding: '0.25rem 0.75rem',
+            fontSize: '0.85em',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontWeight: active ? 600 : 400,
+            background: active ? 'var(--ctp-blue)' : 'var(--ctp-surface1)',
+            color: active ? 'var(--ctp-crust)' : 'var(--ctp-subtext0)',
+          });
+
+          const timeRangeButtons = (
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                onClick={() => setDistributionTimeRange('hour')}
+                style={timeRangeButtonStyle(distributionTimeRange === 'hour')}
+              >
+                {t('info.last_hour')}
+              </button>
+              <button
+                onClick={() => setDistributionTimeRange('24h')}
+                style={timeRangeButtonStyle(distributionTimeRange === '24h')}
+              >
+                {t('info.last_24_hours')}
+              </button>
+              <button
+                onClick={() => setDistributionTimeRange('all')}
+                style={timeRangeButtonStyle(distributionTimeRange === 'all')}
+              >
+                {t('info.all_data')}
+              </button>
+            </div>
+          );
+
+          return (
+            <>
+              {loadingDistribution && (
+                <div className="info-section">
+                  <p>{t('common.loading_indicator')}</p>
+                </div>
+              )}
+
+              {!loadingDistribution && packetDistribution.total > 0 && (
+                <div className="info-section-wide">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                    <h3 style={{ margin: 0 }}>{t('info.packet_distribution', 'Packet Distribution')}</h3>
+                    {timeRangeButtons}
+                  </div>
+                  <div className="packet-distribution-grid">
+                    <PacketStatsChart
+                      title={t('info.packets_by_device')}
+                      data={deviceData}
+                      total={packetDistribution.total}
+                      chartId="dist-device"
+                      bare
+                      stacked
+                    />
+                    <PacketStatsChart
+                      title={t('info.packets_by_type')}
+                      data={typeData}
+                      total={packetDistribution.total}
+                      chartId="dist-type"
+                      bare
+                      stacked
+                    />
+                  </div>
+                </div>
+              )}
+
+              {!loadingDistribution && packetDistribution.total === 0 && (
+                <div className="info-section">
+                  <p style={{ color: '#888', fontStyle: 'italic' }}>{t('info.no_packet_data')}</p>
+                </div>
+              )}
+            </>
+          );
+        })()}
+
+        {/* Per-portnum node distribution - separate section */}
+        {packetDistribution?.enabled && packetDistribution.byType.length > 0 && (
+          <div className="info-section">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem' }}>
+              <h3 style={{ margin: 0 }}>{t('info.packets_by_type_nodes')}</h3>
+              <select
+                id="portnum-select"
+                value={selectedPortnum ?? ''}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSelectedPortnum(val ? parseInt(val, 10) : null);
+                  if (!val) setPortnumNodeDistribution(null);
+                }}
+                style={{
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '0.85em',
+                  borderRadius: '4px',
+                  border: '1px solid var(--ctp-surface2)',
+                  background: 'var(--ctp-surface0)',
+                  color: 'var(--ctp-text)',
+                }}
+              >
+                <option value="">--</option>
+                {[...packetDistribution.byType]
+                  .sort((a, b) => b.count - a.count)
+                  .map((p) => (
+                    <option key={p.portnum} value={p.portnum}>
+                      {p.portnum_name.replace(/_APP$/, '').replace(/_/g, ' ')} ({p.count})
+                    </option>
+                  ))}
+              </select>
+            </div>
+
+            {selectedPortnum !== null && loadingPortnumNodes && (
+              <p style={{ fontSize: '0.9em', color: '#888' }}>{t('common.loading_indicator')}</p>
+            )}
+
+            {selectedPortnum !== null && !loadingPortnumNodes && portnumNodeDistribution && (() => {
+              if (portnumNodeDistribution.byDevice.length === 0) {
+                return (
+                  <p style={{ color: '#888', fontStyle: 'italic', fontSize: '0.9em' }}>
+                    {t('info.no_packets_for_type')}
+                  </p>
+                );
+              }
+
+              const portnumDeviceData: ChartDataEntry[] = portnumNodeDistribution.byDevice.map((d, i) => ({
+                name: d.from_node_longName || d.from_node_id || `Node ${d.from_node}`,
+                value: d.count,
+                color: DISTRIBUTION_COLORS[i % DISTRIBUTION_COLORS.length]
+              }));
+
+              const portnumDeviceTotal = portnumDeviceData.reduce((sum, d) => sum + d.value, 0);
+              const portnumOtherCount = portnumNodeDistribution.total - portnumDeviceTotal;
+              if (portnumOtherCount > 0) {
+                portnumDeviceData.push({
+                  name: t('info.other_devices'),
+                  value: portnumOtherCount,
+                  color: DISTRIBUTION_COLORS[10]
+                });
+              }
+
+              const selectedTypeName = packetDistribution.byType
+                .find((p) => p.portnum === selectedPortnum)
+                ?.portnum_name.replace(/_APP$/, '').replace(/_/g, ' ') ?? `Port ${selectedPortnum}`;
+
+              return (
+                <PacketStatsChart
+                  title={t('info.nodes_sending_type', { type: selectedTypeName })}
+                  data={portnumDeviceData}
+                  total={portnumNodeDistribution.total}
+                  chartId="portnum-nodes"
+                  bare
+                  stacked
+                />
+              );
+            })()}
+
+            {selectedPortnum === null && (
+              <p style={{ color: '#888', fontStyle: 'italic', fontSize: '0.9em' }}>
+                {t('info.select_packet_type')}
+              </p>
+            )}
+          </div>
+        )}
 
         {localStats?.hostUptimeSeconds !== undefined && (
           <div className="info-section">

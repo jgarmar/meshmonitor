@@ -17,9 +17,9 @@ export const POSTGRES_SCHEMA_SQL = `
     "lastMessageHops" INTEGER,
     "viaMqtt" BOOLEAN,
     macaddr TEXT,
-    latitude REAL,
-    longitude REAL,
-    altitude REAL,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    altitude DOUBLE PRECISION,
     "batteryLevel" INTEGER,
     voltage REAL,
     "channelUtilization" REAL,
@@ -48,10 +48,14 @@ export const POSTGRES_SCHEMA_SQL = `
     "positionHdop" REAL,
     "positionTimestamp" BIGINT,
     "positionOverrideEnabled" BOOLEAN DEFAULT false,
-    "latitudeOverride" REAL,
-    "longitudeOverride" REAL,
-    "altitudeOverride" REAL,
+    "latitudeOverride" DOUBLE PRECISION,
+    "longitudeOverride" DOUBLE PRECISION,
+    "altitudeOverride" DOUBLE PRECISION,
     "positionOverrideIsPrivate" BOOLEAN DEFAULT false,
+    "hasRemoteAdmin" BOOLEAN DEFAULT false,
+    "lastRemoteAdminCheck" BIGINT,
+    "remoteAdminMetadata" TEXT,
+    "lastTimeSync" BIGINT,
     "createdAt" BIGINT NOT NULL,
     "updatedAt" BIGINT NOT NULL
   );
@@ -102,13 +106,14 @@ export const POSTGRES_SCHEMA_SQL = `
     "nodeNum" BIGINT NOT NULL,
     "telemetryType" TEXT NOT NULL,
     timestamp BIGINT NOT NULL,
-    value REAL NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
     unit TEXT,
     "createdAt" BIGINT NOT NULL,
     "packetTimestamp" BIGINT,
+    "packetId" BIGINT,
     channel INTEGER,
     "precisionBits" INTEGER,
-    "gpsAccuracy" REAL
+    "gpsAccuracy" DOUBLE PRECISION
   );
 
   CREATE TABLE IF NOT EXISTS traceroutes (
@@ -357,6 +362,13 @@ export const POSTGRES_SCHEMA_SQL = `
     "createdAt" BIGINT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS auto_time_sync_nodes (
+    id SERIAL PRIMARY KEY,
+    "nodeNum" BIGINT NOT NULL UNIQUE,
+    enabled BOOLEAN DEFAULT true,
+    "createdAt" BIGINT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS auto_traceroute_log (
     id SERIAL PRIMARY KEY,
     timestamp BIGINT NOT NULL,
@@ -456,9 +468,11 @@ export const POSTGRES_TABLE_NAMES = [
   'user_map_preferences',
   'solar_estimates',
   'auto_traceroute_nodes',
+  'auto_time_sync_nodes',
   'auto_traceroute_log',
   'auto_key_repair_state',
   'auto_key_repair_log',
   'channel_database',
   'channel_database_permissions',
+  'ignored_nodes',
 ];

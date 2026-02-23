@@ -4,7 +4,7 @@
  * Handles all message-related database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, gt, lt, and, or, desc, sql } from 'drizzle-orm';
+import { eq, gt, gte, lt, and, or, desc, sql } from 'drizzle-orm';
 import { messagesSqlite, messagesPostgres, messagesMysql } from '../schema/messages.js';
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType, DbMessage } from '../types.js';
@@ -343,6 +343,61 @@ export class MessagesRepository extends BaseRepository {
   }
 
   /**
+   * Count messages sent from or to a specific node (by nodeNum).
+   */
+  async getMessageCountByNode(nodeNum: number, since?: number): Promise<number> {
+    if (this.isSQLite()) {
+      const db = this.getSqliteDb();
+      const conditions = [
+        or(
+          eq(messagesSqlite.fromNodeNum, nodeNum),
+          eq(messagesSqlite.toNodeNum, nodeNum),
+        ),
+      ];
+      if (since !== undefined) {
+        conditions.push(gte(messagesSqlite.timestamp, since));
+      }
+      const result = await db
+        .select()
+        .from(messagesSqlite)
+        .where(and(...conditions));
+      return result.length;
+    } else if (this.isMySQL()) {
+      const db = this.getMysqlDb();
+      const conditions = [
+        or(
+          eq(messagesMysql.fromNodeNum, nodeNum),
+          eq(messagesMysql.toNodeNum, nodeNum),
+        ),
+      ];
+      if (since !== undefined) {
+        conditions.push(gte(messagesMysql.timestamp, since));
+      }
+      const result = await db
+        .select()
+        .from(messagesMysql)
+        .where(and(...conditions));
+      return result.length;
+    } else {
+      const db = this.getPostgresDb();
+      const conditions = [
+        or(
+          eq(messagesPostgres.fromNodeNum, nodeNum),
+          eq(messagesPostgres.toNodeNum, nodeNum),
+        ),
+      ];
+      if (since !== undefined) {
+        conditions.push(gte(messagesPostgres.timestamp, since));
+      }
+      const result = await db
+        .select()
+        .from(messagesPostgres)
+        .where(and(...conditions));
+      return result.length;
+    }
+  }
+
+  /**
    * Delete a message by ID
    */
   async deleteMessage(id: string): Promise<boolean> {
@@ -630,6 +685,52 @@ export class MessagesRepository extends BaseRepository {
       await db
         .update(messagesPostgres)
         .set({ deliveryState })
+        .where(eq(messagesPostgres.requestId, requestId));
+      return true;
+    }
+  }
+
+  async updateMessageTimestamps(requestId: number, rxTime: number): Promise<boolean> {
+    if (this.isSQLite()) {
+      const db = this.getSqliteDb();
+      const existing = await db
+        .select({ id: messagesSqlite.id })
+        .from(messagesSqlite)
+        .where(eq(messagesSqlite.requestId, requestId));
+
+      if (existing.length === 0) return false;
+
+      await db
+        .update(messagesSqlite)
+        .set({ rxTime, timestamp: rxTime })
+        .where(eq(messagesSqlite.requestId, requestId));
+      return true;
+    } else if (this.isMySQL()) {
+      const db = this.getMysqlDb();
+      const existing = await db
+        .select({ id: messagesMysql.id })
+        .from(messagesMysql)
+        .where(eq(messagesMysql.requestId, requestId));
+
+      if (existing.length === 0) return false;
+
+      await db
+        .update(messagesMysql)
+        .set({ rxTime, timestamp: rxTime })
+        .where(eq(messagesMysql.requestId, requestId));
+      return true;
+    } else {
+      const db = this.getPostgresDb();
+      const existing = await db
+        .select({ id: messagesPostgres.id })
+        .from(messagesPostgres)
+        .where(eq(messagesPostgres.requestId, requestId));
+
+      if (existing.length === 0) return false;
+
+      await db
+        .update(messagesPostgres)
+        .set({ rxTime, timestamp: rxTime })
         .where(eq(messagesPostgres.requestId, requestId));
       return true;
     }
