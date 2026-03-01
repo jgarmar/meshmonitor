@@ -278,6 +278,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     nodeDimmingMinOpacity,
     maxNodeAgeHours,
     nodeHopsCalculation,
+    overlayColors,
   } = useSettings();
 
   const { hasPermission, authStatus } = useAuth();
@@ -310,6 +311,20 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     return saved === 'true';
   });
 
+  // Node list sidebar resizable width (default 380px, min 200px, max 50% viewport)
+  const {
+    size: sidebarWidth,
+    isResizing: isSidebarResizing,
+    handleMouseDown: handleSidebarResizeStart,
+    handleTouchStart: handleSidebarTouchStart
+  } = useResizable({
+    id: 'nodes-sidebar-width',
+    defaultHeight: 380,
+    minHeight: 200,
+    maxHeight: Math.round(window.innerWidth * 0.5),
+    direction: 'horizontal'
+  });
+
   // Packet Monitor resizable height (default 35% of viewport, min 150px, max 70%)
   const {
     size: packetMonitorHeight,
@@ -333,41 +348,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     return saved === 'true';
   });
 
-  // Nodes sidebar position and size state
-  const [sidebarPosition, setSidebarPosition] = useState(() => {
-    const saved = localStorage.getItem('nodesSidebarPosition');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return { x: parsed.x ?? 16, y: parsed.y ?? 16 };
-      } catch {
-        return { x: 16, y: 16 };
-      }
-    }
-    return { x: 16, y: 16 };
-  });
-
-  const [sidebarSize, setSidebarSize] = useState(() => {
-    const saved = localStorage.getItem('nodesSidebarSize');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return { width: parsed.width ?? 350, height: parsed.height ?? null };
-      } catch {
-        return { width: 350, height: null };
-      }
-    }
-    return { width: 350, height: null };
-  });
-
-  // Drag state
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const sidebarRef = useRef<HTMLDivElement>(null);
-
-  // Resize state
-  const [isResizing, setIsResizing] = useState(false);
-  const [resizeStart, setResizeStart] = useState({ x: 0, y: 0, width: 0, height: 0 });
 
   // Save packet monitor preference to localStorage
   useEffect(() => {
@@ -379,15 +360,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     localStorage.setItem('isMapControlsCollapsed', isMapControlsCollapsed.toString());
   }, [isMapControlsCollapsed]);
 
-  // Save sidebar position to localStorage
-  useEffect(() => {
-    localStorage.setItem('nodesSidebarPosition', JSON.stringify(sidebarPosition));
-  }, [sidebarPosition]);
-
-  // Save sidebar size to localStorage
-  useEffect(() => {
-    localStorage.setItem('nodesSidebarSize', JSON.stringify(sidebarSize));
-  }, [sidebarSize]);
 
   // Map controls position state with localStorage persistence
   // Position is relative to the map container (absolute positioning)
@@ -395,16 +367,19 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const MAP_CONTROLS_DEFAULT_POSITION = { x: -1, y: 10 };
 
   const [mapControlsPosition, setMapControlsPosition] = useState(() => {
-    const saved = localStorage.getItem('mapControlsPosition');
+    // Migration: clear old left-based positions (now right-based)
+    const oldSaved = localStorage.getItem('mapControlsPosition');
+    if (oldSaved && !localStorage.getItem('mapControlsPositionV2')) {
+      localStorage.removeItem('mapControlsPosition');
+      return MAP_CONTROLS_DEFAULT_POSITION;
+    }
+    const saved = localStorage.getItem('mapControlsPositionV2');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        // If x or y is invalid, use defaults
         if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
-          // Sanity check: if position seems unreasonable, reset to default
-          // This handles migration from old viewport-based positions
           if (parsed.x > 2000 || parsed.x < -100 || parsed.y > 2000 || parsed.y < -100) {
-            localStorage.removeItem('mapControlsPosition');
+            localStorage.removeItem('mapControlsPositionV2');
             return MAP_CONTROLS_DEFAULT_POSITION;
           }
           return { x: parsed.x, y: parsed.y };
@@ -424,7 +399,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // Save map controls position to localStorage (only if not default)
   useEffect(() => {
     if (mapControlsPosition.x !== -1) {
-      localStorage.setItem('mapControlsPosition', JSON.stringify(mapControlsPosition));
+      localStorage.setItem('mapControlsPositionV2', JSON.stringify(mapControlsPosition));
     }
   }, [mapControlsPosition]);
 
@@ -514,10 +489,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     }
   }, []); // Empty deps - function never changes
 
-  // Utility to prevent mousedown from triggering drag on form elements
-  // Firefox handles select/input mousedown differently, which can trigger panel drag
-  const stopPropagation = useCallback((e: React.MouseEvent) => e.stopPropagation(), []);
-
   // Stable callback factories for node item interactions
   const handleNodeClick = useCallback((node: DeviceInfo) => {
     return () => {
@@ -577,12 +548,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Simple toggle callbacks
   const handleCollapseNodeList = useCallback(() => {
-    const willBeCollapsed = !isNodeListCollapsed;
-    setIsNodeListCollapsed(willBeCollapsed);
-    // Reset position to default when collapsing (will be restored when expanding)
-    if (willBeCollapsed) {
-      // Don't reset position - keep it for when user expands again
-    }
+    setIsNodeListCollapsed(!isNodeListCollapsed);
   }, [isNodeListCollapsed, setIsNodeListCollapsed]);
 
   const handleToggleFilterPopup = useCallback(() => {
@@ -593,180 +559,60 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
   }, [sortDirection, setSortDirection]);
 
-  // Drag handlers for sidebar
-  const handleDragStart = useCallback((e: React.MouseEvent) => {
-    if (isNodeListCollapsed || isTouchDevice) return; // Disable drag on mobile
-    // Don't start drag if clicking on an input, button, select, or anything inside node-controls
-    // Check this FIRST before doing anything else
-    const target = e.target as HTMLElement;
-    const isInteractiveElement = 
-      target.tagName === 'INPUT' || 
-      target.tagName === 'BUTTON' || 
-      target.tagName === 'SELECT' || 
-      target.tagName === 'OPTION' ||
-      target.closest('.node-controls') !== null ||
-      target.closest('input') !== null ||
-      target.closest('button') !== null ||
-      target.closest('select') !== null;
-    
-    if (isInteractiveElement) {
-      // Don't prevent default - allow normal interaction
-      e.stopPropagation();
-      return;
-    }
-    e.preventDefault();
-    setIsDragging(true);
-    setDragStart({
-      x: e.clientX - sidebarPosition.x,
-      y: e.clientY - sidebarPosition.y,
-    });
-  }, [isNodeListCollapsed, sidebarPosition, isTouchDevice]);
 
-  const handleDragMove = useCallback((e: MouseEvent) => {
-    if (!isDragging) return;
-    
-    const splitView = document.querySelector('.nodes-split-view');
-    if (!splitView) return;
-    
-    const rect = splitView.getBoundingClientRect();
-    const sidebarWidth = sidebarSize.width || 350;
-    const maxX = rect.width - sidebarWidth - 20; // Leave some margin
-    const maxY = rect.height - 100; // Minimum height for header
-    
-    const newX = Math.max(0, Math.min(maxX, e.clientX - dragStart.x));
-    const newY = Math.max(0, Math.min(maxY, e.clientY - dragStart.y));
-    
-    setSidebarPosition({ x: newX, y: newY });
-  }, [isDragging, dragStart, sidebarSize]);
 
-  const handleDragEnd = useCallback(() => {
-    setIsDragging(false);
-  }, []);
-
-  // Resize handlers for sidebar
-  const handleResizeStart = useCallback((e: React.MouseEvent) => {
-    if (isNodeListCollapsed || isTouchDevice) return; // Disable resize on mobile
-    e.preventDefault();
-    e.stopPropagation();
-    setIsResizing(true);
-    const sidebar = sidebarRef.current;
-    const currentHeight = sidebar ? sidebar.offsetHeight : 0;
-    setResizeStart({
-      x: e.clientX,
-      y: e.clientY,
-      width: sidebarSize.width || 350,
-      height: sidebarSize.height || currentHeight,
-    });
-  }, [isNodeListCollapsed, sidebarSize, isTouchDevice]);
-
-  const handleResizeMove = useCallback((e: MouseEvent) => {
-    if (!isResizing) return;
-    
-    const splitView = document.querySelector('.nodes-split-view');
-    if (!splitView) return;
-    
-    const rect = splitView.getBoundingClientRect();
-    const deltaX = e.clientX - resizeStart.x;
-    const deltaY = e.clientY - resizeStart.y;
-    
-    const minWidth = 250;
-    const maxWidth = Math.min(800, rect.width - sidebarPosition.x - 20);
-    const minHeight = 200;
-    const maxHeight = rect.height - sidebarPosition.y - 20;
-    
-    const newWidth = Math.max(minWidth, Math.min(maxWidth, resizeStart.width + deltaX));
-    // Always set height when resizing (user is explicitly resizing)
-    const newHeight = Math.max(minHeight, Math.min(maxHeight, resizeStart.height + deltaY));
-    
-    setSidebarSize({ width: newWidth, height: newHeight });
-  }, [isResizing, resizeStart, sidebarPosition]);
-
-  const handleResizeEnd = useCallback(() => {
-    setIsResizing(false);
-  }, []);
-
-  // Global mouse event listeners for drag and resize
-  useEffect(() => {
-    if (isDragging) {
-      document.addEventListener('mousemove', handleDragMove);
-      document.addEventListener('mouseup', handleDragEnd);
-      document.body.style.cursor = 'grabbing';
-      document.body.style.userSelect = 'none';
-      
-      return () => {
-        document.removeEventListener('mousemove', handleDragMove);
-        document.removeEventListener('mouseup', handleDragEnd);
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-      };
-    }
-  }, [isDragging, handleDragMove, handleDragEnd]);
-
-  useEffect(() => {
-    if (isResizing) {
-      document.addEventListener('mousemove', handleResizeMove);
-      document.addEventListener('mouseup', handleResizeEnd);
-      document.body.style.cursor = 'nwse-resize';
-      document.body.style.userSelect = 'none';
-      
-      return () => {
-        document.removeEventListener('mousemove', handleResizeMove);
-        document.removeEventListener('mouseup', handleResizeEnd);
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-      };
-    }
-  }, [isResizing, handleResizeMove, handleResizeEnd]);
-
-  // Map controls drag handlers
+  // Map controls drag handlers — positions are stored as (right, top) relative to the map container
+  // so the controls stay anchored to the right edge when the sidebar resizes
   const handleMapControlsDragStart = useCallback((e: React.MouseEvent) => {
     if (isMapControlsCollapsed || isTouchDevice) return; // Disable drag on mobile
     e.preventDefault();
     e.stopPropagation();
 
+    const mapContainer = document.querySelector('.map-container');
+    if (!mapContainer) return;
+    const containerRect = mapContainer.getBoundingClientRect();
+
     // If position is default (-1), calculate actual position from element
-    let currentX = mapControlsPosition.x;
+    let currentRightOffset = mapControlsPosition.x;
     let currentY = mapControlsPosition.y;
 
-    if (currentX === -1) {
-      // Convert from CSS right: 10px to left-based coordinates
-      const mapContainer = document.querySelector('.map-container');
+    if (currentRightOffset === -1) {
+      // Convert from CSS right: 10px to explicit right-based coordinates
       const controls = mapControlsRef.current;
-      if (mapContainer && controls) {
-        const containerRect = mapContainer.getBoundingClientRect();
+      if (controls) {
         const controlsRect = controls.getBoundingClientRect();
-        currentX = controlsRect.left - containerRect.left;
+        currentRightOffset = containerRect.right - controlsRect.right;
         currentY = controlsRect.top - containerRect.top;
-        // Update the position to be explicit
-        setMapControlsPosition({ x: currentX, y: currentY });
+        setMapControlsPosition({ x: currentRightOffset, y: currentY });
       }
     }
 
     setIsDraggingMapControls(true);
+    // Store offset: mouse position relative to the element's right-edge anchor
     setMapControlsDragStart({
-      x: e.clientX - currentX,
-      y: e.clientY - currentY,
+      x: (containerRect.right - e.clientX) - currentRightOffset,
+      y: e.clientY - containerRect.top - currentY,
     });
   }, [isMapControlsCollapsed, mapControlsPosition, isTouchDevice]);
 
   const handleMapControlsDragMove = useCallback((e: MouseEvent) => {
     if (!isDraggingMapControls) return;
-    
+
     const mapContainer = document.querySelector('.map-container');
     if (!mapContainer) return;
-    
+
     const rect = mapContainer.getBoundingClientRect();
     const controls = mapControlsRef.current;
     if (!controls) return;
-    
+
     const controlsRect = controls.getBoundingClientRect();
-    const maxX = rect.width - controlsRect.width - 10;
+    const maxRight = rect.width - controlsRect.width - 10;
     const maxY = rect.height - controlsRect.height - 10;
-    
-    const newX = Math.max(10, Math.min(maxX, e.clientX - mapControlsDragStart.x - rect.left));
-    const newY = Math.max(10, Math.min(maxY, e.clientY - mapControlsDragStart.y - rect.top));
-    
-    setMapControlsPosition({ x: newX, y: newY });
+
+    const newRight = Math.max(10, Math.min(maxRight, (rect.right - e.clientX) - mapControlsDragStart.x));
+    const newY = Math.max(10, Math.min(maxY, e.clientY - rect.top - mapControlsDragStart.y));
+
+    setMapControlsPosition({ x: newRight, y: newY });
   }, [isDraggingMapControls, mapControlsDragStart]);
 
   const handleMapControlsDragEnd = useCallback(() => {
@@ -1098,41 +944,18 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   };
 
   return (
-    <div className="nodes-split-view">
-      {/* Floating Node List Panel */}
+    <div className="nodes-split-view nodes-anchored-view">
+      {/* Anchored Node List Sidebar */}
       <div
         ref={sidebarRef}
-        className={`nodes-sidebar ${isNodeListCollapsed ? 'collapsed' : ''}`}
-        style={{
-          left: isNodeListCollapsed ? undefined : `${sidebarPosition.x}px`,
-          top: isNodeListCollapsed ? undefined : `${sidebarPosition.y}px`,
-          width: isNodeListCollapsed ? undefined : `${sidebarSize.width}px`,
-          height: isNodeListCollapsed ? undefined : (sidebarSize.height ? `${sidebarSize.height}px` : 'auto'),
-          maxHeight: isNodeListCollapsed ? undefined : (sidebarSize.height ? `${sidebarSize.height}px` : 'calc(100% - 32px)'),
-        }}
-        onMouseDown={(e) => {
-          // If clicking on node-controls or any interactive element, don't let the drag handler run
-          const target = e.target as HTMLElement;
-          if (
-            target.closest('.node-controls') ||
-            target.tagName === 'INPUT' ||
-            target.tagName === 'BUTTON' ||
-            target.tagName === 'SELECT'
-          ) {
-            e.stopPropagation();
-          }
-        }}
+        className={`nodes-sidebar nodes-anchored-sidebar ${isNodeListCollapsed ? 'collapsed' : ''} ${isSidebarResizing ? 'resizing' : ''}`}
+        style={!isNodeListCollapsed ? { width: `${sidebarWidth}px` } : undefined}
       >
-        <div
-          className="sidebar-header"
-          onMouseDown={handleDragStart}
-          style={{ cursor: (isNodeListCollapsed || isTouchDevice) ? 'default' : 'grab' }}
-        >
+        <div className="sidebar-header">
           <button
             className="collapse-nodes-btn"
             onClick={handleCollapseNodeList}
             title={isNodeListCollapsed ? 'Expand node list' : 'Collapse node list'}
-            onMouseDown={(e) => e.stopPropagation()}
           >
             {isNodeListCollapsed ? '▶' : '◀'}
           </button>
@@ -1176,14 +999,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 placeholder={t('nodes.filter_placeholder')}
                 value={nodesNodeFilter}
                 onChange={(e) => setNodesNodeFilter(e.target.value)}
-                onMouseDown={stopPropagation}
                 className="filter-input-small"
               />
               {nodesNodeFilter && (
                 <button
                   className="filter-clear-btn"
                   onClick={() => setNodesNodeFilter('')}
-                  onMouseDown={stopPropagation}
                   title={t('common.clear_filter')}
                   type="button"
                 >
@@ -1210,7 +1031,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <select
                 value={sortField}
                 onChange={(e) => setSortField(e.target.value as any)}
-                onMouseDown={stopPropagation}
                 className="sort-dropdown"
                 title={t('nodes.sort_by')}
               >
@@ -1519,16 +1339,19 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           )}
         </div>
         )}
+        {/* Resize handle on right edge of sidebar */}
         {!isNodeListCollapsed && (
           <div
-            className="sidebar-resize-handle"
-            onMouseDown={handleResizeStart}
+            className="nodes-sidebar-resize-handle"
+            onMouseDown={handleSidebarResizeStart}
+            onTouchStart={handleSidebarTouchStart}
             title="Drag to resize"
           />
         )}
       </div>
 
       {/* Right Side - Map and Optional Packet Monitor */}
+      <div className="nodes-map-area">
       <div
         className={`map-container ${showPacketMonitor && canViewPacketMonitor ? 'with-packet-monitor' : ''}`}
         style={showPacketMonitor && canViewPacketMonitor ? { height: `calc(100% - ${packetMonitorHeight}px)` } : undefined}
@@ -1540,11 +1363,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               className={`map-controls ${isMapControlsCollapsed ? 'collapsed' : ''}`}
               style={isTouchDevice ? undefined : (
                 // If collapsed, don't apply any position styles (use CSS defaults)
-                // If position is default (-1), don't apply left (CSS will use right: 10px)
+                // x = -1 means use CSS default (right: 10px); otherwise x is distance from right edge
                 isMapControlsCollapsed ? undefined : {
-                  left: mapControlsPosition.x === -1 ? undefined : `${mapControlsPosition.x}px`,
+                  right: mapControlsPosition.x === -1 ? undefined : `${mapControlsPosition.x}px`,
                   top: `${mapControlsPosition.y}px`,
-                  right: mapControlsPosition.x === -1 ? undefined : 'auto',
+                  left: mapControlsPosition.x === -1 ? undefined : 'auto',
                 }
               )}
             >
@@ -1733,7 +1556,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               )}
               <ZoomHandler onZoomChange={setMapZoom} />
               <MapPositionHandler />
-              <MapResizeHandler trigger={showPacketMonitor} />
+              <MapResizeHandler trigger={`${showPacketMonitor}-${isNodeListCollapsed}`} />
               <SpiderfierController ref={spiderfierRef} zoomLevel={mapZoom} />
               <MapLegend />
               {nodesWithPosition
@@ -1904,7 +1727,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   // Get hop color for the circle (same as marker)
                   const isLocalNode = node.user?.id === currentNodeId;
                   const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                  const color = getHopColor(hops);
+                  const color = getHopColor(hops, overlayColors.hopColors);
 
                   return (
                     <Circle
@@ -1939,12 +1762,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   return true;
                 })
                 .map(node => {
-                  // Convert precision_bits to size in meters
-                  // precision_bits indicates how many bits of lat/lon are valid
-                  // Earth's circumference is ~40,075,000 meters
-                  // At N precision bits, the grid cell size is Earth's circumference / 2^N
-                  const earthCircumference = 40_075_000; // meters
-                  const sizeMeters = earthCircumference / Math.pow(2, node.positionPrecisionBits!);
+                  // Convert precision_bits to accuracy zone in meters
+                  // Meshtastic encodes lat/lon as int32 (1 unit = 1e-7 degrees).
+                  // With N precision bits, the grid cell = 2^(32-N) * 1e-7 * 111111 meters.
+                  // The accuracy (max deviation) is half the grid cell.
+                  const metersPerDegree = 111_111;
+                  const sizeMeters = Math.pow(2, 32 - node.positionPrecisionBits!) * 1e-7 * metersPerDegree;
                   const halfSizeMeters = sizeMeters / 2;
 
                   // Convert meters to lat/lng offsets
@@ -1969,7 +1792,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   // Get hop color for the region (same as marker)
                   const isLocalNode = node.user?.id === currentNodeId;
                   const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                  const color = getHopColor(hops);
+                  const color = getHopColor(hops, overlayColors.hopColors);
 
                   return (
                     <Rectangle
@@ -2018,7 +1841,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   <Polyline
                     key={`neighbor-${idx}`}
                     positions={positions}
-                    color="#cba6f7"
+                    color={overlayColors.neighborLine}
                     weight={4}
                     opacity={0.7}
                     dashArray="5, 5"
@@ -2064,7 +1887,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 for (let i = 0; i < segmentCount; i++) {
                   const startPos = filteredHistory[i];
                   const endPos = filteredHistory[i + 1];
-                  const color = getPositionHistoryColor(i, segmentCount);
+                  const color = getPositionHistoryColor(i, segmentCount, overlayColors.positionHistoryOld, overlayColors.positionHistoryNew);
                   segmentColors.push(color);
 
                   // Generate path - use Bezier curve if heading data is available
@@ -2197,6 +2020,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           />
         </div>
       )}
+      </div>
 
     </div>
   );

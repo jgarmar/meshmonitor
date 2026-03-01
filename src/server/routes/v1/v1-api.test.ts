@@ -238,8 +238,11 @@ vi.mock('../../services/packetLogService.js', () => {
   return {
     default: {
       getPackets: vi.fn(() => testPackets),
+      getPacketsAsync: vi.fn(async () => testPackets),
       getPacketCount: vi.fn(() => testPackets.length),
+      getPacketCountAsync: vi.fn(async () => testPackets.length),
       getPacketById: vi.fn((id: number) => testPackets.find(p => p.id === id) || null),
+      getPacketByIdAsync: vi.fn(async (id: number) => testPackets.find(p => p.id === id) || null),
       getMaxCount: vi.fn(() => 10000)
     }
   };
@@ -1202,12 +1205,14 @@ describe('GET /api/v1/nodes/:nodeId/position-history', () => {
 
   it('should return 403 for private-position node without nodes_private:read', async () => {
     const databaseService = await import('../../../services/database.js');
-    vi.mocked(databaseService.default.getNode).mockReturnValueOnce({
-      nodeId: '2882400001', node_id: 2882400001, positionOverrideIsPrivate: true
-    } as any);
+    // getNode is called twice: once by checkNodeChannelAccess, once by the privacy check
+    vi.mocked(databaseService.default.getNode)
+      .mockReturnValueOnce({ channel: 0, positionOverrideIsPrivate: true } as any)
+      .mockReturnValueOnce({ channel: 0, positionOverrideIsPrivate: true } as any);
     vi.mocked(databaseService.default.getUserPermissionSetAsync).mockResolvedValue({
       nodes: { read: true },
-      nodes_private: { read: false }
+      nodes_private: { read: false },
+      channel_0: { viewOnMap: true, read: true, write: true }
     } as any);
 
     const response = await request(app)

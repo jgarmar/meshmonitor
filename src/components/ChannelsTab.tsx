@@ -10,10 +10,12 @@ import { useTranslation } from 'react-i18next';
 import { Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
 import { ResourceType } from '../types/permission';
-import { TimeFormat, DateFormat } from '../contexts/SettingsContext';
+import { TimeFormat, DateFormat, useSettings } from '../contexts/SettingsContext';
+import { formatPrecisionAccuracy } from '../utils/distance';
 import apiService, { type ChannelDatabaseEntry } from '../services/api';
 import { formatMessageTime, getMessageDateSeparator, shouldShowDateSeparator } from '../utils/datetime';
 import { getUtf8ByteLength, formatByteCount, isEmoji } from '../utils/text';
+import { applyHomoglyphOptimization } from '../utils/homoglyph';
 import { renderMessageWithLinks } from '../utils/linkRenderer';
 import HopCountDisplay from './HopCountDisplay';
 import LinkPreview from './LinkPreview';
@@ -112,6 +114,10 @@ export interface ChannelsTabProps {
 
   // Refs from parent for scroll handling
   channelMessagesContainerRef: React.RefObject<HTMLDivElement | null>;
+
+  // Search focus
+  focusMessageId?: string | null;
+  onFocusMessageHandled?: () => void;
 }
 
 export default function ChannelsTab({
@@ -152,9 +158,12 @@ export default function ChannelsTab({
   isMqttBridgeMessage,
   setEmojiPickerMessage,
   channelMessagesContainerRef,
+  focusMessageId,
+  onFocusMessageHandled,
 }: ChannelsTabProps) {
   const { t } = useTranslation();
   const { nodes } = useNodes();
+  const { distanceUnit } = useSettings();
 
   // Refs
   const channelMessageInputRef = useRef<HTMLInputElement>(null);
@@ -171,6 +180,26 @@ export default function ChannelsTab({
   const [selectedRxTime, setSelectedRxTime] = useState<Date | undefined>(undefined);
   const [selectedMessageRssi, setSelectedMessageRssi] = useState<number | undefined>(undefined);
   const [directNeighborStats, setDirectNeighborStats] = useState<Record<number, { avgRssi: number; packetCount: number; lastHeard: number }>>({});
+  const [homoglyphEnabled, setHomoglyphEnabled] = useState(false);
+
+  // Fetch homoglyph optimization setting
+  useEffect(() => {
+    const fetchHomoglyphSetting = async () => {
+      try {
+        const settings = await apiService.get<Record<string, string>>('/api/settings');
+        setHomoglyphEnabled(settings.homoglyphEnabled === 'true');
+      } catch {
+        // Default to false if we can't fetch settings
+      }
+    };
+    fetchHomoglyphSetting();
+  }, []);
+
+  // Memoize byte count to avoid redundant homoglyph optimization on each render
+  const byteCountDisplay = useMemo(() => {
+    const message = homoglyphEnabled ? applyHomoglyphOptimization(newMessage) : newMessage;
+    return formatByteCount(getUtf8ByteLength(message));
+  }, [newMessage, homoglyphEnabled]);
 
   // Compute auto-position channel: lowest-index channel with positionPrecision > 0
   const autoPositionChannelId = useMemo(() => {
@@ -246,6 +275,22 @@ export default function ChannelsTab({
       return () => container.removeEventListener('scroll', handleScroll);
     }
   }, [channelMessagesContainerRef, handleScroll]);
+
+  // Scroll to and highlight a focused message from search
+  useEffect(() => {
+    if (!focusMessageId) return;
+    // Delay to allow React to render the channel's messages after tab/channel switch
+    const timer = setTimeout(() => {
+      const el = document.querySelector(`[data-message-id="${CSS.escape(focusMessageId)}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('search-highlight');
+        setTimeout(() => el.classList.remove('search-highlight'), 3000);
+      }
+      onFocusMessageHandled?.();
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [focusMessageId, onFocusMessageHandled]);
 
   // Helper: get channel name
   const getChannelName = (channelNum: number): string => {
@@ -385,7 +430,9 @@ export default function ChannelsTab({
                   const uplink = channelConfig?.uplinkEnabled ? '↑' : '';
                   const downlink = channelConfig?.downlinkEnabled ? '↓' : '';
                   const encryptionIcon = encryptionStatus === 'secure' ? '🔒' : encryptionStatus === 'default' ? '🔐' : '🔓';
-                  const locationIcon = channelId === autoPositionChannelId ? '📍' : '';
+                  const channelConfig2 = channels.find(c => c.id === channelId);
+                  const hasLocation = (channelConfig2?.positionPrecision ?? 0) > 0;
+                  const locationIcon = channelId === autoPositionChannelId ? '📍' : hasLocation ? '📌' : '';
 
                   return (
                     <option key={channelId} value={channelId}>
@@ -453,6 +500,14 @@ export default function ChannelsTab({
                               title={t('channels.location_auto_position')}
                             >
                               📍
+                            </span>
+                          )}
+                          {channelId !== autoPositionChannelId && (channels.find(c => c.id === channelId)?.positionPrecision ?? 0) > 0 && (
+                            <span
+                              className="location-icon"
+                              title={t('channels.location_enabled')}
+                            >
+                              📌
                             </span>
                           )}
                           <a
@@ -809,8 +864,8 @@ export default function ChannelsTab({
                                 }
                               }}
                             />
-                            <div className={formatByteCount(getUtf8ByteLength(newMessage)).className}>
-                              {formatByteCount(getUtf8ByteLength(newMessage)).text}
+                            <div className={byteCountDisplay.className}>
+                              {byteCountDisplay.text}
                             </div>
                           </div>
                           <button
@@ -936,7 +991,11 @@ export default function ChannelsTab({
                       <span className="info-value">
                         {selectedChannelConfig.id === autoPositionChannelId ? (
                           <span className="status-enabled">
-                            {t('channels.location_auto_position')}
+                            {t('channels.location_auto_position')} ({formatPrecisionAccuracy(selectedChannelConfig.positionPrecision ?? 0, distanceUnit)})
+                          </span>
+                        ) : (selectedChannelConfig.positionPrecision ?? 0) > 0 ? (
+                          <span className="status-enabled">
+                            {t('channels.location_enabled')} ({formatPrecisionAccuracy(selectedChannelConfig.positionPrecision ?? 0, distanceUnit)})
                           </span>
                         ) : (
                           <span className="status-disabled">{t('channels.location_disabled')}</span>

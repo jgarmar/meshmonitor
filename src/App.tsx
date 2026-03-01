@@ -31,6 +31,7 @@ import GeofenceTriggersSection from './components/GeofenceTriggersSection';
 import RemoteAdminScannerSection from './components/RemoteAdminScannerSection';
 import AutoTimeSyncSection from './components/AutoTimeSyncSection';
 import AutoPingSection from './components/AutoPingSection';
+import AutoFavoriteSection from './components/AutoFavoriteSection';
 import IgnoredNodesSection from './components/IgnoredNodesSection';
 import SectionNav from './components/SectionNav';
 import { ToastProvider, useToast } from './components/ToastContainer';
@@ -56,7 +57,9 @@ import api, { type ChannelDatabaseEntry } from './services/api';
 import { logger } from './utils/logger';
 // generateArrowMarkers moved to useTraceroutePaths hook
 import { isNodeComplete, getEffectivePosition } from './utils/nodeHelpers';
+import { applyHomoglyphOptimization } from './utils/homoglyph';
 import Sidebar from './components/Sidebar';
+import { SearchModal } from './components/SearchModal/SearchModal.js';
 import { SettingsProvider, useSettings } from './contexts/SettingsContext';
 import { MapProvider, useMapContext } from './contexts/MapContext';
 import { DataProvider, useData } from './contexts/DataContext';
@@ -141,6 +144,8 @@ function App() {
   } | null>(null);
   const [selectedRouteSegment, setSelectedRouteSegment] = useState<{ nodeNum1: number; nodeNum2: number } | null>(null);
   const [emojiPickerMessage, setEmojiPickerMessage] = useState<MeshMessage | null>(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [focusMessageId, setFocusMessageId] = useState<string | null>(null);
 
   // Check if mobile viewport and default to collapsed on mobile
   const isMobileViewport = () => window.innerWidth <= 768;
@@ -199,6 +204,7 @@ function App() {
   const connectionStatusRef = useRef<string>('disconnected'); // Track connection status for interval closure
   const localNodeIdRef = useRef<string>(''); // Track local node ID for immediate access (bypasses React state delay)
   const pendingMessagesRef = useRef<Map<string, MeshMessage>>(new Map()); // Track pending messages for interval access (bypasses closure stale state)
+  const homoglyphEnabledRef = useRef<boolean>(false); // Track homoglyph setting for send handlers
   const upgradePollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // Track upgrade polling interval for cleanup
 
   // Constants for emoji tapbacks
@@ -297,6 +303,7 @@ function App() {
     setSolarMonitoringLongitude,
     setSolarMonitoringAzimuth,
     setSolarMonitoringDeclination,
+    overlayColors: schemeColors,
   } = useSettings();
 
   // Map context
@@ -383,6 +390,15 @@ function App() {
       setThemeColors({ mauve, red, blue, overlay0 });
     }
   }, [theme]);
+
+  // Merge overlay scheme colors into theme colors for traceroute rendering
+  const mergedThemeColors = useMemo(() => ({
+    ...themeColors,
+    tracerouteForward: schemeColors.tracerouteForward,
+    tracerouteReturn: schemeColors.tracerouteReturn,
+    mqttSegment: schemeColors.mqttSegment,
+    neighborLine: schemeColors.neighborLine,
+  }), [themeColors, schemeColors]);
 
   // Channel Database entries for displaying names of server-decrypted channels
   const [channelDatabaseEntries, setChannelDatabaseEntries] = useState<ChannelDatabaseEntry[]>([]);
@@ -917,6 +933,11 @@ function App() {
             const value = parseInt(settings.telemetryVisualizationHours);
             setTelemetryVisualizationHours(value);
             localStorage.setItem('telemetryVisualizationHours', value.toString());
+          }
+
+          // Homoglyph optimization setting - stored in ref for use in send handlers
+          if (settings.homoglyphEnabled !== undefined) {
+            homoglyphEnabledRef.current = settings.homoglyphEnabled === 'true';
           }
 
           // Automation settings - loaded from database, not localStorage
@@ -2332,7 +2353,18 @@ function App() {
 
             // For pending messages (temp IDs), only keep if still pending
             if (m.id.toString().startsWith('temp_')) {
-              return pendingIds.has(m.id);
+              if (!pendingIds.has(m.id)) return false;
+              // Safety net: filter out if a matching server message already exists
+              // This catches edge cases where the ref timing or text/sender matching fails
+              // Must use localNodeId fallback (same as primary dedup) because temp messages
+              // created before first poll may have fromNodeId='me' instead of the real node ID
+              const hasServerMatch = processedMessages.some((pm: MeshMessage) =>
+                pm.text === m.text &&
+                ((localNodeId && pm.from === localNodeId) || pm.fromNodeId === m.fromNodeId || pm.from === m.from) &&
+                Math.abs(pm.timestamp.getTime() - m.timestamp.getTime()) < 30000
+              );
+              if (hasServerMatch) return false;
+              return true;
             }
 
             // Keep all other older messages (loaded via infinite scroll)
@@ -2398,7 +2430,17 @@ function App() {
               // Once matched/acknowledged, pendingIds won't contain it anymore
               // Channel messages use 'temp_' prefix, DMs use 'temp_dm_' prefix
               if (m.id.toString().startsWith('temp_')) {
-                return pendingIds.has(m.id);
+                if (!pendingIds.has(m.id)) return false;
+                // Safety net: filter out if a matching server message already exists
+                // Must use localNodeId fallback (same as primary dedup) because temp messages
+                // created before first poll may have fromNodeId='me' instead of the real node ID
+                const hasServerMatch = pollMsgs.some(pm =>
+                  pm.text === m.text &&
+                  ((localNodeId && pm.from === localNodeId) || pm.fromNodeId === m.fromNodeId || pm.from === m.from) &&
+                  Math.abs(pm.timestamp.getTime() - m.timestamp.getTime()) < 30000
+                );
+                if (hasServerMatch) return false;
+                return true;
               }
 
               // Keep all other older messages (loaded via infinite scroll)
@@ -2600,7 +2642,7 @@ function App() {
     }
   };
 
-  const handleExchangePosition = async (nodeId: string) => {
+  const handleExchangePosition = async (nodeId: string, channel?: number) => {
     if (connectionStatus !== 'connected') {
       return;
     }
@@ -2625,7 +2667,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ destination: nodeNum }),
+        body: JSON.stringify({ destination: nodeNum, ...(channel !== undefined && { channel }) }),
       });
 
       logger.debug(`📍 Position request sent to ${nodeId}`);
@@ -2784,13 +2826,16 @@ function App() {
     const tempId = `temp_dm_${Date.now()}_${Math.random()}`;
     // Use localNodeIdRef for immediate access (bypasses React state delay)
     const nodeId = localNodeIdRef.current || currentNodeId || 'me';
+    // Apply homoglyph optimization to match what the backend will store,
+    // so dedup text comparison works correctly (#2027)
+    const displayText = homoglyphEnabledRef.current ? applyHomoglyphOptimization(newMessage) : newMessage;
     const sentMessage: MeshMessage = {
       id: tempId,
       from: nodeId,
       to: destinationNodeId,
       fromNodeId: nodeId,
       toNodeId: destinationNodeId,
-      text: newMessage,
+      text: displayText,
       channel: -1, // -1 indicates a direct message
       timestamp: new Date(),
       isLocalMessage: true,
@@ -2803,11 +2848,10 @@ function App() {
     setMessages(prev => [...prev, sentMessage]);
 
     // Add to pending acknowledgments
-    setPendingMessages(prev => {
-      const updated = new Map(prev).set(tempId, sentMessage);
-      pendingMessagesRef.current = updated; // Update ref for interval access
-      return updated;
-    });
+    // Update ref immediately (before React batches the state update) so processPollData
+    // can always find the pending message even if a WebSocket event arrives before React commits
+    pendingMessagesRef.current = new Map(pendingMessagesRef.current).set(tempId, sentMessage);
+    setPendingMessages(pendingMessagesRef.current);
 
     // Scroll to bottom after sending message
     setTimeout(() => {
@@ -3263,13 +3307,16 @@ function App() {
     const tempId = `temp_${Date.now()}_${Math.random()}`;
     // Use localNodeIdRef for immediate access (bypasses React state delay)
     const nodeId = localNodeIdRef.current || currentNodeId || 'me';
+    // Apply homoglyph optimization to match what the backend will store,
+    // so dedup text comparison works correctly (#2027)
+    const displayText = homoglyphEnabledRef.current ? applyHomoglyphOptimization(newMessage) : newMessage;
     const sentMessage: MeshMessage = {
       id: tempId,
       from: nodeId,
       to: '!ffffffff', // Broadcast
       fromNodeId: nodeId,
       toNodeId: '!ffffffff',
-      text: newMessage,
+      text: displayText,
       channel: messageChannel,
       timestamp: new Date(),
       isLocalMessage: true,
@@ -3292,12 +3339,11 @@ function App() {
       fromNodeId: sentMessage.fromNodeId,
       channel: sentMessage.channel,
     });
-    setPendingMessages(prev => {
-      const updated = new Map(prev).set(tempId, sentMessage);
-      pendingMessagesRef.current = updated; // Update ref for interval access
-      console.log(`📊 Pending messages map size after add: ${updated.size}`);
-      return updated;
-    });
+    // Update ref immediately (before React batches the state update) so processPollData
+    // can always find the pending message even if a WebSocket event arrives before React commits
+    pendingMessagesRef.current = new Map(pendingMessagesRef.current).set(tempId, sentMessage);
+    console.log(`📊 Pending messages map size after add: ${pendingMessagesRef.current.size}`);
+    setPendingMessages(pendingMessagesRef.current);
 
     // Scroll to bottom after sending message
     setTimeout(() => {
@@ -4070,10 +4116,47 @@ function App() {
     traceroutesDigest,
     distanceUnit,
     maxNodeAgeHours,
-    themeColors,
+    themeColors: mergedThemeColors,
     callbacks: tracerouteCallbacks,
     visibleNodeNums,
   });
+
+  // Navigate to message from search result
+  const handleNavigateToMessage = useCallback((result: { id: string; source: string; channel?: number; fromNodeId?: string; fromNodeNum?: number }) => {
+    setIsSearchOpen(false);
+    setFocusMessageId(result.id);
+    if (result.source === 'meshcore') {
+      setActiveTab('meshcore');
+    } else if (result.channel === -1) {
+      setActiveTab('messages');
+      // Navigate to DM conversation with the sender
+      if (result.fromNodeId) {
+        setSelectedDMNode(result.fromNodeId);
+      } else if (result.fromNodeNum) {
+        // Fallback: convert nodeNum to hex ID format
+        setSelectedDMNode(`!${result.fromNodeNum.toString(16)}`);
+      }
+    } else {
+      setActiveTab('channels');
+      // Navigate to the specific channel
+      if (result.channel !== undefined) {
+        setSelectedChannel(result.channel);
+        selectedChannelRef.current = result.channel;
+      }
+    }
+  }, [setActiveTab, setSelectedDMNode, setSelectedChannel]);
+
+  // Ctrl+K / Cmd+K keyboard shortcut to toggle search modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsSearchOpen(prev => !prev);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // If anonymous is disabled and user is not authenticated, show login page
   if (authStatus?.anonymousDisabled && !authStatus?.authenticated) {
@@ -4239,6 +4322,7 @@ function App() {
         baseUrl={baseUrl}
         connectedNodeName={connectedNodeName}
         meshcoreEnabled={authStatus?.meshcoreEnabled || false}
+        onSearchClick={() => setIsSearchOpen(true)}
       />
 
       <main className="app-main">
@@ -4315,6 +4399,8 @@ function App() {
             isMqttBridgeMessage={isMqttBridgeMessage}
             setEmojiPickerMessage={setEmojiPickerMessage}
             channelMessagesContainerRef={channelMessagesContainerRef}
+            focusMessageId={focusMessageId}
+            onFocusMessageHandled={() => setFocusMessageId(null)}
           />
         )}
         {activeTab === 'messages' && (
@@ -4342,6 +4428,7 @@ function App() {
             dmFilter={dmFilter}
             setDmFilter={setDmFilter}
             securityFilter={securityFilter}
+            channels={channels}
             channelFilter={channelFilter}
             showIncompleteNodes={showIncompleteNodes}
             showNodeFilterPopup={showNodeFilterPopup}
@@ -4377,6 +4464,8 @@ function App() {
             setEmojiPickerMessage={setEmojiPickerMessage}
             shouldShowData={shouldShowData}
             dmMessagesContainerRef={dmMessagesContainerRef}
+            focusMessageId={focusMessageId}
+            onFocusMessageHandled={() => setFocusMessageId(null)}
             toggleIgnored={toggleIgnored}
             toggleFavorite={toggleFavorite}
             handleShowOnMap={(nodeId: string) => {
@@ -4476,6 +4565,7 @@ function App() {
             <SectionNav
               items={[
                 { id: 'auto-welcome', label: t('automation.welcome.title', 'Auto Welcome') },
+                { id: 'auto-favorite', label: t('automation.auto_favorite.title', 'Auto Favorite') },
                 { id: 'auto-traceroute', label: t('automation.traceroute.title', 'Auto Traceroute') },
                 { id: 'auto-ping', label: t('automation.auto_ping.title', 'Auto Ping') },
                 { id: 'remote-admin-scanner', label: t('automation.remote_admin_scanner.title', 'Remote Admin Scanner') },
@@ -4505,6 +4595,9 @@ function App() {
                   onWaitForNameChange={setAutoWelcomeWaitForName}
                   onMaxHopsChange={setAutoWelcomeMaxHops}
                 />
+              </div>
+              <div id="auto-favorite">
+                <AutoFavoriteSection baseUrl={baseUrl} />
               </div>
               <div id="auto-traceroute">
                 <AutoTracerouteSection
@@ -4715,6 +4808,19 @@ function App() {
         isOpen={showStatusModal}
         systemStatus={systemStatus}
         onClose={() => setShowStatusModal(false)}
+      />
+
+      {/* Message Search Modal */}
+      <SearchModal
+        isOpen={isSearchOpen}
+        onClose={() => setIsSearchOpen(false)}
+        onNavigateToMessage={handleNavigateToMessage}
+        channels={channels.map(ch => ({ id: ch.id, name: ch.name }))}
+        nodes={nodes.map(n => ({
+          nodeId: n.user?.id || String(n.nodeNum),
+          longName: n.user?.longName || `!${n.nodeNum.toString(16)}`,
+          shortName: n.user?.shortName || '????',
+        }))}
       />
 
       {/* SaveBar for unified save/dismiss actions */}

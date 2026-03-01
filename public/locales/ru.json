@@ -376,7 +376,7 @@
     "channels.cannot_undo": "Это действие не может быть отменено",
     "channels.location_sharing": "",
     "channels.location_auto_position": "",
-    "channels.location_disabled": "",
+    "channels.location_disabled": "Выключено",
     "dashboard.title": "Панель телеметрии",
     "dashboard.add_widget": "Добавить виджет",
     "dashboard.remove_widget": "Убрать виджет",
@@ -2734,7 +2734,7 @@
     "detectionsensor_config.trigger_type": "Тип триггера",
     "admin_commands.config_coming_soon": "Скоро появится пользовательский интерфейс конфигурации. Используйте Загрузку для просмотра текущих настроек.",
     "storeforward_config.history_return_max": "Максимально сообщений за один запрос",
-    "serial_config.title": "Модуль последовательного порта",
+    "serial_config.title": "Настройка последовательного порта",
     "notifications.apprise_config_title": "Настройки Apprise",
     "notifications.test_failed": "Не удалось отправить тестовое уведомление",
     "admin_commands.security_config_loaded": "Настройки безопасности успешно загружены",
@@ -3690,5 +3690,12 @@
     "automation.auto_announce.feature_remote_admin": "🔍 Сканирование удаленного администратора - сканирование сети",
     "automation.auto_announce.feature_time_sync": "🕐 Автоматическая синхронизация времени - Синхронизация часов",
     "messages.packet_type_distribution": "Распределение пакетов по типам (24 часа)",
-    "info.select_packet_type": "Выберите тип пакета, чтобы увидеть, какие узлы его отправляют"
+    "info.select_packet_type": "Выберите тип пакета, чтобы увидеть, какие узлы его отправляют",
+    "node_identity.is_licensed_description": "Отметьте этот узел как лицензированного радиолюбителя (HAM). Полное имя должно соответствовать номеру вашей лицензии.",
+    "channels_config.estimated_accuracy": "Предполагаемая точность: {{accuracy}}",
+    "channels_config.location_auto_broadcast": "Местоположение: Автоматическая трансляция",
+    "channels_config.location_enabled": "Местоположение: Включено",
+    "admin_commands.mark_licensed": "Лицензия (HAM)",
+    "admin_commands.mark_licensed_description": "Укажите, что вы являетесь лицензированным радиолюбителем. Полное имя должно совпадать с номером лицензии.",
+    "node_identity.is_licensed": "Лицензия (HAM)"
 }

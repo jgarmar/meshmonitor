@@ -18,7 +18,9 @@ import { messageQueueService } from './messageQueueService.js';
 import { normalizeTriggerPatterns } from '../utils/autoResponderUtils.js';
 import { isWithinTimeWindow } from './utils/timeWindow.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
+import { applyHomoglyphOptimization } from '../utils/homoglyph.js';
 import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, MIN_TRACEROUTE_INTERVAL_MS } from './constants/meshtastic.js';
+import { isAutoFavoriteEligible } from './constants/autoFavorite.js';
 import { createRequire } from 'module';
 import * as cron from 'node-cron';
 import fs from 'fs';
@@ -282,7 +284,7 @@ class MeshtasticManager {
   private localStatsInterval: NodeJS.Timeout | null = null;
   private timeOffsetSamples: number[] = [];
   private timeOffsetInterval: NodeJS.Timeout | null = null;
-  private localStatsIntervalMinutes: number = 5;  // Default 5 minutes
+  private localStatsIntervalMinutes: number = 15;  // Default 5 minutes
   private announceInterval: NodeJS.Timeout | null = null;
   private announceCronJob: cron.ScheduledTask | null = null;
   private timerCronJobs: Map<string, cron.ScheduledTask> = new Map();
@@ -330,6 +332,8 @@ class MeshtasticManager {
   }> = new Map();
   // Track pending module config requests so empty Proto3 responses can be mapped to the correct key
   private pendingModuleConfigRequests: Map<number, string> = new Map();
+  // Track whether module configs have ever been fetched this process lifetime (skip on reconnect)
+  private moduleConfigsEverFetched: boolean = false;
   // Per-node channel storage for remote nodes
   private remoteNodeChannels: Map<number, Map<number, any>> = new Map();
   // Per-node owner storage for remote nodes
@@ -344,6 +348,8 @@ class MeshtasticManager {
 
   // Auto-welcome tracking to prevent race conditions
   private welcomingNodes: Set<number> = new Set();  // Track nodes currently being welcomed
+  private autoFavoritingNodes = new Set<number>();  // Track nodes currently being auto-favorited
+  private autoFavoriteSweepRunning = false;  // Prevent concurrent sweep operations
 
   // Virtual Node Server - Message capture for initialization sequence
   private initConfigCache: Array<{ type: string; data: Uint8Array }> = [];  // Store raw FromRadio messages with type metadata during init
@@ -353,18 +359,18 @@ class MeshtasticManager {
 
   constructor() {
     // Initialize message queue service with send callback
-    messageQueueService.setSendCallback(async (text: string, destination: number, replyId?: number, channel?: number) => {
+    messageQueueService.setSendCallback(async (text: string, destination: number, replyId?: number, channel?: number, emoji?: number) => {
       // For channel messages: channel is specified, destination is 0 (undefined in sendTextMessage)
       // For DMs: channel is undefined, destination is the node number
       if (channel !== undefined) {
         // Channel message - send to channel, no specific destination
-        return await this.sendTextMessage(text, channel, undefined, replyId);
+        return await this.sendTextMessage(text, channel, undefined, replyId, emoji);
       } else {
         // DM - use the channel we last heard the target node on
         const targetNode = databaseService.getNode(destination);
         const dmChannel = (targetNode?.channel !== undefined && targetNode?.channel !== null) ? targetNode.channel : 0;
         logger.debug(`📨 Queue DM to ${destination} - Using channel: ${dmChannel}`);
-        return await this.sendTextMessage(text, dmChannel, destination, replyId);
+        return await this.sendTextMessage(text, dmChannel, destination, replyId, emoji);
       }
     });
 
@@ -625,15 +631,20 @@ class MeshtasticManager {
         }
       }, 2000);
 
-      // Request all module configs for complete device backup capability
-      setTimeout(async () => {
-        try {
-          logger.info('📦 Requesting all module configs for backup...');
-          await this.requestAllModuleConfigs();
-        } catch (error) {
-          logger.error('❌ Failed to request all module configs:', error);
-        }
-      }, 3000); // Start after LoRa config request
+      // Request all module configs for complete device backup capability (skip on reconnect)
+      if (!this.moduleConfigsEverFetched) {
+        setTimeout(async () => {
+          try {
+            logger.info('📦 Requesting all module configs for backup...');
+            await this.requestAllModuleConfigs();
+            this.moduleConfigsEverFetched = true;
+          } catch (error) {
+            logger.error('❌ Failed to request all module configs:', error);
+          }
+        }, 3000); // Start after LoRa config request
+      } else {
+        logger.info('📦 Skipping module config request on reconnect (already fetched this session)');
+      }
 
       // Give the node a moment to send initial config, then do basic setup
       setTimeout(async () => {
@@ -670,6 +681,20 @@ class MeshtasticManager {
 
         // Start auto key repair scheduler
         this.startKeyRepairScheduler();
+
+        // Auto-favorite staleness sweep - runs every 60 minutes
+        setInterval(() => {
+          this.autoFavoriteSweep().catch(error => {
+            logger.error('❌ Error in auto-favorite sweep interval:', error);
+          });
+        }, 60 * 60 * 1000);
+
+        // Run initial sweep after 30 seconds to handle cleanup from previous session
+        setTimeout(() => {
+          this.autoFavoriteSweep().catch(error => {
+            logger.error('❌ Error in initial auto-favorite sweep:', error);
+          });
+        }, 30000);
 
         logger.debug(`✅ Configuration complete: ${databaseService.getNodeCount()} nodes, ${databaseService.getChannelCount()} channels`);
       }, 5000);
@@ -1335,7 +1360,7 @@ class MeshtasticManager {
 
   /**
    * Start periodic LocalStats collection from the local node
-   * Requests LocalStats every 5 minutes to track mesh health metrics
+   * Requests LocalStats at the configured interval to track mesh health metrics
    */
   private startLocalStatsScheduler(): void {
     if (this.localStatsInterval) {
@@ -1352,16 +1377,17 @@ class MeshtasticManager {
     const intervalMs = this.localStatsIntervalMinutes * 60 * 1000;
     logger.debug(`📊 Starting LocalStats scheduler with ${this.localStatsIntervalMinutes} minute interval`);
 
-    // Request immediately on start
-    if (this.isConnected && this.localNodeInfo) {
-      this.requestLocalStats().catch(error => {
-        logger.error('❌ Error requesting initial LocalStats:', error);
-      });
-      // Also save system node metrics on initial request
-      this.saveSystemNodeMetrics().catch(error => {
-        logger.error('❌ Error saving initial system node metrics:', error);
-      });
-    }
+    // Delay the first request by 30 seconds to let the node settle after connect
+    setTimeout(() => {
+      if (this.isConnected && this.localNodeInfo) {
+        this.requestLocalStats().catch(error => {
+          logger.error('❌ Error requesting initial LocalStats:', error);
+        });
+        this.saveSystemNodeMetrics().catch(error => {
+          logger.error('❌ Error saving initial system node metrics:', error);
+        });
+      }
+    }, 30000);
 
     this.localStatsInterval = setInterval(async () => {
       if (this.isConnected && this.localNodeInfo) {
@@ -1671,6 +1697,13 @@ class MeshtasticManager {
       return;
     }
 
+    // Auto-assign IDs to triggers missing them
+    for (let i = 0; i < timerTriggers.length; i++) {
+      if (!timerTriggers[i].id) {
+        timerTriggers[i].id = `timer-${i}`;
+      }
+    }
+
     // Schedule each enabled timer
     for (const trigger of timerTriggers) {
       if (!trigger.enabled) {
@@ -1738,6 +1771,13 @@ class MeshtasticManager {
     } catch (e) {
       logger.error('📍 Failed to parse geofenceTriggers setting:', e);
       return;
+    }
+
+    // Auto-assign IDs to triggers missing them (prevents shared state when id is undefined)
+    for (let i = 0; i < triggers.length; i++) {
+      if (!triggers[i].id) {
+        triggers[i].id = `geofence-${i}`;
+      }
     }
 
     const enabledTriggers = triggers.filter(t => t.enabled);
@@ -3382,7 +3422,7 @@ class MeshtasticManager {
           hop_limit: meshPacket.hopLimit ?? undefined,
           hop_start: meshPacket.hopStart ?? undefined,
           relay_node: meshPacket.relayNode ?? undefined,
-          payload_size: meshPacket.decoded?.payload?.length ?? undefined,
+          payload_size: meshPacket.decoded?.payload?.length ?? meshPacket.encrypted?.length ?? undefined,
           want_ack: meshPacket.wantAck ?? false,
           priority: meshPacket.priority ?? undefined,
           payload_preview: payloadPreview ?? undefined,
@@ -3767,17 +3807,26 @@ class MeshtasticManager {
           const newPrecision = precisionBits;
           const existingPositionAge = existingNode.positionTimestamp ? (now - existingNode.positionTimestamp) : Infinity;
           const twelveHoursMs = 12 * 60 * 60 * 1000;
+          const tenMinutesMs = 10 * 60 * 1000;
+
+          // Mobile/tracker nodes need more frequent position updates
+          const isMobileOrTracker = existingNode.mobile === 1 ||
+            existingNode.role === 5 ||   // Tracker
+            existingNode.role === 10;    // TAK Tracker
+
+          const staleThresholdMs = isMobileOrTracker ? tenMinutesMs : twelveHoursMs;
 
           // Smart upgrade/downgrade logic:
           // - Always upgrade to higher precision
-          // - Only downgrade if existing position is >12 hours old
-          if (newPrecision < existingPrecision && existingPositionAge < twelveHoursMs) {
+          // - Only downgrade if existing position is older than the stale threshold
+          //   (10 min for mobile/tracker nodes, 12 hours for stationary)
+          if (newPrecision < existingPrecision && existingPositionAge < staleThresholdMs) {
             shouldUpdatePosition = false;
-            logger.debug(`🗺️ Skipping position update for ${nodeId}: New precision (${newPrecision}) < existing (${existingPrecision}) and existing position is recent (${Math.round(existingPositionAge / 1000 / 60)}min old)`);
+            logger.debug(`🗺️ Skipping position update for ${nodeId}: New precision (${newPrecision}) < existing (${existingPrecision}) and existing position is recent (${Math.round(existingPositionAge / 1000 / 60)}min old, threshold: ${Math.round(staleThresholdMs / 1000 / 60)}min)`);
           } else if (newPrecision > existingPrecision) {
             logger.debug(`🗺️ Upgrading position precision for ${nodeId}: ${existingPrecision} -> ${newPrecision} bits (channel ${channelIndex})`);
-          } else if (existingPositionAge >= twelveHoursMs) {
-            logger.debug(`🗺️ Updating stale position for ${nodeId}: existing is ${Math.round(existingPositionAge / 1000 / 60 / 60)}h old`);
+          } else if (existingPositionAge >= staleThresholdMs) {
+            logger.debug(`🗺️ Updating stale position for ${nodeId}: existing is ${Math.round(existingPositionAge / 1000 / 60)}min old (threshold: ${Math.round(staleThresholdMs / 1000 / 60)}min)`);
           }
         }
 
@@ -3833,8 +3882,28 @@ class MeshtasticManager {
           });
         }
 
-        // Only update node's current position if precision check passes
-        if (shouldUpdatePosition) {
+        // Skip overwriting the local node's position from mesh broadcast packets when fixedPosition is enabled.
+        // When fixedPosition=true, the position is set explicitly by the user (via config or CLI).
+        // The device's firmware may broadcast stale position data before the new fixed position takes effect,
+        // which would otherwise overwrite the correct position in the database.
+        const isLocalNode = this.localNodeInfo && fromNum === this.localNodeInfo.nodeNum;
+        const hasFixedPositionEnabled = this.actualDeviceConfig?.position?.fixedPosition === true;
+        if (isLocalNode && hasFixedPositionEnabled && shouldUpdatePosition) {
+          logger.info(`🗺️ Skipping position update for local node ${nodeId}: fixedPosition is enabled, position should only be set via config. Received: ${coords.latitude}, ${coords.longitude}`);
+          // Still update lastHeard and technical fields, just not lat/lon/alt
+          const technicalData: any = {
+            nodeNum: fromNum,
+            nodeId: nodeId,
+            lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000, Date.now() / 1000),
+          };
+          if (meshPacket.rxSnr && meshPacket.rxSnr !== 0) {
+            technicalData.snr = meshPacket.rxSnr;
+          }
+          if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+            technicalData.rssi = meshPacket.rxRssi;
+          }
+          databaseService.upsertNode(technicalData);
+        } else if (shouldUpdatePosition) {
           const nodeData: any = {
             nodeNum: fromNum,
             nodeId: nodeId,
@@ -4045,6 +4114,9 @@ class MeshtasticManager {
 
       // Check if we should send auto-welcome message
       await this.checkAutoWelcome(fromNum, nodeId);
+
+      // Check if we should auto-favorite this node
+      await this.checkAutoFavorite(fromNum, nodeId);
     } catch (error) {
       logger.error('❌ Error processing user message:', error);
     }
@@ -6845,6 +6917,11 @@ class MeshtasticManager {
     }
 
     try {
+      // Apply homoglyph optimization if enabled (replace Cyrillic look-alikes with Latin to save bytes)
+      if (databaseService.getSetting('homoglyphEnabled') === 'true') {
+        text = applyHomoglyphOptimization(text);
+      }
+
       // Use the new protobuf service to create a proper text message
       // Note: PKI encryption is handled automatically by the firmware if it has the recipient's public key
       const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji);
@@ -7597,21 +7674,21 @@ class MeshtasticManager {
 
         logger.debug(`🤖 Auto-acknowledging with tapback ${hopEmoji} (${hopsTraveled} hops) to ${target}`);
 
-        // Tapbacks always reply on the original channel (not affected by alwaysUseDM)
-        try {
-          await this.sendTextMessage(
-            hopEmoji,
-            isDirectMessage ? 0 : channelIndex,
-            isDirectMessage ? fromNum : undefined,
-            packetId, // replyId - react to the original message
-            1 // emoji flag = 1 for tapback/reaction
-          );
-          logger.info(`✅ Auto-acknowledge tapback ${hopEmoji} delivered to ${target}`);
-          // Record the send so that the message reply respects the 30s rate limit
-          messageQueueService.recordExternalSend();
-        } catch (error) {
-          logger.warn(`❌ Auto-acknowledge tapback failed to ${target}:`, error);
-        }
+        // Route tapback through message queue for rate limiting
+        messageQueueService.enqueue(
+          hopEmoji,
+          isDirectMessage ? fromNum : 0, // destination: node number for DM, 0 for channel
+          packetId, // replyId - react to the original message
+          () => {
+            logger.info(`✅ Auto-acknowledge tapback ${hopEmoji} delivered to ${target}`);
+          },
+          (reason: string) => {
+            logger.warn(`❌ Auto-acknowledge tapback failed to ${target}: ${reason}`);
+          },
+          isDirectMessage ? undefined : channelIndex, // channel
+          1, // maxAttempts - tapbacks are best-effort, don't retry
+          1 // emoji flag = 1 for tapback/reaction
+        );
       }
 
       // Send message reply if enabled
@@ -8879,21 +8956,37 @@ class MeshtasticManager {
 
         logger.info(`👋 Sending auto-welcome to ${nodeId} (${node.longName}): "${welcomeText}" ${autoWelcomeTarget === 'dm' ? '(via DM)' : `(channel ${channel})`}`);
 
-        await this.sendTextMessage(welcomeText, channel, destination);
+        // Route through message queue for rate limiting
+        // For DMs, send only once (maxAttempts=1) — the local radio ACK confirms
+        // transmission to the mesh; remote ACKs from the destination node are unreliable
+        // and waiting for them causes the queue to retry, sending the message multiple times.
+        messageQueueService.enqueue(
+          welcomeText,
+          destination ?? 0, // destination: node number for DM, 0 for channel
+          undefined, // replyId
+          () => {
+            this.welcomingNodes.delete(nodeNum);
+            logger.debug(`🔓 Unlocked auto-welcome tracking for ${nodeId}`);
+          },
+          (reason: string) => {
+            logger.warn(`❌ Auto-welcome send failed for ${nodeId}: ${reason}`);
+            this.welcomingNodes.delete(nodeNum);
+            logger.debug(`🔓 Unlocked auto-welcome tracking for ${nodeId} (failure case)`);
+          },
+          destination ? undefined : channel, // channel: undefined for DM, channel number for channel
+          1 // maxAttemptsOverride: send once, don't retry on missing remote ACK
+        );
 
-        // Mark node as welcomed using atomic check-and-set operation
-        // This ensures the node is only marked if it hasn't been marked already
+        // Mark node as welcomed immediately after enqueue — the local radio ACK is
+        // sufficient confirmation that the message was transmitted to the mesh.
+        // Previously this was inside the onSuccess callback which only fires on remote
+        // ACK, causing welcomedAt to never be set and the node to be re-welcomed repeatedly.
         const wasMarked = databaseService.markNodeAsWelcomedIfNotAlready(nodeNum, nodeId);
         if (wasMarked) {
-          logger.info(`✅ Node ${nodeId} welcomed successfully and marked in database`);
+          logger.info(`✅ Node ${nodeId} welcomed and marked in database`);
         } else {
           logger.warn(`⚠️  Node ${nodeId} was already marked as welcomed by another process`);
         }
-
-        // RACE CONDITION PROTECTION: Release lock immediately after atomic database operation
-        // The atomic operation completes synchronously, so no delay is needed
-        this.welcomingNodes.delete(nodeNum);
-        logger.debug(`🔓 Unlocked auto-welcome tracking for ${nodeId}`);
       } catch (error) {
         // Release lock on error as well
         this.welcomingNodes.delete(nodeNum);
@@ -8902,6 +8995,173 @@ class MeshtasticManager {
       }
     } catch (error) {
       logger.error('❌ Error in auto-welcome:', error);
+    }
+  }
+
+  private async checkAutoFavorite(nodeNum: number, nodeId: string): Promise<void> {
+    try {
+      const autoFavoriteEnabled = databaseService.getSetting('autoFavoriteEnabled');
+      if (autoFavoriteEnabled !== 'true') {
+        return;
+      }
+
+      if (!this.supportsFavorites()) {
+        return;
+      }
+
+      // Skip local node
+      const localNodeNum = databaseService.getSetting('localNodeNum');
+      if (localNodeNum && parseInt(localNodeNum) === nodeNum) {
+        return;
+      }
+
+      // Prevent duplicate concurrent operations
+      if (this.autoFavoritingNodes.has(nodeNum)) {
+        return;
+      }
+
+      // Get local node role
+      const localNodeNumInt = localNodeNum ? parseInt(localNodeNum) : this.localNodeInfo?.nodeNum;
+      if (!localNodeNumInt) return;
+      const localNode = databaseService.getNode(localNodeNumInt);
+      if (!localNode) return;
+
+      const targetNode = databaseService.getNode(nodeNum);
+      if (!targetNode) return;
+
+      // Check if already in auto-favorite list (prevent re-adding manually unfavorited nodes)
+      const autoFavoriteNodesJson = databaseService.getSetting('autoFavoriteNodes') || '[]';
+      const autoFavoriteNodes: number[] = JSON.parse(autoFavoriteNodesJson);
+      if (autoFavoriteNodes.includes(nodeNum)) {
+        return; // Already auto-managed
+      }
+
+      // Check eligibility
+      if (!isAutoFavoriteEligible(localNode.role, targetNode)) {
+        return;
+      }
+
+      this.autoFavoritingNodes.add(nodeNum);
+      try {
+        // Mark in DB
+        databaseService.setNodeFavorite(nodeNum, true);
+
+        // Sync to device
+        try {
+          await this.sendFavoriteNode(nodeNum);
+          logger.info(`⭐ Auto-favorited node ${nodeId} (${targetNode.longName || 'Unknown'}) - 0-hop, role=${targetNode.role}`);
+        } catch (error) {
+          logger.warn(`⚠️ Auto-favorited node ${nodeId} in DB but device sync failed:`, error);
+        }
+
+        // Add to auto-favorite tracking list
+        autoFavoriteNodes.push(nodeNum);
+        databaseService.setSetting('autoFavoriteNodes', JSON.stringify(autoFavoriteNodes));
+      } finally {
+        this.autoFavoritingNodes.delete(nodeNum);
+      }
+    } catch (error) {
+      logger.error('❌ Error in auto-favorite check:', error);
+    }
+  }
+
+  private async autoFavoriteSweep(): Promise<void> {
+    if (this.autoFavoriteSweepRunning) return;
+    this.autoFavoriteSweepRunning = true;
+    try {
+      const autoFavoriteEnabled = databaseService.getSetting('autoFavoriteEnabled');
+      const autoFavoriteNodesJson = databaseService.getSetting('autoFavoriteNodes') || '[]';
+      const autoFavoriteNodes: number[] = JSON.parse(autoFavoriteNodesJson);
+
+      if (autoFavoriteNodes.length === 0) {
+        return;
+      }
+
+      // If feature was disabled, clean up all auto-favorited nodes
+      if (autoFavoriteEnabled !== 'true') {
+        logger.info(`🧹 Auto-favorite disabled, cleaning up ${autoFavoriteNodes.length} auto-favorited nodes`);
+        for (const nodeNum of autoFavoriteNodes) {
+          try {
+            databaseService.setNodeFavorite(nodeNum, false);
+            if (this.supportsFavorites() && this.isConnected) {
+              await this.sendRemoveFavoriteNode(nodeNum);
+            }
+          } catch (error) {
+            logger.warn(`⚠️ Failed to unfavorite node ${nodeNum} during cleanup:`, error);
+          }
+        }
+        databaseService.setSetting('autoFavoriteNodes', '[]');
+        return;
+      }
+
+      if (!this.supportsFavorites()) return;
+
+      const staleHours = parseInt(databaseService.getSetting('autoFavoriteStaleHours') || '72');
+      const staleThreshold = Date.now() / 1000 - (staleHours * 3600);
+
+      // Get local node role for re-evaluation
+      const localNodeNum = databaseService.getSetting('localNodeNum');
+      const localNodeNumInt = localNodeNum ? parseInt(localNodeNum) : this.localNodeInfo?.nodeNum;
+      const localNode = localNodeNumInt ? databaseService.getNode(localNodeNumInt) : null;
+
+      const nodesToRemove: number[] = [];
+
+      for (const nodeNum of autoFavoriteNodes) {
+        const node = databaseService.getNode(nodeNum);
+        if (!node) {
+          nodesToRemove.push(nodeNum);
+          continue;
+        }
+
+        let shouldRemove = false;
+        let reason = '';
+
+        // Check staleness
+        if (node.lastHeard && node.lastHeard < staleThreshold) {
+          shouldRemove = true;
+          reason = `stale (not heard in ${staleHours}+ hours)`;
+        }
+
+        // Check hops changed
+        if (!shouldRemove && (node.hopsAway == null || node.hopsAway > 0)) {
+          shouldRemove = true;
+          reason = `no longer 0-hop (hopsAway=${node.hopsAway})`;
+        }
+
+        // Check role eligibility changed (for ROUTER/ROUTER_LATE local)
+        if (!shouldRemove && localNode) {
+          if (!isAutoFavoriteEligible(localNode.role, { ...node, isFavorite: false })) {
+            shouldRemove = true;
+            reason = 'no longer eligible (role changed)';
+          }
+        }
+
+        if (shouldRemove) {
+          nodesToRemove.push(nodeNum);
+          try {
+            databaseService.setNodeFavorite(nodeNum, false);
+            if (this.isConnected) {
+              await this.sendRemoveFavoriteNode(nodeNum);
+            }
+            const nodeId = node.nodeId || `!${nodeNum.toString(16).padStart(8, '0')}`;
+            logger.info(`☆ Auto-unfavorited node ${nodeId} (${node.longName || 'Unknown'}) - ${reason}`);
+          } catch (error) {
+            logger.warn(`⚠️ Failed to auto-unfavorite node ${nodeNum}:`, error);
+          }
+        }
+      }
+
+      // Update the tracking list
+      if (nodesToRemove.length > 0) {
+        const removeSet = new Set(nodesToRemove);
+        const remaining = autoFavoriteNodes.filter(n => !removeSet.has(n));
+        databaseService.setSetting('autoFavoriteNodes', JSON.stringify(remaining));
+        logger.info(`🧹 Auto-favorite sweep: removed ${nodesToRemove.length}, remaining ${remaining.length}`);
+      }
+    } catch (error) {
+      logger.error('❌ Error in auto-favorite sweep:', error);
+    } finally {
+      this.autoFavoriteSweepRunning = false;
     }
   }
 
@@ -10616,6 +10876,18 @@ class MeshtasticManager {
   }
 
   /**
+   * Force refresh of module configs (resets the cache flag and re-fetches).
+   * Useful for Configuration tab refresh button or API use.
+   */
+  async refreshModuleConfigs(): Promise<void> {
+    this.moduleConfigsEverFetched = false;
+    this.actualModuleConfig = null;
+    logger.info('📦 Force-refreshing module configs...');
+    await this.requestAllModuleConfigs();
+    this.moduleConfigsEverFetched = true;
+  }
+
+  /**
    * Send an admin command to a node (local or remote)
    * The admin message should already be built with session passkey if needed
    * @param adminMessagePayload The encoded admin message (should already include session passkey for remote nodes)
@@ -10832,6 +11104,22 @@ class MeshtasticManager {
 
         await this.transport.send(positionPacket);
         logger.debug('⚙️ Sent set_fixed_position admin message');
+
+        // Immediately update the local node's position in the database so it's correct
+        // before any stale position broadcast arrives from the device firmware.
+        if (this.localNodeInfo) {
+          const localNodeNum = this.localNodeInfo.nodeNum;
+          const localNodeId = `!${localNodeNum.toString(16).padStart(8, '0')}`;
+          databaseService.upsertNode({
+            nodeNum: localNodeNum,
+            nodeId: localNodeId,
+            latitude,
+            longitude,
+            altitude: altitude || 0,
+            positionTimestamp: Date.now(),
+          });
+          logger.info(`⚙️ Updated local node ${localNodeId} position in database: lat=${latitude}, lon=${longitude}`);
+        }
       }
 
       // Then send position configuration (fixedPosition flag, broadcast intervals, etc.)
@@ -10985,14 +11273,14 @@ class MeshtasticManager {
   /**
    * Set node owner (long name and short name)
    */
-  async setNodeOwner(longName: string, shortName: string, isUnmessagable?: boolean): Promise<void> {
+  async setNodeOwner(longName: string, shortName: string, isUnmessagable?: boolean, isLicensed?: boolean): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
 
     try {
-      logger.debug(`⚙️ Setting node owner: "${longName}" (${shortName}), isUnmessagable: ${isUnmessagable}`);
-      const setOwnerMsg = protobufService.createSetOwnerMessage(longName, shortName, isUnmessagable, new Uint8Array());
+      logger.debug(`⚙️ Setting node owner: "${longName}" (${shortName}), isUnmessagable: ${isUnmessagable}, isLicensed: ${isLicensed}`);
+      const setOwnerMsg = protobufService.createSetOwnerMessage(longName, shortName, isUnmessagable, new Uint8Array(), isLicensed);
       const adminPacket = protobufService.createAdminPacket(setOwnerMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
 
       await this.transport.send(adminPacket);

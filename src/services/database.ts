@@ -83,6 +83,7 @@ import { migration as showMeshCoreNodesMigration, runMigration074Postgres, runMi
 import { migration as telemetryPacketIdBigintMigration, runMigration075Postgres, runMigration075Mysql } from '../server/migrations/075_upgrade_telemetry_packetid_bigint.js';
 import { migration as accuracyEstimatedPrefsMigration, runMigration076Postgres, runMigration076Mysql } from '../server/migrations/076_add_accuracy_and_estimated_position_prefs.js';
 import { migration as ignoredNodesNodeNumBigintMigration, runMigration077Postgres, runMigration077Mysql } from '../server/migrations/077_upgrade_ignored_nodes_nodenum_bigint.js';
+import { migration as createEmbedProfilesMigration, runMigration078Postgres, runMigration078Mysql } from '../server/migrations/078_create_embed_profiles.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
 
 // Drizzle ORM imports for dual-database support
@@ -105,7 +106,9 @@ import {
   MiscRepository,
   ChannelDatabaseRepository,
   IgnoredNodesRepository,
+  EmbedProfileRepository,
 } from '../db/repositories/index.js';
+import type { EmbedProfile, EmbedProfileInput } from '../db/repositories/index.js';
 import type { DatabaseType } from '../db/types.js';
 import { packetLogPostgres, packetLogMysql, packetLogSqlite } from '../db/schema/packets.js';
 import { POSTGRES_SCHEMA_SQL, POSTGRES_TABLE_NAMES } from '../db/schema/postgres-create.js';
@@ -484,6 +487,7 @@ class DatabaseService {
   public miscRepo: MiscRepository | null = null;
   public channelDatabaseRepo: ChannelDatabaseRepository | null = null;
   public ignoredNodesRepo: IgnoredNodesRepository | null = null;
+  public embedProfileRepo: EmbedProfileRepository | null = null;
 
   constructor() {
     logger.debug('🔧🔧🔧 DatabaseService constructor called');
@@ -750,6 +754,7 @@ class DatabaseService {
       this.miscRepo = new MiscRepository(drizzleDb, this.drizzleDbType);
       this.channelDatabaseRepo = new ChannelDatabaseRepository(drizzleDb, this.drizzleDbType);
       this.ignoredNodesRepo = new IgnoredNodesRepository(drizzleDb, this.drizzleDbType);
+      this.embedProfileRepo = new EmbedProfileRepository(drizzleDb, this.drizzleDbType);
 
       logger.info('[DatabaseService] Drizzle repositories initialized successfully');
 
@@ -963,6 +968,7 @@ class DatabaseService {
     this.runTelemetryPacketIdBigintMigration();
     this.runAccuracyEstimatedPrefsMigration();
     this.runIgnoredNodesNodeNumBigintMigration();
+    this.runCreateEmbedProfilesMigration();
     this.ensureAutomationDefaults();
     this.warmupCaches();
     this.isInitialized = true;
@@ -2484,6 +2490,24 @@ class DatabaseService {
       logger.debug('ignored_nodes nodeNum bigint migration completed successfully');
     } catch (error) {
       logger.error('Failed to run ignored_nodes nodeNum bigint migration:', error);
+      throw error;
+    }
+  }
+
+  private runCreateEmbedProfilesMigration(): void {
+    const migrationKey = 'migration_078_create_embed_profiles';
+    try {
+      const migrationStatus = this.getSetting(migrationKey);
+      if (migrationStatus === 'completed') {
+        logger.debug('Migration 078 (create embed_profiles) already completed');
+        return;
+      }
+      logger.debug('Running migration 078: Create embed_profiles table...');
+      createEmbedProfilesMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('Create embed_profiles migration completed successfully');
+    } catch (error) {
+      logger.error('Failed to run create embed_profiles migration:', error);
       throw error;
     }
   }
@@ -4251,6 +4275,27 @@ class DatabaseService {
     return messages.map(message => this.normalizeBigInts(message));
   }
 
+  async searchMessagesAsync(options: {
+    query: string;
+    caseSensitive?: boolean;
+    scope?: 'all' | 'channels' | 'dms';
+    channels?: number[];
+    fromNodeId?: string;
+    startDate?: number;
+    endDate?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ messages: DbMessage[]; total: number }> {
+    if (this.messagesRepo) {
+      const result = await this.messagesRepo.searchMessages(options);
+      return {
+        messages: result.messages.map(msg => this.convertRepoMessage(msg)),
+        total: result.total,
+      };
+    }
+    return { messages: [], total: 0 };
+  }
+
   // Statistics
   getMessageCount(): number {
     // For PostgreSQL/MySQL, use cache
@@ -4330,46 +4375,6 @@ class DatabaseService {
     }
     // Fallback to sync for SQLite if repo not ready
     return this.getTelemetryCountByNode(nodeId, sinceTimestamp, beforeTimestamp, telemetryType);
-  }
-
-  /**
-   * Count distinct position packets for a node from the telemetry table.
-   */
-  async getPositionPacketCountByNodeAsync(nodeId: string, since?: number): Promise<number> {
-    if (this.telemetryRepo) {
-      return this.telemetryRepo.getPositionPacketCountByNode(nodeId, since);
-    }
-    return 0;
-  }
-
-  /**
-   * Count distinct non-position telemetry packets for a node from the telemetry table.
-   */
-  async getNonPositionTelemetryPacketCountByNodeAsync(nodeId: string, since?: number): Promise<number> {
-    if (this.telemetryRepo) {
-      return this.telemetryRepo.getNonPositionTelemetryPacketCountByNode(nodeId, since);
-    }
-    return 0;
-  }
-
-  /**
-   * Count messages sent from or to a specific node.
-   */
-  async getMessageCountByNodeAsync(nodeNum: number, since?: number): Promise<number> {
-    if (this.messagesRepo) {
-      return this.messagesRepo.getMessageCountByNode(nodeNum, since);
-    }
-    return 0;
-  }
-
-  /**
-   * Count traceroutes involving a specific node.
-   */
-  async getTracerouteCountByNodeAsync(nodeNum: number, since?: number): Promise<number> {
-    if (this.traceroutesRepo) {
-      return this.traceroutesRepo.getTracerouteCountByNode(nodeNum, since);
-    }
-    return 0;
   }
 
   /**
@@ -8393,6 +8398,27 @@ class DatabaseService {
     return !!row;
   }
 
+  // Embed profile operations
+  async getEmbedProfilesAsync(): Promise<EmbedProfile[]> {
+    return this.embedProfileRepo!.getAllAsync();
+  }
+
+  async getEmbedProfileByIdAsync(id: string): Promise<EmbedProfile | null> {
+    return this.embedProfileRepo!.getByIdAsync(id);
+  }
+
+  async createEmbedProfileAsync(input: EmbedProfileInput): Promise<EmbedProfile> {
+    return this.embedProfileRepo!.createAsync(input);
+  }
+
+  async updateEmbedProfileAsync(id: string, input: Partial<EmbedProfileInput>): Promise<EmbedProfile | null> {
+    return this.embedProfileRepo!.updateAsync(id, input);
+  }
+
+  async deleteEmbedProfileAsync(id: string): Promise<boolean> {
+    return this.embedProfileRepo!.deleteAsync(id);
+  }
+
   // Position override operations
   setNodePositionOverride(
     nodeNum: number,
@@ -10012,6 +10038,61 @@ class DatabaseService {
     return result || null;
   }
 
+  async getPacketLogByIdAsync(id: number): Promise<DbPacketLog | null> {
+    // For PostgreSQL, use pool.query with parameterized query
+    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+      try {
+        const result = await this.postgresPool.query(`
+          SELECT
+            pl.*,
+            from_nodes."longName" as "from_node_longName",
+            to_nodes."longName" as "to_node_longName"
+          FROM packet_log pl
+          LEFT JOIN nodes from_nodes ON pl.from_node = from_nodes."nodeNum"
+          LEFT JOIN nodes to_nodes ON pl.to_node = to_nodes."nodeNum"
+          WHERE pl.id = $1
+        `, [id]);
+        const row = result.rows?.[0];
+        if (!row) return null;
+        return {
+          ...row,
+          id: row.id != null ? Number(row.id) : row.id,
+          packet_id: row.packet_id != null ? Number(row.packet_id) : row.packet_id,
+          timestamp: row.timestamp != null ? Number(row.timestamp) : row.timestamp,
+          from_node: row.from_node != null ? Number(row.from_node) : row.from_node,
+          to_node: row.to_node != null ? Number(row.to_node) : row.to_node,
+          relay_node: row.relay_node != null ? Number(row.relay_node) : row.relay_node,
+          created_at: row.created_at != null ? Number(row.created_at) : row.created_at,
+        } as DbPacketLog;
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to get packet log by id:', error);
+        return null;
+      }
+    }
+    // For MySQL, use pool.query with parameterized query
+    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+      try {
+        const [rows] = await this.mysqlPool.query(`
+          SELECT
+            pl.*,
+            from_nodes.longName as from_node_longName,
+            to_nodes.longName as to_node_longName
+          FROM packet_log pl
+          LEFT JOIN nodes from_nodes ON pl.from_node = from_nodes.nodeNum
+          LEFT JOIN nodes to_nodes ON pl.to_node = to_nodes.nodeNum
+          WHERE pl.id = ?
+        `, [id]);
+        const row = (rows as any[])?.[0];
+        return row ? (row as DbPacketLog) : null;
+      } catch (error) {
+        logger.error('[DatabaseService] Failed to get packet log by id:', error);
+        return null;
+      }
+    }
+    // For SQLite, use sync method
+    return this.getPacketLogById(id);
+  }
+
   getPacketLogCount(options: {
     portnum?: number;
     from_node?: number;
@@ -10952,6 +11033,9 @@ class DatabaseService {
       // Run migration 077: Upgrade ignored_nodes.nodeNum to BIGINT
       await runMigration077Postgres(client);
 
+      // Run migration 078: Create embed_profiles table
+      await runMigration078Postgres(client);
+
       // Verify all expected tables exist
       const result = await client.query(`
         SELECT table_name FROM information_schema.tables
@@ -11094,6 +11178,9 @@ class DatabaseService {
 
       // Run migration 077: Upgrade ignored_nodes.nodeNum to BIGINT
       await runMigration077Mysql(pool);
+
+      // Run migration 078: Create embed_profiles table
+      await runMigration078Mysql(pool);
 
       // Verify all expected tables exist
       const [rows] = await connection.query(`

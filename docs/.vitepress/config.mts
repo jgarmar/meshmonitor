@@ -47,6 +47,8 @@ export default defineConfig({
             { text: 'Packet Monitor', link: '/features/packet-monitor' },
             { text: 'Channel Database', link: '/features/channel-database' },
             { text: 'Security', link: '/features/security' },
+            { text: 'Message Search', link: '/features/message-search' },
+            { text: 'Embed Maps', link: '/features/embed-maps' },
             { text: 'Link Quality & Smart Hops', link: '/features/link-quality' },
             { text: 'MeshCore (Experimental)', link: '/features/meshcore' },
             { text: '🌍 Translations', link: '/features/translations' },
@@ -168,6 +170,7 @@ export default defineConfig({
     '**/database/**',
     '**/api/**',
     '**/planning/**',
+    '**/plans/**',
     '**/operations/**',
     // Internal development documentation (available on GitHub)
     'ARCHITECTURE_LESSONS.md',

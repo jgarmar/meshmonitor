@@ -38,9 +38,10 @@ import { inactiveNodeNotificationService } from './services/inactiveNodeNotifica
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import { getUserNotificationPreferencesAsync, saveUserNotificationPreferencesAsync, applyNodeNamePrefix } from './utils/notificationFiltering.js';
 import { upgradeService } from './services/upgradeService.js';
-import { enhanceNodeForClient, filterNodesByChannelPermission } from './utils/nodeEnhancer.js';
+import { enhanceNodeForClient, filterNodesByChannelPermission, checkNodeChannelAccess } from './utils/nodeEnhancer.js';
 import { dynamicCspMiddleware, refreshTileHostnameCache } from './middleware/dynamicCsp.js';
 import { PortNum } from './constants/meshtastic.js';
+import settingsRoutes, { setSettingsCallbacks } from './routes/settingsRoutes.js';
 
 const require = createRequire(import.meta.url);
 const packageJson = require('../../package.json');
@@ -195,6 +196,31 @@ const getAllowedOrigins = () => {
   return origins.length > 0 ? origins : ['http://localhost:3000'];
 };
 
+// Embed origin cache (refreshes every 60 seconds)
+let embedOriginsCache: string[] = [];
+let embedOriginsCacheTime = 0;
+const EMBED_ORIGINS_CACHE_TTL = 60000;
+
+function refreshEmbedOriginsCache(): void {
+  databaseService.getEmbedProfilesAsync().then(profiles => {
+    embedOriginsCache = [...new Set(
+      profiles.filter(p => p.enabled).flatMap(p => p.allowedOrigins)
+    )];
+    embedOriginsCacheTime = Date.now();
+  }).catch(() => {
+    // On error, keep stale cache
+  });
+}
+
+function getEmbedAllowedOrigins(): string[] {
+  if (Date.now() - embedOriginsCacheTime < EMBED_ORIGINS_CACHE_TTL) {
+    return embedOriginsCache;
+  }
+  // Fire async lookup, use stale cache until it resolves
+  refreshEmbedOriginsCache();
+  return embedOriginsCache;
+}
+
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -204,11 +230,17 @@ app.use(
       if (!origin) return callback(null, true);
 
       if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-        callback(null, true);
-      } else {
-        logger.warn(`CORS request blocked from origin: ${origin}`);
-        callback(new Error('Not allowed by CORS'));
+        return callback(null, true);
       }
+
+      // Check embed profile origins
+      const embedOrigins = getEmbedAllowedOrigins();
+      if (embedOrigins.includes(origin) || embedOrigins.includes('*')) {
+        return callback(null, true);
+      }
+
+      logger.warn(`CORS request blocked from origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
     },
     credentials: true,
     optionsSuccessStatus: 200,
@@ -399,6 +431,18 @@ setTimeout(async () => {
         meshtasticManager.setRemoteAdminScannerInterval(intervalMinutes);
         logger.debug(
           `✅ Loaded saved remote admin scanner interval: ${intervalMinutes} minutes${intervalMinutes === 0 ? ' (disabled)' : ''}`
+        );
+      }
+    }
+
+    // Load LocalStats collection interval
+    const localStatsInterval = databaseService.getSetting('localStatsIntervalMinutes');
+    if (localStatsInterval !== null) {
+      const intervalMinutes = parseInt(localStatsInterval);
+      if (!isNaN(intervalMinutes) && intervalMinutes >= 0 && intervalMinutes <= 60) {
+        meshtasticManager.setLocalStatsInterval(intervalMinutes);
+        logger.debug(
+          `✅ Loaded saved LocalStats interval: ${intervalMinutes} minutes${intervalMinutes === 0 ? ' (disabled)' : ''}`
         );
       }
     }
@@ -642,6 +686,9 @@ import newsRoutes from './routes/newsRoutes.js';
 import tileServerRoutes from './routes/tileServerTest.js';
 import v1Router from './routes/v1/index.js';
 import meshcoreRoutes from './routes/meshcoreRoutes.js';
+import embedProfileRoutes from './routes/embedProfileRoutes.js';
+import { createEmbedCspMiddleware } from './middleware/embedMiddleware.js';
+import embedPublicRoutes from './routes/embedPublicRoutes.js';
 
 // CSRF token endpoint (must be before CSRF protection middleware)
 apiRouter.get('/csrf-token', csrfTokenEndpoint);
@@ -735,6 +782,28 @@ apiRouter.use('/', scriptContentRoutes);
 // Tile server testing routes (for Custom Tileset Manager autodetect)
 apiRouter.use('/tile-server', optionalAuth(), tileServerRoutes);
 
+// Settings routes (GET/POST/DELETE /settings)
+apiRouter.use('/settings', settingsRoutes);
+
+// Embed profile admin routes (admin only)
+apiRouter.use('/embed-profiles', embedProfileRoutes);
+
+// Wire up side-effect callbacks for settingsRoutes
+setSettingsCallbacks({
+  refreshTileHostnameCache,
+  setTracerouteInterval: (interval) => meshtasticManager.setTracerouteInterval(interval),
+  setRemoteAdminScannerInterval: (interval) => meshtasticManager.setRemoteAdminScannerInterval(interval),
+  setLocalStatsInterval: (interval) => meshtasticManager.setLocalStatsInterval(interval),
+  setKeyRepairSettings: (settings) => meshtasticManager.setKeyRepairSettings(settings),
+  restartInactiveNodeService: (threshold, check, cooldown) =>
+    inactiveNodeNotificationService.start(threshold, check, cooldown),
+  stopInactiveNodeService: () => inactiveNodeNotificationService.stop(),
+  restartAnnounceScheduler: () => meshtasticManager.restartAnnounceScheduler(),
+  restartTimerScheduler: () => meshtasticManager.restartTimerScheduler(),
+  restartGeofenceEngine: () => meshtasticManager.restartGeofenceEngine(),
+  handleAutoWelcomeEnabled: () => databaseService.handleAutoWelcomeEnabled(),
+});
+
 // API Routes
 /**
  * GET /api/nodes
@@ -795,6 +864,11 @@ apiRouter.get('/nodes/active', optionalAuth(), async (req, res) => {
 apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res) => {
   try {
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
 
     // Allow hours parameter for future use, but default to fetching ALL position history
     // This ensures we capture movement that may have happened long ago
@@ -864,6 +938,12 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
 apiRouter.get('/nodes/:nodeId/positions', optionalAuth(), async (req, res) => {
   try {
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
     const limit = req.query.limit ? parseInt(req.query.limit as string) : 2000;
 
     // Get only position-related telemetry (lat/lon/alt) for the node
@@ -946,6 +1026,16 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
 
     // Update favorite status in database
     databaseService.setNodeFavorite(nodeNum, isFavorite);
+
+    // If manually unfavoriting, remove from auto-favorite tracking list
+    if (!isFavorite) {
+      const autoFavoriteNodesJson = databaseService.getSetting('autoFavoriteNodes') || '[]';
+      const autoFavoriteNodes: number[] = JSON.parse(autoFavoriteNodesJson);
+      if (autoFavoriteNodes.includes(nodeNum)) {
+        const updated = autoFavoriteNodes.filter(n => n !== nodeNum);
+        databaseService.setSetting('autoFavoriteNodes', JSON.stringify(updated));
+      }
+    }
 
     // Broadcast updated NodeInfo to virtual node clients
     const virtualNodeServer = (global as any).virtualNodeServer;
@@ -1046,6 +1136,52 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
     logger.error('Error setting node favorite:', error);
     const errorResponse: ApiErrorResponse = {
       error: 'Failed to set node favorite',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Get auto-favorite status (local role, firmware, managed nodes)
+apiRouter.get('/auto-favorite/status', requirePermission('nodes', 'read'), (_req, res) => {
+  try {
+    const localNodeNum = databaseService.getSetting('localNodeNum');
+    const localNodeNumInt = localNodeNum ? parseInt(localNodeNum) : meshtasticManager.getLocalNodeInfo()?.nodeNum;
+    const localNode = localNodeNumInt ? databaseService.getNode(localNodeNumInt) : null;
+    const firmwareVersion = meshtasticManager.getLocalNodeInfo()?.firmwareVersion || null;
+    const supportsFavorites = meshtasticManager.supportsFavorites();
+
+    const autoFavoriteNodesJson = databaseService.getSetting('autoFavoriteNodes') || '[]';
+    const autoFavoriteNodeNums: number[] = JSON.parse(autoFavoriteNodesJson);
+
+    // Get node details for each auto-favorited node
+    const autoFavoriteNodes = autoFavoriteNodeNums
+      .map(nodeNum => {
+        const node = databaseService.getNode(nodeNum);
+        if (!node) return null;
+        return {
+          nodeNum: node.nodeNum,
+          nodeId: node.nodeId,
+          longName: node.longName,
+          shortName: node.shortName,
+          role: node.role,
+          hopsAway: node.hopsAway,
+          lastHeard: node.lastHeard,
+        };
+      })
+      .filter(Boolean);
+
+    res.json({
+      localNodeRole: localNode?.role ?? null,
+      firmwareVersion,
+      supportsFavorites,
+      autoFavoriteNodes,
+    });
+  } catch (error) {
+    logger.error('Error fetching auto-favorite status:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to fetch auto-favorite status',
       code: 'INTERNAL_ERROR',
       details: error instanceof Error ? error.message : 'Unknown error occurred',
     };
@@ -1257,6 +1393,11 @@ apiRouter.delete('/ignored-nodes/:nodeId', requirePermission('nodes', 'write'), 
 apiRouter.get('/nodes/:nodeId/position-override', optionalAuth(), async (req, res) => {
   try {
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
 
     // Convert nodeId (hex string like !a1b2c3d4) to nodeNum (integer)
     const nodeNumStr = nodeId.replace('!', '');
@@ -2704,7 +2845,10 @@ apiRouter.post('/position/request', requirePermission('messages', 'write'), asyn
 
     // Look up the node to get its channel
     const node = databaseService.getNode(destinationNum);
-    const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
+    // Use explicit channel from request if provided and valid (0-7), otherwise fall back to node's stored channel
+    const channel = (typeof req.body.channel === 'number' && req.body.channel >= 0 && req.body.channel <= 7)
+      ? req.body.channel
+      : (node?.channel ?? 0);
 
     const { packetId, requestId } = await meshtasticManager.sendPositionRequest(destinationNum, channel);
 
@@ -3176,6 +3320,11 @@ apiRouter.get('/telemetry/:nodeId', optionalAuth(), async (req, res) => {
     }
 
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
     const hoursParam = req.query.hours ? parseInt(req.query.hours as string) : 24;
 
     // Calculate cutoff timestamp for filtering
@@ -3233,6 +3382,11 @@ apiRouter.get('/telemetry/:nodeId/rates', optionalAuth(), async (req, res) => {
     }
 
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
     const hoursParam = req.query.hours ? parseInt(req.query.hours as string) : 24;
 
     // Calculate cutoff timestamp for filtering
@@ -3310,6 +3464,11 @@ apiRouter.get('/telemetry/:nodeId/smarthops', optionalAuth(), async (req, res) =
     }
 
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
     // Validate and clamp hours (1-168, default 24)
     const hoursParam = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
     // Validate and clamp interval (5-60 minutes, default 15)
@@ -3341,6 +3500,11 @@ apiRouter.get('/telemetry/:nodeId/linkquality', optionalAuth(), async (req, res)
     }
 
     const { nodeId } = req.params;
+
+    // Check channel-based access for this node
+    if (!await checkNodeChannelAccess(nodeId, req.user)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
     // Validate and clamp hours (1-168, default 24)
     const hoursParam = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
 
@@ -4795,662 +4959,7 @@ apiRouter.get('/settings/key-repair-log', requirePermission('settings', 'read'),
   }
 });
 
-// Helper functions for tile URL validation
-function validateTileUrl(url: string): boolean {
-  // Must contain {z}, {x}, {y} placeholders
-  if (!url.includes('{z}') || !url.includes('{x}') || !url.includes('{y}')) {
-    return false;
-  }
-
-  // Basic URL validation - replace placeholders with test values
-  try {
-    const testUrl = url.replace(/{z}/g, '0').replace(/{x}/g, '0').replace(/{y}/g, '0').replace(/{s}/g, 'a');
-
-    const parsedUrl = new URL(testUrl);
-
-    // Only allow http and https protocols
-    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-      return false;
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function validateCustomTilesets(tilesets: any[]): boolean {
-  if (!Array.isArray(tilesets)) {
-    return false;
-  }
-
-  for (const tileset of tilesets) {
-    // Check required fields exist and have correct types
-    if (
-      typeof tileset.id !== 'string' ||
-      typeof tileset.name !== 'string' ||
-      typeof tileset.url !== 'string' ||
-      typeof tileset.attribution !== 'string' ||
-      typeof tileset.maxZoom !== 'number' ||
-      typeof tileset.description !== 'string' ||
-      typeof tileset.createdAt !== 'number' ||
-      typeof tileset.updatedAt !== 'number'
-    ) {
-      return false;
-    }
-
-    // Validate ID format (must start with 'custom-')
-    if (!tileset.id.startsWith('custom-')) {
-      return false;
-    }
-
-    // Validate string lengths
-    if (
-      tileset.name.length > 100 ||
-      tileset.url.length > 500 ||
-      tileset.attribution.length > 200 ||
-      tileset.description.length > 200
-    ) {
-      return false;
-    }
-
-    // Validate maxZoom range
-    if (tileset.maxZoom < 1 || tileset.maxZoom > 22) {
-      return false;
-    }
-
-    // Validate tile URL format
-    if (!validateTileUrl(tileset.url)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-// Get all settings
-apiRouter.get('/settings', optionalAuth(), (_req, res) => {
-  try {
-    // Allow all users (including anonymous) to read settings
-    // Settings contain UI preferences (temperature unit, map tileset, etc.) that all users need
-    const settings = databaseService.getAllSettings();
-    res.json(settings);
-  } catch (error) {
-    logger.error('Error fetching settings:', error);
-    res.status(500).json({ error: 'Failed to fetch settings' });
-  }
-});
-
-// Save settings
-apiRouter.post('/settings', requirePermission('settings', 'write'), (req, res) => {
-  try {
-    const settings = req.body;
-
-    // Get current settings for before/after comparison
-    const currentSettings = databaseService.getAllSettings();
-
-    // Validate settings
-    const validKeys = [
-      'maxNodeAgeHours',
-      'tracerouteIntervalMinutes',
-      'temperatureUnit',
-      'distanceUnit',
-      'positionHistoryLineStyle',
-      'telemetryVisualizationHours',
-      'telemetryFavorites',
-      'telemetryCustomOrder',
-      'dashboardWidgets',
-      'dashboardSolarVisibility',
-      'autoAckEnabled',
-      'autoAckRegex',
-      'autoAckMessage',
-      'autoAckMessageDirect',
-      'autoAckChannels',
-      'autoAckDirectMessages',
-      'autoAckUseDM',
-      'autoAckSkipIncompleteNodes',
-      'autoAckTapbackEnabled',
-      'autoAckReplyEnabled',
-      'autoAckDirectEnabled',
-      'autoAckDirectTapbackEnabled',
-      'autoAckDirectReplyEnabled',
-      'autoAckMultihopEnabled',
-      'autoAckMultihopTapbackEnabled',
-      'autoAckMultihopReplyEnabled',
-      'autoAckTestMessages',
-      'customTapbackEmojis',
-      'autoAnnounceEnabled',
-      'autoAnnounceIntervalHours',
-      'autoAnnounceMessage',
-      'autoAnnounceChannelIndex',
-      'autoAnnounceOnStart',
-      'autoAnnounceUseSchedule',
-      'autoAnnounceSchedule',
-      'autoAnnounceNodeInfoEnabled',
-      'autoAnnounceNodeInfoChannels',
-      'autoAnnounceNodeInfoDelaySeconds',
-      'autoWelcomeEnabled',
-      'autoWelcomeMessage',
-      'autoWelcomeTarget',
-      'autoWelcomeWaitForName',
-      'autoWelcomeMaxHops',
-      'autoResponderEnabled',
-      'autoResponderTriggers',
-      'autoResponderSkipIncompleteNodes',
-      'timerTriggers',
-      'preferredSortField',
-      'preferredSortDirection',
-      'preferredDashboardSortOption',
-      'timeFormat',
-      'dateFormat',
-      'mapTileset',
-      'packet_log_enabled',
-      'packet_log_max_count',
-      'packet_log_max_age_hours',
-      'solarMonitoringEnabled',
-      'solarMonitoringLatitude',
-      'solarMonitoringLongitude',
-      'solarMonitoringAzimuth',
-      'solarMonitoringDeclination',
-      'mapPinStyle',
-      'favoriteTelemetryStorageDays',
-      'theme',
-      'customTilesets',
-      'hideIncompleteNodes',
-      'inactiveNodeThresholdHours',
-      'inactiveNodeCheckIntervalMinutes',
-      'inactiveNodeCooldownHours',
-      'autoUpgradeImmediate',
-      'maintenanceEnabled',
-      'maintenanceTime',
-      'messageRetentionDays',
-      'tracerouteRetentionDays',
-      'routeSegmentRetentionDays',
-      'neighborInfoRetentionDays',
-      'autoKeyManagementEnabled',
-      'autoKeyManagementIntervalMinutes',
-      'autoKeyManagementMaxExchanges',
-      'autoKeyManagementAutoPurge',
-      'remoteAdminScannerIntervalMinutes',
-      'remoteAdminScannerExpirationHours',
-      'tracerouteScheduleEnabled',
-      'tracerouteScheduleStart',
-      'tracerouteScheduleEnd',
-      'remoteAdminScheduleEnabled',
-      'remoteAdminScheduleStart',
-      'remoteAdminScheduleEnd',
-      'geofenceTriggers',
-      'autoPingEnabled',
-      'autoPingIntervalSeconds',
-      'autoPingMaxPings',
-      'autoPingTimeoutSeconds',
-    ];
-    const filteredSettings: Record<string, string> = {};
-
-    for (const key of validKeys) {
-      if (key in settings) {
-        filteredSettings[key] = String(settings[key]);
-      }
-    }
-
-    // Validate autoAckRegex pattern
-    if ('autoAckRegex' in filteredSettings) {
-      const pattern = filteredSettings.autoAckRegex;
-
-      // Check length
-      if (pattern.length > 100) {
-        return res.status(400).json({ error: 'Regex pattern too long (max 100 characters)' });
-      }
-
-      // Check for potentially dangerous patterns
-      if (/(\.\*){2,}|(\+.*\+)|(\*.*\*)|(\{[0-9]{3,}\})|(\{[0-9]+,\})/.test(pattern)) {
-        return res.status(400).json({ error: 'Regex pattern too complex or may cause performance issues' });
-      }
-
-      // Try to compile
-      try {
-        new RegExp(pattern, 'i');
-      } catch (error) {
-        return res.status(400).json({ error: 'Invalid regex syntax' });
-      }
-    }
-
-    // Validate autoAckChannels (channel indices must be 0-7)
-    if ('autoAckChannels' in filteredSettings) {
-      const channelList = filteredSettings.autoAckChannels.split(',');
-      const validChannels = channelList.map(c => parseInt(c.trim())).filter(n => !isNaN(n) && n >= 0 && n < 8); // Max 8 channels in Meshtastic
-
-      filteredSettings.autoAckChannels = validChannels.join(',');
-    }
-
-    // Validate inactive node notification settings
-    if ('inactiveNodeThresholdHours' in filteredSettings) {
-      const threshold = parseInt(filteredSettings.inactiveNodeThresholdHours, 10);
-      if (isNaN(threshold) || threshold < 1 || threshold > 720) {
-        return res.status(400).json({ error: 'inactiveNodeThresholdHours must be between 1 and 720 hours' });
-      }
-    }
-
-    if ('inactiveNodeCheckIntervalMinutes' in filteredSettings) {
-      const interval = parseInt(filteredSettings.inactiveNodeCheckIntervalMinutes, 10);
-      if (isNaN(interval) || interval < 1 || interval > 1440) {
-        return res.status(400).json({ error: 'inactiveNodeCheckIntervalMinutes must be between 1 and 1440 minutes' });
-      }
-    }
-
-    if ('inactiveNodeCooldownHours' in filteredSettings) {
-      const cooldown = parseInt(filteredSettings.inactiveNodeCooldownHours, 10);
-      if (isNaN(cooldown) || cooldown < 1 || cooldown > 720) {
-        return res.status(400).json({ error: 'inactiveNodeCooldownHours must be between 1 and 720 hours' });
-      }
-    }
-
-    // Validate autoResponderTriggers JSON
-    if ('autoResponderTriggers' in filteredSettings) {
-      try {
-        const triggers = JSON.parse(filteredSettings.autoResponderTriggers);
-
-        // Validate that it's an array
-        if (!Array.isArray(triggers)) {
-          return res.status(400).json({ error: 'autoResponderTriggers must be an array' });
-        }
-
-        // Validate each trigger
-        for (const trigger of triggers) {
-          if (!trigger.id || !trigger.trigger || !trigger.responseType || !trigger.response) {
-            return res
-              .status(400)
-              .json({ error: 'Each trigger must have id, trigger, responseType, and response fields' });
-          }
-
-          // Validate trigger is string or non-empty array
-          if (Array.isArray(trigger.trigger) && trigger.trigger.length === 0) {
-            return res.status(400).json({ error: 'Trigger array cannot be empty' });
-          }
-          if (!Array.isArray(trigger.trigger) && typeof trigger.trigger !== 'string') {
-            return res.status(400).json({ error: 'Trigger must be a string or array of strings' });
-          }
-
-          if (trigger.responseType !== 'text' && trigger.responseType !== 'http' && trigger.responseType !== 'script') {
-            return res.status(400).json({ error: 'responseType must be "text", "http", or "script"' });
-          }
-
-          // Validate script paths
-          if (trigger.responseType === 'script') {
-            if (!trigger.response.startsWith('/data/scripts/')) {
-              return res.status(400).json({ error: 'Script path must start with /data/scripts/' });
-            }
-            if (trigger.response.includes('..')) {
-              return res.status(400).json({ error: 'Script path cannot contain ..' });
-            }
-            const ext = trigger.response.split('.').pop()?.toLowerCase();
-            if (!ext || !['js', 'mjs', 'py', 'sh'].includes(ext)) {
-              return res.status(400).json({ error: 'Script must have .js, .mjs, .py, or .sh extension' });
-            }
-          }
-        }
-      } catch (error) {
-        return res.status(400).json({ error: 'Invalid JSON format for autoResponderTriggers' });
-      }
-    }
-
-    // Validate timerTriggers JSON
-    if ('timerTriggers' in filteredSettings) {
-      try {
-        const triggers = JSON.parse(filteredSettings.timerTriggers);
-
-        // Validate that it's an array
-        if (!Array.isArray(triggers)) {
-          return res.status(400).json({ error: 'timerTriggers must be an array' });
-        }
-
-        // Validate each timer trigger
-        for (const trigger of triggers) {
-          // Basic required fields
-          if (!trigger.id || !trigger.name || !trigger.cronExpression) {
-            return res
-              .status(400)
-              .json({ error: 'Each timer trigger must have id, name, and cronExpression fields' });
-          }
-
-          // Validate response type (default to 'script' for backward compatibility)
-          const responseType = trigger.responseType || 'script';
-          if (responseType !== 'script' && responseType !== 'text') {
-            return res.status(400).json({ error: 'responseType must be "script" or "text"' });
-          }
-
-          // Validate based on response type
-          if (responseType === 'script') {
-            if (!trigger.scriptPath) {
-              return res.status(400).json({ error: 'Script timer triggers must have a scriptPath' });
-            }
-            // Validate script paths
-            if (!trigger.scriptPath.startsWith('/data/scripts/')) {
-              return res.status(400).json({ error: 'Timer script path must start with /data/scripts/' });
-            }
-            if (trigger.scriptPath.includes('..')) {
-              return res.status(400).json({ error: 'Timer script path cannot contain ..' });
-            }
-            const ext = trigger.scriptPath.split('.').pop()?.toLowerCase();
-            if (!ext || !['js', 'mjs', 'py', 'sh'].includes(ext)) {
-              return res.status(400).json({ error: 'Timer script must have .js, .mjs, .py, or .sh extension' });
-            }
-          } else if (responseType === 'text') {
-            if (!trigger.response || typeof trigger.response !== 'string' || trigger.response.trim().length === 0) {
-              return res.status(400).json({ error: 'Text timer triggers must have a non-empty response message' });
-            }
-          }
-
-          // Validate cron expression format (basic validation - detailed validation happens in scheduler)
-          if (typeof trigger.cronExpression !== 'string' || trigger.cronExpression.trim().length === 0) {
-            return res.status(400).json({ error: 'cronExpression must be a non-empty string' });
-          }
-
-          // Validate enabled is boolean
-          if (trigger.enabled !== undefined && typeof trigger.enabled !== 'boolean') {
-            return res.status(400).json({ error: 'enabled must be a boolean' });
-          }
-        }
-      } catch (error) {
-        return res.status(400).json({ error: 'Invalid JSON format for timerTriggers' });
-      }
-    }
-
-    // Validate geofenceTriggers JSON
-    if ('geofenceTriggers' in filteredSettings) {
-      try {
-        const triggers = JSON.parse(filteredSettings.geofenceTriggers);
-
-        if (!Array.isArray(triggers)) {
-          return res.status(400).json({ error: 'geofenceTriggers must be an array' });
-        }
-
-        for (const trigger of triggers) {
-          // Required fields
-          if (!trigger.id || !trigger.name || !trigger.shape || !trigger.event || !trigger.responseType || trigger.channel === undefined) {
-            return res.status(400).json({ error: 'Each geofence trigger must have id, name, shape, event, responseType, and channel fields' });
-          }
-
-          // Validate enabled is boolean
-          if (trigger.enabled !== undefined && typeof trigger.enabled !== 'boolean') {
-            return res.status(400).json({ error: 'enabled must be a boolean' });
-          }
-
-          // Validate shape
-          if (trigger.shape.type === 'circle') {
-            if (!trigger.shape.center || typeof trigger.shape.center.lat !== 'number' || typeof trigger.shape.center.lng !== 'number') {
-              return res.status(400).json({ error: 'Circle geofence must have a center with lat and lng' });
-            }
-            if (trigger.shape.center.lat < -90 || trigger.shape.center.lat > 90) {
-              return res.status(400).json({ error: 'Circle center latitude must be between -90 and 90' });
-            }
-            if (trigger.shape.center.lng < -180 || trigger.shape.center.lng > 180) {
-              return res.status(400).json({ error: 'Circle center longitude must be between -180 and 180' });
-            }
-            if (typeof trigger.shape.radiusKm !== 'number' || trigger.shape.radiusKm <= 0) {
-              return res.status(400).json({ error: 'Circle geofence must have a positive radiusKm' });
-            }
-          } else if (trigger.shape.type === 'polygon') {
-            if (!Array.isArray(trigger.shape.vertices) || trigger.shape.vertices.length < 3) {
-              return res.status(400).json({ error: 'Polygon geofence must have at least 3 vertices' });
-            }
-            for (const v of trigger.shape.vertices) {
-              if (typeof v.lat !== 'number' || typeof v.lng !== 'number') {
-                return res.status(400).json({ error: 'Each polygon vertex must have numeric lat and lng' });
-              }
-              if (v.lat < -90 || v.lat > 90 || v.lng < -180 || v.lng > 180) {
-                return res.status(400).json({ error: 'Polygon vertex coordinates out of range' });
-              }
-            }
-          } else {
-            return res.status(400).json({ error: 'Shape type must be "circle" or "polygon"' });
-          }
-
-          // Validate event
-          if (!['entry', 'exit', 'while_inside'].includes(trigger.event)) {
-            return res.status(400).json({ error: 'event must be "entry", "exit", or "while_inside"' });
-          }
-
-          // Validate whileInsideIntervalMinutes
-          if (trigger.event === 'while_inside') {
-            if (typeof trigger.whileInsideIntervalMinutes !== 'number' || trigger.whileInsideIntervalMinutes < 1) {
-              return res.status(400).json({ error: 'whileInsideIntervalMinutes must be >= 1 when event is "while_inside"' });
-            }
-          }
-
-          // Validate responseType and response/scriptPath
-          if (trigger.responseType !== 'text' && trigger.responseType !== 'script') {
-            return res.status(400).json({ error: 'Geofence responseType must be "text" or "script"' });
-          }
-
-          if (trigger.responseType === 'text') {
-            if (!trigger.response || typeof trigger.response !== 'string' || trigger.response.trim().length === 0) {
-              return res.status(400).json({ error: 'Text geofence triggers must have a non-empty response message' });
-            }
-          } else if (trigger.responseType === 'script') {
-            if (!trigger.scriptPath) {
-              return res.status(400).json({ error: 'Script geofence triggers must have a scriptPath' });
-            }
-            if (!trigger.scriptPath.startsWith('/data/scripts/')) {
-              return res.status(400).json({ error: 'Geofence script path must start with /data/scripts/' });
-            }
-            if (trigger.scriptPath.includes('..')) {
-              return res.status(400).json({ error: 'Geofence script path cannot contain ..' });
-            }
-            const ext = trigger.scriptPath.split('.').pop()?.toLowerCase();
-            if (!ext || !['js', 'mjs', 'py', 'sh'].includes(ext)) {
-              return res.status(400).json({ error: 'Geofence script must have .js, .mjs, .py, or .sh extension' });
-            }
-          }
-
-          // Validate channel ('dm', 'none', or number 0-7)
-          if (trigger.channel !== 'dm' && trigger.channel !== 'none' && (typeof trigger.channel !== 'number' || trigger.channel < 0 || trigger.channel > 7)) {
-            return res.status(400).json({ error: 'Geofence channel must be "dm", "none", or a number between 0 and 7' });
-          }
-
-          // Validate nodeFilter
-          if (trigger.nodeFilter) {
-            if (trigger.nodeFilter.type !== 'all' && trigger.nodeFilter.type !== 'selected') {
-              return res.status(400).json({ error: 'nodeFilter type must be "all" or "selected"' });
-            }
-            if (trigger.nodeFilter.type === 'selected') {
-              if (!Array.isArray(trigger.nodeFilter.nodeNums) || trigger.nodeFilter.nodeNums.length === 0) {
-                return res.status(400).json({ error: 'Selected node filter must include at least one node number' });
-              }
-            }
-          }
-        }
-      } catch (error) {
-        return res.status(400).json({ error: 'Invalid JSON format for geofenceTriggers' });
-      }
-    }
-
-    // Validate customTilesets JSON
-    if ('customTilesets' in filteredSettings) {
-      try {
-        const tilesets = JSON.parse(filteredSettings.customTilesets);
-
-        // Validate that it's an array
-        if (!Array.isArray(tilesets)) {
-          return res.status(400).json({ error: 'customTilesets must be an array' });
-        }
-
-        // Validate array length (max 50 custom tilesets)
-        if (tilesets.length > 50) {
-          return res.status(400).json({ error: 'Maximum 50 custom tilesets allowed' });
-        }
-
-        // Validate each tileset
-        if (!validateCustomTilesets(tilesets)) {
-          return res
-            .status(400)
-            .json({ error: 'Invalid custom tileset configuration. Check field types, lengths, and URL format.' });
-        }
-      } catch (error) {
-        return res.status(400).json({ error: 'Invalid JSON format for customTilesets' });
-      }
-    }
-
-    // Save to database
-    databaseService.setSettings(filteredSettings);
-
-    // Refresh CSP cache if custom tilesets were updated
-    if ('customTilesets' in filteredSettings) {
-      refreshTileHostnameCache();
-      logger.debug('🗺️ Refreshed CSP tile hostname cache after customTilesets update');
-    }
-
-    // Handle auto-welcome being enabled for the first time
-    if ('autoWelcomeEnabled' in filteredSettings) {
-      // Check if the setting changed from disabled (not 'true') to enabled ('true')
-      const wasEnabled = currentSettings['autoWelcomeEnabled'] === 'true';
-      const nowEnabled = filteredSettings['autoWelcomeEnabled'] === 'true';
-      
-      // If changing from disabled to enabled, mark existing nodes as welcomed
-      // This prevents a "thundering herd" of welcome messages when the feature is first enabled
-      if (!wasEnabled && nowEnabled) {
-        logger.info('👋 Auto-welcome being enabled - marking existing nodes as welcomed...');
-        const markedCount = databaseService.handleAutoWelcomeEnabled();
-        if (markedCount > 0) {
-          logger.info(`✅ Marked ${markedCount} existing node(s) as welcomed to prevent spam`);
-        }
-      }
-    }
-
-    // Apply traceroute interval if changed
-    if ('tracerouteIntervalMinutes' in filteredSettings) {
-      const interval = parseInt(filteredSettings.tracerouteIntervalMinutes);
-      if (!isNaN(interval) && interval >= 0 && interval <= 60) {
-        meshtasticManager.setTracerouteInterval(interval);
-      }
-    }
-
-    // Apply remote admin scanner interval if changed
-    if ('remoteAdminScannerIntervalMinutes' in filteredSettings) {
-      const interval = parseInt(filteredSettings.remoteAdminScannerIntervalMinutes);
-      if (!isNaN(interval) && interval >= 0 && interval <= 60) {
-        meshtasticManager.setRemoteAdminScannerInterval(interval);
-      }
-    }
-
-    // Apply auto key repair settings if changed
-    const keyRepairSettings = [
-      'autoKeyManagementEnabled',
-      'autoKeyManagementIntervalMinutes',
-      'autoKeyManagementMaxExchanges',
-      'autoKeyManagementAutoPurge',
-    ];
-    const keyRepairSettingsChanged = keyRepairSettings.some(key => key in filteredSettings);
-    if (keyRepairSettingsChanged) {
-      meshtasticManager.setKeyRepairSettings({
-        enabled: filteredSettings.autoKeyManagementEnabled === 'true' ||
-          (filteredSettings.autoKeyManagementEnabled === undefined &&
-           databaseService.getSetting('autoKeyManagementEnabled') === 'true'),
-        intervalMinutes: parseInt(
-          filteredSettings.autoKeyManagementIntervalMinutes ||
-          databaseService.getSetting('autoKeyManagementIntervalMinutes') || '5'
-        ),
-        maxExchanges: parseInt(
-          filteredSettings.autoKeyManagementMaxExchanges ||
-          databaseService.getSetting('autoKeyManagementMaxExchanges') || '3'
-        ),
-        autoPurge: filteredSettings.autoKeyManagementAutoPurge === 'true' ||
-          (filteredSettings.autoKeyManagementAutoPurge === undefined &&
-           databaseService.getSetting('autoKeyManagementAutoPurge') === 'true'),
-      });
-      logger.info('✅ Auto key repair settings updated');
-    }
-
-    // Restart inactive node notification service if any inactive node settings changed
-    const inactiveNodeSettings = [
-      'inactiveNodeThresholdHours',
-      'inactiveNodeCheckIntervalMinutes',
-      'inactiveNodeCooldownHours',
-    ];
-    const inactiveNodeSettingsChanged = inactiveNodeSettings.some(key => key in filteredSettings);
-    if (inactiveNodeSettingsChanged) {
-      const threshold = parseInt(
-        filteredSettings.inactiveNodeThresholdHours || databaseService.getSetting('inactiveNodeThresholdHours') || '24',
-        10
-      );
-      const checkInterval = parseInt(
-        filteredSettings.inactiveNodeCheckIntervalMinutes ||
-          databaseService.getSetting('inactiveNodeCheckIntervalMinutes') ||
-          '60',
-        10
-      );
-      const cooldown = parseInt(
-        filteredSettings.inactiveNodeCooldownHours || databaseService.getSetting('inactiveNodeCooldownHours') || '24',
-        10
-      );
-
-      if (
-        !isNaN(threshold) &&
-        threshold > 0 &&
-        !isNaN(checkInterval) &&
-        checkInterval > 0 &&
-        !isNaN(cooldown) &&
-        cooldown > 0
-      ) {
-        inactiveNodeNotificationService.stop();
-        inactiveNodeNotificationService.start(threshold, checkInterval, cooldown);
-        logger.info(
-          `✅ Inactive node notification service restarted (threshold: ${threshold}h, check: ${checkInterval}min, cooldown: ${cooldown}h)`
-        );
-      }
-    }
-
-    // Restart announce scheduler if announce settings changed
-    const announceSettings = [
-      'autoAnnounceEnabled',
-      'autoAnnounceIntervalHours',
-      'autoAnnounceUseSchedule',
-      'autoAnnounceSchedule',
-    ];
-    const announceSettingsChanged = announceSettings.some(key => key in filteredSettings);
-    if (announceSettingsChanged) {
-      meshtasticManager.restartAnnounceScheduler();
-    }
-
-    // Restart timer scheduler if timer triggers changed
-    if ('timerTriggers' in filteredSettings) {
-      meshtasticManager.restartTimerScheduler();
-    }
-
-    // Restart geofence engine if geofence triggers changed
-    if ('geofenceTriggers' in filteredSettings) {
-      meshtasticManager.restartGeofenceEngine();
-    }
-
-    // Audit log with before/after values
-    const changedSettings: Record<string, { before: string | undefined; after: string }> = {};
-    Object.keys(filteredSettings).forEach(key => {
-      if (currentSettings[key] !== filteredSettings[key]) {
-        changedSettings[key] = {
-          before: currentSettings[key],
-          after: filteredSettings[key],
-        };
-      }
-    });
-
-    if (Object.keys(changedSettings).length > 0) {
-      databaseService.auditLog(
-        req.user!.id,
-        'settings_updated',
-        'settings',
-        JSON.stringify({ keys: Object.keys(changedSettings) }),
-        req.ip || null,
-        JSON.stringify(Object.fromEntries(Object.entries(changedSettings).map(([k, v]) => [k, v.before]))),
-        JSON.stringify(Object.fromEntries(Object.entries(changedSettings).map(([k, v]) => [k, v.after])))
-      );
-    }
-
-    res.json({ success: true, settings: filteredSettings });
-  } catch (error) {
-    logger.error('Error saving settings:', error);
-    res.status(500).json({ error: 'Failed to save settings' });
-  }
-});
+// Note: GET/POST/DELETE /settings routes are in routes/settingsRoutes.ts
 
 // Mark all nodes as welcomed (for auto-welcome feature)
 apiRouter.post('/settings/mark-all-welcomed', requirePermission('settings', 'write'), (req, res) => {
@@ -5473,34 +4982,6 @@ apiRouter.post('/settings/mark-all-welcomed', requirePermission('settings', 'wri
   } catch (error) {
     logger.error('Error marking all nodes as welcomed:', error);
     res.status(500).json({ error: 'Failed to mark nodes as welcomed' });
-  }
-});
-
-// Reset settings to defaults
-apiRouter.delete('/settings', requirePermission('settings', 'write'), (req, res) => {
-  try {
-    // Get current settings before deletion for audit log
-    const currentSettings = databaseService.getAllSettings();
-
-    databaseService.deleteAllSettings();
-    // Reset traceroute interval to default (disabled)
-    meshtasticManager.setTracerouteInterval(0);
-
-    // Audit log
-    databaseService.auditLog(
-      req.user!.id,
-      'settings_reset',
-      'settings',
-      'All settings reset to defaults',
-      req.ip || null,
-      JSON.stringify(currentSettings),
-      null
-    );
-
-    res.json({ success: true, message: 'Settings reset to defaults' });
-  } catch (error) {
-    logger.error('Error resetting settings:', error);
-    res.status(500).json({ error: 'Failed to reset settings' });
   }
 });
 
@@ -6029,12 +5510,12 @@ apiRouter.post('/config/module/:moduleType', requirePermission('configuration', 
 
 apiRouter.post('/config/owner', requirePermission('configuration', 'write'), async (req, res) => {
   try {
-    const { longName, shortName, isUnmessagable } = req.body;
+    const { longName, shortName, isUnmessagable, isLicensed } = req.body;
     if (!longName || !shortName) {
       res.status(400).json({ error: 'longName and shortName are required' });
       return;
     }
-    await meshtasticManager.setNodeOwner(longName, shortName, isUnmessagable);
+    await meshtasticManager.setNodeOwner(longName, shortName, isUnmessagable, isLicensed);
     res.json({ success: true, message: 'Node owner updated' });
   } catch (error) {
     logger.error('Error setting node owner:', error);
@@ -6767,6 +6248,7 @@ apiRouter.post('/admin/load-owner', requireAdmin(), async (req, res) => {
           longName: localNodeInfo.longName || '' ,
           shortName: localNodeInfo.shortName || '' ,
           isUnmessagable: false,
+          isLicensed: false,
           publicKey: publicKeyBase64
         }});
       } else {
@@ -6779,7 +6261,8 @@ apiRouter.post('/admin/load-owner', requireAdmin(), async (req, res) => {
         return res.json({ owner: {
           longName: owner.longName || '' ,
           shortName: owner.shortName || '' ,
-          isUnmessagable: owner.isUnmessagable || false
+          isUnmessagable: owner.isUnmessagable || false,
+          isLicensed: owner.isLicensed || false
         }});
       } else {
         return res.status(404).json({ error: `Owner info not received from remote node ${destinationNodeNum}` });
@@ -7220,7 +6703,8 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
           params.longName,
           params.shortName,
           params.isUnmessagable,
-          sessionPasskey || undefined
+          sessionPasskey || undefined,
+          params.isLicensed
         );
         break;
       case 'setChannel':
@@ -7263,6 +6747,21 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
             sessionPasskey || undefined
           );
           await meshtasticManager.sendAdminCommand(setPositionMsg, destinationNodeNum);
+
+          // Immediately update the local node's position in the database so it's correct
+          // before any stale position broadcast arrives from the device firmware.
+          if (isLocalNode && localNodeNum) {
+            const localNodeId = `!${localNodeNum.toString(16).padStart(8, '0')}`;
+            databaseService.upsertNode({
+              nodeNum: localNodeNum,
+              nodeId: localNodeId,
+              latitude,
+              longitude,
+              altitude: altitude || 0,
+              positionTimestamp: Date.now(),
+            });
+            logger.info(`⚙️ Updated local node ${localNodeId} position in database: lat=${latitude}, lon=${longitude}`);
+          }
         }
         adminMessage = protobufService.createSetPositionConfigMessage(positionConfig, sessionPasskey || undefined);
         break;
@@ -7397,6 +6896,21 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
 
     // Send the admin command
     await meshtasticManager.sendAdminCommand(adminMessage, destinationNodeNum);
+
+    // For setFixedPosition on the local node, immediately update the database
+    // so it's correct before any stale position broadcast arrives from the device firmware.
+    if (command === 'setFixedPosition' && isLocalNode && localNodeNum) {
+      const localNodeId = `!${localNodeNum.toString(16).padStart(8, '0')}`;
+      databaseService.upsertNode({
+        nodeNum: localNodeNum,
+        nodeId: localNodeId,
+        latitude: params.latitude,
+        longitude: params.longitude,
+        altitude: params.altitude || 0,
+        positionTimestamp: Date.now(),
+      });
+      logger.info(`⚙️ Updated local node ${localNodeId} position in database: lat=${params.latitude}, lon=${params.longitude}`);
+    }
 
     // If command succeeded on a remote node, update hasRemoteAdmin flag
     if (!isLocalNode) {
@@ -9123,7 +8637,14 @@ apiRouter.delete('/scripts/:filename', requirePermission('settings', 'write'), a
   }
 });
 
-// Mount API router first - this must come before static file serving
+// Public embed config API (must come BEFORE apiRouter to avoid rate limiter and CSRF)
+// CSP middleware is applied per-route inside the router (needs req.params.profileId)
+if (BASE_URL) {
+  app.use(`${BASE_URL}/api/embed`, embedPublicRoutes);
+}
+app.use('/api/embed', embedPublicRoutes);
+
+// Mount API router - this must come before static file serving
 // Apply rate limiting and CSRF protection to all API routes (except csrf-token endpoint)
 if (BASE_URL) {
   app.use(`${BASE_URL}/api`, apiLimiter, csrfProtection, apiRouter);
@@ -9164,6 +8685,8 @@ const rewriteHtml = (htmlContent: string, baseUrl: string): string => {
 // Cache for rewritten HTML to avoid repeated file reads
 let cachedHtml: string | null = null;
 let cachedRewrittenHtml: string | null = null;
+let cachedEmbedHtml: string | null = null;
+let cachedRewrittenEmbedHtml: string | null = null;
 
 // Serve static assets (JS, CSS, images)
 if (BASE_URL) {
@@ -9206,6 +8729,20 @@ if (BASE_URL) {
     staticMiddleware(req, res, next);
   });
 
+  // Serve embed page (before SPA fallback)
+  app.get(`${BASE_URL}/embed/:profileId`, createEmbedCspMiddleware(), (_req: express.Request, res: express.Response) => {
+    if (!cachedRewrittenEmbedHtml) {
+      const embedHtmlPath = path.join(buildPath, 'embed.html');
+      if (!fs.existsSync(embedHtmlPath)) {
+        return res.status(404).send('Embed page not found');
+      }
+      cachedEmbedHtml = fs.readFileSync(embedHtmlPath, 'utf-8');
+      cachedRewrittenEmbedHtml = rewriteHtml(cachedEmbedHtml, BASE_URL);
+    }
+    res.setHeader('Content-Type', 'text/html');
+    res.send(cachedRewrittenEmbedHtml);
+  });
+
   // Catch all handler for SPA routing - but exclude /api
   app.get(`${BASE_URL}`, (_req: express.Request, res: express.Response) => {
     // Use cached HTML if available, otherwise read and cache
@@ -9241,6 +8778,19 @@ if (BASE_URL) {
 } else {
   // Normal static file serving for root deployment
   app.use(express.static(buildPath));
+
+  // Serve embed page (before SPA fallback)
+  app.get('/embed/:profileId', createEmbedCspMiddleware(), (_req: express.Request, res: express.Response) => {
+    if (!cachedEmbedHtml) {
+      const embedHtmlPath = path.join(buildPath, 'embed.html');
+      if (!fs.existsSync(embedHtmlPath)) {
+        return res.status(404).send('Embed page not found');
+      }
+      cachedEmbedHtml = fs.readFileSync(embedHtmlPath, 'utf-8');
+    }
+    res.setHeader('Content-Type', 'text/html');
+    res.send(cachedEmbedHtml);
+  });
 
   // Catch all handler for SPA routing - skip API routes
   app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -9373,6 +8923,9 @@ let server: ReturnType<typeof app.listen>;
     logger.error('❌ Database initialization failed:', error);
     process.exit(1);
   }
+
+  // Eagerly populate embed origins cache so first CORS check works
+  refreshEmbedOriginsCache();
 
   server = app.listen(PORT, () => {
     logger.debug(`MeshMonitor server running on port ${PORT}`);

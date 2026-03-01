@@ -21,6 +21,8 @@ import { useUI } from '../contexts/UIContext';
 import { LanguageSelector } from './LanguageSelector';
 import SectionNav from './SectionNav';
 import TapbackEmojiSettings from './TapbackEmojiSettings';
+import EmbedSettings from './settings/EmbedSettings';
+import { useAuth } from '../contexts/AuthContext';
 
 type DistanceUnit = 'km' | 'mi';
 type PositionHistoryLineStyle = 'linear' | 'spline';
@@ -129,6 +131,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 }) => {
   const { t } = useTranslation();
   const csrfFetch = useCsrfFetch();
+  const { authStatus } = useAuth();
+  const isAdmin = authStatus?.user?.isAdmin ?? false;
   const {
     customThemes,
     customTilesets,
@@ -177,6 +181,9 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // Note: localHideIncompleteNodes is inverted from showIncompleteNodes because
   // the UI checkbox says "Hide" while the context uses "show" semantics
   const [localHideIncompleteNodes, setLocalHideIncompleteNodes] = useState(!showIncompleteNodes);
+  const [localHomoglyphEnabled, setLocalHomoglyphEnabled] = useState(false);
+  const [localLocalStatsIntervalMinutes, setLocalLocalStatsIntervalMinutes] = useState(15);
+  const [initialLocalStatsIntervalMinutes, setInitialLocalStatsIntervalMinutes] = useState(15);
   const [isFetchingSolarEstimates, setIsFetchingSolarEstimates] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -243,6 +250,16 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           // Load hide incomplete nodes setting
           setLocalHideIncompleteNodes(hideIncomplete);
           setShowIncompleteNodes(!hideIncomplete);
+
+          // Load homoglyph optimization setting
+          const homoglyphOn = settings.homoglyphEnabled === 'true';
+          setLocalHomoglyphEnabled(homoglyphOn);
+          setInitialHomoglyphEnabled(homoglyphOn);
+
+          // Load LocalStats interval setting
+          const statsInterval = parseInt(settings.localStatsIntervalMinutes || '15', 10);
+          setLocalLocalStatsIntervalMinutes(statsInterval);
+          setInitialLocalStatsIntervalMinutes(statsInterval);
         }
       } catch (error) {
         logger.error('Failed to fetch server settings:', error);
@@ -295,6 +312,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // Note: We can't compare packet monitor settings to props since they're not in props
   // Instead, we'll track initial packet monitor values separately
   const [initialPacketMonitorSettings, setInitialPacketMonitorSettings] = useState({ enabled: false, maxCount: 1000, maxAgeHours: 24 });
+  const [initialHomoglyphEnabled, setInitialHomoglyphEnabled] = useState(false);
 
   useEffect(() => {
     const changed =
@@ -324,14 +342,17 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       localSolarMonitoringLongitude !== solarMonitoringLongitude ||
       localSolarMonitoringAzimuth !== solarMonitoringAzimuth ||
       localSolarMonitoringDeclination !== solarMonitoringDeclination ||
-      localHideIncompleteNodes !== !showIncompleteNodes;
+      localHideIncompleteNodes !== !showIncompleteNodes ||
+      localHomoglyphEnabled !== initialHomoglyphEnabled ||
+      localLocalStatsIntervalMinutes !== initialLocalStatsIntervalMinutes;
     setHasChanges(changed);
   }, [localMaxNodeAge, localInactiveNodeThresholdHours, localInactiveNodeCheckIntervalMinutes, localInactiveNodeCooldownHours, localTemperatureUnit, localDistanceUnit, localPositionHistoryLineStyle, localTelemetryHours, localFavoriteTelemetryStorageDays, localPreferredSortField, localPreferredSortDirection, localTimeFormat, localDateFormat, localMapTileset, localMapPinStyle, localTheme, localNodeHopsCalculation, localDashboardSortOption,
       maxNodeAgeHours, inactiveNodeThresholdHours, inactiveNodeCheckIntervalMinutes, inactiveNodeCooldownHours, temperatureUnit, distanceUnit, positionHistoryLineStyle, telemetryVisualizationHours, favoriteTelemetryStorageDays, preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTileset, mapPinStyle, theme, nodeHopsCalculation, preferredDashboardSortOption,
       localPacketLogEnabled, localPacketLogMaxCount, localPacketLogMaxAgeHours, initialPacketMonitorSettings,
       localSolarMonitoringEnabled, localSolarMonitoringLatitude, localSolarMonitoringLongitude, localSolarMonitoringAzimuth, localSolarMonitoringDeclination,
       solarMonitoringEnabled, solarMonitoringLatitude, solarMonitoringLongitude, solarMonitoringAzimuth, solarMonitoringDeclination,
-      localHideIncompleteNodes, showIncompleteNodes]);
+      localHideIncompleteNodes, showIncompleteNodes, localHomoglyphEnabled, initialHomoglyphEnabled,
+      localLocalStatsIntervalMinutes, initialLocalStatsIntervalMinutes]);
 
   // Reset local state to current saved values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
@@ -362,12 +383,15 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setLocalSolarMonitoringAzimuth(solarMonitoringAzimuth);
     setLocalSolarMonitoringDeclination(solarMonitoringDeclination);
     setLocalHideIncompleteNodes(!showIncompleteNodes);
+    setLocalHomoglyphEnabled(initialHomoglyphEnabled);
+    setLocalLocalStatsIntervalMinutes(initialLocalStatsIntervalMinutes);
   }, [maxNodeAgeHours, inactiveNodeThresholdHours, inactiveNodeCheckIntervalMinutes,
       inactiveNodeCooldownHours, temperatureUnit, distanceUnit, telemetryVisualizationHours,
       favoriteTelemetryStorageDays, preferredSortField, preferredSortDirection, timeFormat,
       dateFormat, mapTileset, mapPinStyle, theme, nodeHopsCalculation, preferredDashboardSortOption,
       initialPacketMonitorSettings, solarMonitoringEnabled, solarMonitoringLatitude,
-      solarMonitoringLongitude, solarMonitoringAzimuth, solarMonitoringDeclination, showIncompleteNodes]);
+      solarMonitoringLongitude, solarMonitoringAzimuth, solarMonitoringDeclination, showIncompleteNodes,
+      initialHomoglyphEnabled, initialLocalStatsIntervalMinutes]);
 
   const handleSave = useCallback(async () => {
     setIsSaving(true);
@@ -397,7 +421,13 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         solarMonitoringLongitude: localSolarMonitoringLongitude.toString(),
         solarMonitoringAzimuth: localSolarMonitoringAzimuth.toString(),
         solarMonitoringDeclination: localSolarMonitoringDeclination.toString(),
-        hideIncompleteNodes: localHideIncompleteNodes ? '1' : '0'
+        hideIncompleteNodes: localHideIncompleteNodes ? '1' : '0',
+        homoglyphEnabled: String(localHomoglyphEnabled),
+        localStatsIntervalMinutes: localLocalStatsIntervalMinutes.toString(),
+        nodeHopsCalculation: localNodeHopsCalculation,
+        nodeDimmingEnabled: nodeDimmingEnabled ? '1' : '0',
+        nodeDimmingStartHours: nodeDimmingStartHours.toString(),
+        nodeDimmingMinOpacity: nodeDimmingMinOpacity.toString(),
       };
 
       // Save to server
@@ -435,6 +465,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
       // Update initial packet monitor settings after successful save
       setInitialPacketMonitorSettings({ enabled: localPacketLogEnabled, maxCount: localPacketLogMaxCount, maxAgeHours: localPacketLogMaxAgeHours });
+      setInitialHomoglyphEnabled(localHomoglyphEnabled);
+      setInitialLocalStatsIntervalMinutes(localLocalStatsIntervalMinutes);
 
       showToast(t('settings.saved_success'), 'success');
       setHasChanges(false);
@@ -451,7 +483,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       localTimeFormat, localDateFormat, localMapTileset, localMapPinStyle, localTheme,
       localNodeHopsCalculation, localDashboardSortOption, localPacketLogEnabled, localPacketLogMaxCount, localPacketLogMaxAgeHours,
       localSolarMonitoringEnabled, localSolarMonitoringLatitude, localSolarMonitoringLongitude,
-      localSolarMonitoringAzimuth, localSolarMonitoringDeclination, localHideIncompleteNodes,
+      localSolarMonitoringAzimuth, localSolarMonitoringDeclination, localHideIncompleteNodes, localHomoglyphEnabled, localLocalStatsIntervalMinutes,
       onMaxNodeAgeChange, onInactiveNodeThresholdHoursChange, onInactiveNodeCheckIntervalMinutesChange,
       onInactiveNodeCooldownHoursChange, onTemperatureUnitChange, onDistanceUnitChange, onPositionHistoryLineStyleChange,
       onTelemetryVisualizationChange, onFavoriteTelemetryStorageDaysChange, onPreferredSortFieldChange,
@@ -760,6 +792,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         { id: 'settings-backup', label: t('settings.system_backup', 'System Backup') },
         // Only show Database Maintenance for SQLite - it uses SQLite-specific features like VACUUM
         ...(databaseType === 'sqlite' ? [{ id: 'settings-maintenance', label: t('maintenance.title', 'Database Maintenance') }] : []),
+        ...(isAdmin ? [{ id: 'settings-embed', label: t('settings.embed_maps', 'Embed Maps') }] : []),
         { id: 'settings-management', label: t('settings.settings_management') },
         { id: 'settings-danger', label: t('settings.danger_zone') },
       ]} />
@@ -847,6 +880,21 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               max="720"
               value={localInactiveNodeCooldownHours}
               onChange={(e) => setLocalInactiveNodeCooldownHours(parseInt(e.target.value))}
+              className="setting-input"
+            />
+          </div>
+          <div className="setting-item">
+            <label htmlFor="localStatsIntervalMinutes">
+              {t('settings.local_stats_interval_label')}
+              <span className="setting-description">{t('settings.local_stats_interval_description')}</span>
+            </label>
+            <input
+              id="localStatsIntervalMinutes"
+              type="number"
+              min="0"
+              max="60"
+              value={localLocalStatsIntervalMinutes}
+              onChange={(e) => setLocalLocalStatsIntervalMinutes(parseInt(e.target.value))}
               className="setting-input"
             />
           </div>
@@ -1185,6 +1233,23 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
               <input
                 type="checkbox"
+                checked={localHomoglyphEnabled}
+                onChange={(e) => setLocalHomoglyphEnabled(e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.homoglyph_enabled')}</span>
+            </label>
+          </h3>
+          <p className="setting-description">
+            {t('settings.homoglyph_description')}
+          </p>
+        </div>
+
+        <div className="settings-section">
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
                 checked={localHideIncompleteNodes}
                 onChange={(e) => setLocalHideIncompleteNodes(e.target.checked)}
                 style={{ cursor: 'pointer' }}
@@ -1360,6 +1425,13 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         <DatabaseMaintenanceSection />
 
         <AutoUpgradeTestSection baseUrl={baseUrl} />
+
+        {isAdmin && (
+          <div id="settings-embed" className="settings-section">
+            <h3>{t('settings.embed_maps', 'Embed Maps')}</h3>
+            <EmbedSettings />
+          </div>
+        )}
 
         <div id="settings-management" className="settings-section">
           <h3>{t('settings.settings_management')}</h3>

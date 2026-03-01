@@ -175,92 +175,13 @@ router.get('/stats/distribution', requirePacketPermissions, async (req, res) => 
   }
 });
 
-/**
- * GET /api/packets/stats/node-distribution
- * Get packet type distribution for a specific node by querying actual data tables
- * (telemetry, messages, traceroutes) instead of the capped packet_log.
- * Query params:
- *   - node_id: The node's string ID (e.g. !b2a7be34) for telemetry lookups
- *   - node_num: The node's numeric ID for message/traceroute lookups
- *   - since: Unix timestamp (seconds) to filter from
- */
-router.get('/stats/node-distribution', requirePacketPermissions, async (req, res) => {
-  try {
-    const nodeId = req.query.node_id as string | undefined;
-    const nodeNum = req.query.node_num ? parseInt(req.query.node_num as string, 10) : undefined;
-    const sinceParam = req.query.since ? parseInt(req.query.since as string, 10) : undefined;
-    // Convert since from seconds to milliseconds for data table queries
-    // (telemetry, messages, traceroutes all store timestamps in milliseconds)
-    const sinceMs = sinceParam !== undefined ? sinceParam * 1000 : undefined;
-
-    if (!nodeId && nodeNum === undefined) {
-      return res.status(400).json({ error: 'node_id or node_num is required' });
-    }
-
-    const byType: Array<{ portnum: number; portnum_name: string; count: number }> = [];
-    let total = 0;
-
-    // Query actual data tables in parallel
-    const [positionCount, telemetryCount, messageCount, tracerouteCount, nodeInfoFromLog] = await Promise.all([
-      // Position packets from telemetry table (uses milliseconds)
-      nodeId ? databaseService.getPositionPacketCountByNodeAsync(nodeId, sinceMs) : Promise.resolve(0),
-      // Non-position telemetry from telemetry table (uses milliseconds)
-      nodeId ? databaseService.getNonPositionTelemetryPacketCountByNodeAsync(nodeId, sinceMs) : Promise.resolve(0),
-      // Text messages from messages table (uses milliseconds)
-      nodeNum !== undefined ? databaseService.getMessageCountByNodeAsync(nodeNum, sinceMs) : Promise.resolve(0),
-      // Traceroutes from traceroutes table (uses milliseconds)
-      nodeNum !== undefined ? databaseService.getTracerouteCountByNodeAsync(nodeNum, sinceMs) : Promise.resolve(0),
-      // NodeInfo from packet_log (uses seconds - packet_log stores timestamps in seconds)
-      nodeNum !== undefined
-        ? packetLogService.getPacketCountsByPortnumAsync({ since: sinceParam, from_node: nodeNum })
-        : Promise.resolve([]),
-    ]);
-
-    if (positionCount > 0) {
-      byType.push({ portnum: 3, portnum_name: 'POSITION_APP', count: positionCount });
-      total += positionCount;
-    }
-    if (telemetryCount > 0) {
-      byType.push({ portnum: 67, portnum_name: 'TELEMETRY_APP', count: telemetryCount });
-      total += telemetryCount;
-    }
-    if (messageCount > 0) {
-      byType.push({ portnum: 1, portnum_name: 'TEXT_MESSAGE_APP', count: messageCount });
-      total += messageCount;
-    }
-    if (tracerouteCount > 0) {
-      byType.push({ portnum: 70, portnum_name: 'TRACEROUTE_APP', count: tracerouteCount });
-      total += tracerouteCount;
-    }
-
-    // Add NodeInfo count from packet_log (nodeinfo updates nodes table in-place, no separate storage)
-    const nodeInfoEntry = nodeInfoFromLog.find(e => e.portnum === 4);
-    if (nodeInfoEntry && nodeInfoEntry.count > 0) {
-      byType.push({ portnum: 4, portnum_name: 'NODEINFO_APP', count: nodeInfoEntry.count });
-      total += nodeInfoEntry.count;
-    }
-
-    // Sort by count descending
-    byType.sort((a, b) => b.count - a.count);
-
-    res.json({
-      byType,
-      byDevice: [],
-      total,
-      enabled: true,
-    });
-  } catch (error) {
-    logger.error('❌ Error fetching node packet distribution:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 /**
  * GET /api/packets/export
  * Export packet logs as JSONL with optional filtering
  * IMPORTANT: Must be registered before /:id route to avoid route matching conflicts
  */
-router.get('/export', requirePacketPermissions, (req, res) => {
+router.get('/export', requirePacketPermissions, async (req, res) => {
   try {
     const portnum = req.query.portnum ? parseInt(req.query.portnum as string, 10) : undefined;
     const from_node = req.query.from_node ? parseInt(req.query.from_node as string, 10) : undefined;
@@ -271,7 +192,7 @@ router.get('/export', requirePacketPermissions, (req, res) => {
 
     // Fetch all matching packets (up to configured max)
     const maxCount = packetLogService.getMaxCount();
-    const packets = packetLogService.getPackets({
+    const packets = await packetLogService.getPacketsAsync({
       offset: 0,
       limit: maxCount,
       portnum,
@@ -315,14 +236,14 @@ router.get('/export', requirePacketPermissions, (req, res) => {
  * Get single packet by ID
  * IMPORTANT: Must be registered after more specific routes like /stats and /export
  */
-router.get('/:id', requirePacketPermissions, (req, res) => {
+router.get('/:id', requirePacketPermissions, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) {
       return res.status(400).json({ error: 'Invalid packet ID' });
     }
 
-    const packet = packetLogService.getPacketById(id);
+    const packet = await packetLogService.getPacketByIdAsync(id);
     if (!packet) {
       return res.status(404).json({ error: 'Packet not found' });
     }

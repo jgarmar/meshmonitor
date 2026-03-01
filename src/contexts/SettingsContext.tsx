@@ -5,6 +5,7 @@ import { type SortOption as DashboardSortOption } from '../components/Dashboard/
 import { logger } from '../utils/logger';
 import { useCsrf } from './CsrfContext';
 import { DEFAULT_TILESET_ID, type TilesetId, type CustomTileset } from '../config/tilesets';
+import { type OverlayScheme, getSchemeForTileset, getOverlayColors, type OverlayColors } from '../config/overlayColors';
 import i18n from '../config/i18n';
 import { type TapbackEmoji, DEFAULT_TAPBACK_EMOJIS } from '../components/EmojiPickerModal/EmojiPickerModal';
 
@@ -56,6 +57,8 @@ interface SettingsContextType {
   timeFormat: TimeFormat;
   dateFormat: DateFormat;
   mapTileset: TilesetId;
+  overlayScheme: OverlayScheme;
+  overlayColors: OverlayColors;
   mapPinStyle: MapPinStyle;
   theme: Theme;
   language: string;
@@ -281,6 +284,13 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
 
   // Custom tilesets state (database-only, not persisted in localStorage)
   const [customTilesets, setCustomTilesets] = useState<CustomTileset[]>([]);
+
+  const overlayScheme = React.useMemo<OverlayScheme>(() => {
+    const customTileset = customTilesets.find(ct => `custom-${ct.id}` === mapTileset);
+    return getSchemeForTileset(mapTileset, customTileset?.overlayScheme);
+  }, [mapTileset, customTilesets]);
+
+  const overlayColors = React.useMemo(() => getOverlayColors(overlayScheme), [overlayScheme]);
 
   const setMaxNodeAgeHours = (value: number) => {
     setMaxNodeAgeHoursState(value);
@@ -926,6 +936,36 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
             }
           }
 
+          if (settings.nodeHopsCalculation) {
+            const valid: NodeHopsCalculation[] = ['nodeinfo', 'traceroute', 'messages'];
+            if (valid.includes(settings.nodeHopsCalculation as NodeHopsCalculation)) {
+              setNodeHopsCalculationState(settings.nodeHopsCalculation as NodeHopsCalculation);
+              localStorage.setItem('nodeHopsCalculation', settings.nodeHopsCalculation);
+            }
+          }
+
+          if (settings.nodeDimmingEnabled !== undefined) {
+            const enabled = settings.nodeDimmingEnabled === '1' || settings.nodeDimmingEnabled === 'true';
+            setNodeDimmingEnabledState(enabled);
+            localStorage.setItem('nodeDimmingEnabled', enabled.toString());
+          }
+
+          if (settings.nodeDimmingStartHours !== undefined) {
+            const value = parseFloat(settings.nodeDimmingStartHours);
+            if (!isNaN(value) && value > 0) {
+              setNodeDimmingStartHoursState(value);
+              localStorage.setItem('nodeDimmingStartHours', value.toString());
+            }
+          }
+
+          if (settings.nodeDimmingMinOpacity !== undefined) {
+            const value = parseFloat(settings.nodeDimmingMinOpacity);
+            if (!isNaN(value) && value >= 0 && value <= 1) {
+              setNodeDimmingMinOpacityState(value);
+              localStorage.setItem('nodeDimmingMinOpacity', value.toString());
+            }
+          }
+
           logger.debug('✅ Settings loaded from server and applied to state');
 
           // Load user-specific map preferences (overrides global settings)
@@ -999,6 +1039,8 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     timeFormat,
     dateFormat,
     mapTileset,
+    overlayScheme,
+    overlayColors,
     mapPinStyle,
     theme,
     language,

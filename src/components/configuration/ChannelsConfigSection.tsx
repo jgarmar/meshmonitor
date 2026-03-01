@@ -1,9 +1,11 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import apiService from '../../services/api';
 import { useToast } from '../ToastContainer';
 import { Channel } from '../../types/device';
 import { logger } from '../../utils/logger';
+import { useSettings } from '../../contexts/SettingsContext';
+import { formatPrecisionAccuracy } from '../../utils/distance';
 
 // Default public PSK (base64 encoded value of single byte 0x01)
 const DEFAULT_PUBLIC_PSK = 'AQ==';
@@ -43,6 +45,7 @@ const ChannelsConfigSection: React.FC<ChannelsConfigSectionProps> = ({
 }) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
+  const { distanceUnit } = useSettings();
   const [editingChannel, setEditingChannel] = useState<ChannelEditState | null>(null);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
@@ -50,6 +53,14 @@ const ChannelsConfigSection: React.FC<ChannelsConfigSectionProps> = ({
   const [importFileContent, setImportFileContent] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Compute auto-position channel: lowest-index channel with positionPrecision > 0
+  const autoPositionChannelId = useMemo(() => {
+    const sorted = [...channels]
+      .filter(ch => (ch.positionPrecision ?? 0) > 0)
+      .sort((a, b) => a.id - b.id);
+    return sorted.length > 0 ? sorted[0].id : null;
+  }, [channels]);
 
   // Create array of 8 slots (0-7) with channel data
   const channelSlots = Array.from({ length: 8 }, (_, index) => {
@@ -278,6 +289,14 @@ const ChannelsConfigSection: React.FC<ChannelsConfigSectionProps> = ({
                         {channel.downlinkEnabled ? `↓ ${t('channels_config.downlink')}` : ''}
                         {!channel.uplinkEnabled && !channel.downlinkEnabled && t('channels_config.no_bridge')}
                       </div>
+                      {(channel.positionPrecision ?? 0) > 0 && (
+                        <div>
+                          {slotId === autoPositionChannelId
+                            ? `📍 ${t('channels_config.location_auto_broadcast')}`
+                            : `📌 ${t('channels_config.location_enabled')}`}
+                          {` (${formatPrecisionAccuracy(channel.positionPrecision ?? 0, distanceUnit)})`}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -452,6 +471,9 @@ const ChannelsConfigSection: React.FC<ChannelsConfigSectionProps> = ({
                 className="setting-input"
                 placeholder="32"
               />
+              <span className="setting-description" style={{ marginTop: '0.25rem' }}>
+                {t('channels_config.estimated_accuracy', { accuracy: formatPrecisionAccuracy(editingChannel.positionPrecision, distanceUnit) })}
+              </span>
             </div>
 
             <div className="setting-item">
