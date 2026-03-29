@@ -3,11 +3,68 @@ import packetLogService from '../services/packetLogService.js';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
 import { RequestHandler } from 'express';
+import type { PermissionSet } from '../../types/permission.js';
+import { PortNum } from '../constants/meshtastic.js';
+
+const BROADCAST_NODE = 4294967295; // 0xFFFFFFFF
+
+/** Normalize a `since` timestamp to milliseconds (auto-detect seconds vs ms) */
+function normalizeSinceToMs(value: string): number {
+  const n = parseInt(value, 10);
+  return n < 10_000_000_000 ? n * 1000 : n;
+}
 
 const router = express.Router();
 
 /**
- * Permission middleware - require BOTH channels:read AND messages:read
+ * Get the set of channel indices (0-7) that the user has read permission for.
+ * Also includes channel database (virtual channel) IDs the user can read.
+ */
+function getAllowedChannels(permissions: PermissionSet): Set<number> {
+  const allowed = new Set<number>();
+  for (let i = 0; i < 8; i++) {
+    const key = `channel_${i}` as keyof PermissionSet;
+    if (permissions[key]?.read === true) {
+      allowed.add(i);
+    }
+  }
+  return allowed;
+}
+
+/**
+ * Filter packets based on channel and message permissions.
+ * - Encrypted packets always pass through (content is not readable anyway)
+ * - TEXT_MESSAGE_APP DMs (to_node != broadcast) require messages:read permission
+ * - Decrypted packets require read permission on the packet's channel
+ */
+function filterPacketsByPermissions<T extends { encrypted: boolean; channel?: number | null; portnum?: number | null; to_node?: number | null }>(
+  packets: T[],
+  allowedChannels: Set<number>,
+  isAdmin: boolean,
+  canReadMessages: boolean
+): T[] {
+  if (isAdmin) return packets;
+  return packets.filter(packet => {
+    // Encrypted packets always visible
+    if (packet.encrypted) return true;
+    // TEXT_MESSAGE_APP DMs require messages:read permission
+    if (packet.portnum === PortNum.TEXT_MESSAGE_APP &&
+        packet.to_node !== undefined && packet.to_node !== null &&
+        packet.to_node !== BROADCAST_NODE) {
+      return canReadMessages;
+    }
+    // Decrypted packets require channel read permission
+    if (packet.channel !== undefined && packet.channel !== null) {
+      return allowedChannels.has(packet.channel);
+    }
+    // Packets with no channel info - allow (e.g. internal packets)
+    return true;
+  });
+}
+
+/**
+ * Permission middleware - require packetmonitor:read permission
+ * Also attaches allowed channels and admin status to request for downstream filtering
  */
 const requirePacketPermissions: RequestHandler = async (req, res, next) => {
   try {
@@ -23,20 +80,37 @@ const requirePacketPermissions: RequestHandler = async (req, res, next) => {
     const isAdmin = user?.isAdmin ?? false;
 
     if (isAdmin) {
-      // Admins have all permissions
+      (req as any).isAdmin = true;
+      (req as any).allowedChannels = new Set<number>([0, 1, 2, 3, 4, 5, 6, 7]);
+      (req as any).canReadMessages = true;
       return next();
     }
 
-    // Check both channel_0:read and messages:read (minimum required)
-    const hasChannelsRead = permissions.channel_0?.read === true;
-    const hasMessagesRead = permissions.messages?.read === true;
+    // Check packetmonitor:read permission
+    const hasPacketMonitorRead = permissions.packetmonitor?.read === true;
 
-    if (!hasChannelsRead || !hasMessagesRead) {
-      logger.warn(`❌ Permission denied for packet access - channel_0:read=${hasChannelsRead}, messages:read=${hasMessagesRead}`);
+    if (!hasPacketMonitorRead) {
+      logger.warn(`❌ Permission denied for packet access - packetmonitor:read=${hasPacketMonitorRead}`);
       return res.status(403).json({
         error: 'Forbidden',
-        message: 'You need both channel_0:read and messages:read permissions to access packet logs'
+        message: 'You need packetmonitor:read permission to access packet logs'
       });
+    }
+
+    // Attach allowed channels and message permissions for downstream filtering
+    (req as any).isAdmin = false;
+    (req as any).allowedChannels = getAllowedChannels(permissions);
+    (req as any).canReadMessages = permissions.messages?.read === true;
+
+    // Also check channel database permissions for virtual channels
+    if (userId !== null) {
+      const channelDbPerms = await databaseService.channelDatabase.getPermissionsForUserAsync(userId);
+      const allowedDbChannels = channelDbPerms
+        .filter((p: { canRead: boolean }) => p.canRead)
+        .map((p: { channelDatabaseId: number }) => p.channelDatabaseId);
+      (req as any).allowedChannelDbIds = new Set<number>(allowedDbChannels);
+    } else {
+      (req as any).allowedChannelDbIds = new Set<number>();
     }
 
     next();
@@ -57,7 +131,7 @@ router.get('/', requirePacketPermissions, async (req, res) => {
 
     // Enforce maximum limit to prevent unbounded queries
     // Use the configured max count from settings (defaults to 1000)
-    const MAX_LIMIT = packetLogService.getMaxCount();
+    const MAX_LIMIT = await packetLogService.getMaxCount();
     if (limit > MAX_LIMIT) {
       limit = MAX_LIMIT;
     }
@@ -72,9 +146,14 @@ router.get('/', requirePacketPermissions, async (req, res) => {
     const to_node = req.query.to_node ? parseInt(req.query.to_node as string, 10) : undefined;
     const channel = req.query.channel ? parseInt(req.query.channel as string, 10) : undefined;
     const encrypted = req.query.encrypted === 'true' ? true : req.query.encrypted === 'false' ? false : undefined;
-    const since = req.query.since ? parseInt(req.query.since as string, 10) : undefined;
+    const since = req.query.since ? normalizeSinceToMs(req.query.since as string) : undefined;
+    const relay_node = req.query.relay_node === 'unknown' ? 'unknown' as const : req.query.relay_node ? parseInt(req.query.relay_node as string, 10) : undefined;
 
-    const packets = await packetLogService.getPacketsAsync({
+    const isAdmin = (req as any).isAdmin;
+    const allowedChannels = (req as any).allowedChannels as Set<number>;
+    const canReadMessages = (req as any).canReadMessages as boolean;
+
+    const rawPackets = await packetLogService.getPacketsAsync({
       offset,
       limit,
       portnum,
@@ -82,8 +161,12 @@ router.get('/', requirePacketPermissions, async (req, res) => {
       to_node,
       channel,
       encrypted,
-      since
+      since,
+      relay_node
     });
+
+    // Filter packets by channel and message permissions
+    const packets = filterPacketsByPermissions(rawPackets, allowedChannels, isAdmin, canReadMessages);
 
     const total = await packetLogService.getPacketCountAsync({
       portnum,
@@ -91,7 +174,8 @@ router.get('/', requirePacketPermissions, async (req, res) => {
       to_node,
       channel,
       encrypted,
-      since
+      since,
+      relay_node
     });
 
     res.json({
@@ -99,8 +183,8 @@ router.get('/', requirePacketPermissions, async (req, res) => {
       total,
       offset,
       limit,
-      maxCount: packetLogService.getMaxCount(),
-      maxAgeHours: packetLogService.getMaxAgeHours()
+      maxCount: await packetLogService.getMaxCount(),
+      maxAgeHours: await packetLogService.getMaxAgeHours()
     });
   } catch (error) {
     logger.error('❌ Error fetching packet logs:', error);
@@ -122,9 +206,9 @@ router.get('/stats', requirePacketPermissions, async (_req, res) => {
       total,
       encrypted,
       decoded,
-      maxCount: packetLogService.getMaxCount(),
-      maxAgeHours: packetLogService.getMaxAgeHours(),
-      enabled: packetLogService.isEnabled()
+      maxCount: await packetLogService.getMaxCount(),
+      maxAgeHours: await packetLogService.getMaxAgeHours(),
+      enabled: await packetLogService.isEnabled()
     });
   } catch (error) {
     logger.error('❌ Error fetching packet stats:', error);
@@ -136,11 +220,11 @@ router.get('/stats', requirePacketPermissions, async (_req, res) => {
  * GET /api/packets/stats/distribution
  * Get packet distribution by device and by type
  * Query params:
- *   - since: Unix timestamp (seconds) to filter packets from
+ *   - since: Unix timestamp (seconds or milliseconds, auto-detected) to filter packets from
  */
 router.get('/stats/distribution', requirePacketPermissions, async (req, res) => {
   try {
-    const enabled = packetLogService.isEnabled();
+    const enabled = await packetLogService.isEnabled();
 
     // If not enabled, return empty data
     if (!enabled) {
@@ -152,7 +236,7 @@ router.get('/stats/distribution', requirePacketPermissions, async (req, res) => 
       });
     }
 
-    const since = req.query.since ? parseInt(req.query.since as string, 10) : undefined;
+    const since = req.query.since ? normalizeSinceToMs(req.query.since as string) : undefined;
     const from_node = req.query.from_node ? parseInt(req.query.from_node as string, 10) : undefined;
     const portnum = req.query.portnum ? parseInt(req.query.portnum as string, 10) : undefined;
 
@@ -177,6 +261,20 @@ router.get('/stats/distribution', requirePacketPermissions, async (req, res) => 
 
 
 /**
+ * GET /api/packets/relay-nodes
+ * Get distinct relay nodes that appear in packet logs (for filter dropdowns)
+ */
+router.get('/relay-nodes', requirePacketPermissions, async (_req, res) => {
+  try {
+    const relayNodes = await packetLogService.getDistinctRelayNodesAsync();
+    res.json({ relayNodes });
+  } catch (error) {
+    logger.error('❌ Error fetching relay nodes:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
  * GET /api/packets/export
  * Export packet logs as JSONL with optional filtering
  * IMPORTANT: Must be registered before /:id route to avoid route matching conflicts
@@ -188,11 +286,16 @@ router.get('/export', requirePacketPermissions, async (req, res) => {
     const to_node = req.query.to_node ? parseInt(req.query.to_node as string, 10) : undefined;
     const channel = req.query.channel ? parseInt(req.query.channel as string, 10) : undefined;
     const encrypted = req.query.encrypted === 'true' ? true : req.query.encrypted === 'false' ? false : undefined;
-    const since = req.query.since ? parseInt(req.query.since as string, 10) : undefined;
+    const since = req.query.since ? normalizeSinceToMs(req.query.since as string) : undefined;
+    const relay_node = req.query.relay_node === 'unknown' ? 'unknown' as const : req.query.relay_node ? parseInt(req.query.relay_node as string, 10) : undefined;
+
+    const isAdmin = (req as any).isAdmin;
+    const allowedChannels = (req as any).allowedChannels as Set<number>;
+    const canReadMessages = (req as any).canReadMessages as boolean;
 
     // Fetch all matching packets (up to configured max)
-    const maxCount = packetLogService.getMaxCount();
-    const packets = await packetLogService.getPacketsAsync({
+    const maxCount = await packetLogService.getMaxCount();
+    const rawPackets = await packetLogService.getPacketsAsync({
       offset: 0,
       limit: maxCount,
       portnum,
@@ -200,8 +303,12 @@ router.get('/export', requirePacketPermissions, async (req, res) => {
       to_node,
       channel,
       encrypted,
-      since
+      since,
+      relay_node
     });
+
+    // Filter packets by channel and message permissions
+    const packets = filterPacketsByPermissions(rawPackets, allowedChannels, isAdmin, canReadMessages);
 
     // Generate filename with timestamp
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
@@ -248,6 +355,15 @@ router.get('/:id', requirePacketPermissions, async (req, res) => {
       return res.status(404).json({ error: 'Packet not found' });
     }
 
+    // Check channel and message permissions for this packet
+    const isAdmin = (req as any).isAdmin;
+    const allowedChannels = (req as any).allowedChannels as Set<number>;
+    const canReadMessages = (req as any).canReadMessages as boolean;
+    const filtered = filterPacketsByPermissions([packet], allowedChannels, isAdmin, canReadMessages);
+    if (filtered.length === 0) {
+      return res.status(403).json({ error: 'You do not have permission to view this packet' });
+    }
+
     res.json(packet);
   } catch (error) {
     logger.error('❌ Error fetching packet:', error);
@@ -275,10 +391,10 @@ router.delete('/', requirePacketPermissions, async (req, res) => {
     logger.info(`🧹 Admin ${user.username} cleared ${deletedCount} packet logs`);
 
     // Log to audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       user.id,
       'packets_cleared',
-      'packets',
+      'packetmonitor',
       `Cleared ${deletedCount} packet log entries`,
       req.ip || null
     );

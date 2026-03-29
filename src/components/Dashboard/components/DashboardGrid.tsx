@@ -16,6 +16,9 @@ import SmartHopsChart, { isSmartHopsType } from '../../SmartHopsChart';
 import LinkQualityChart, { isLinkQualityType } from '../../LinkQualityChart';
 import NodeStatusWidget from '../../NodeStatusWidget';
 import TracerouteWidget from '../../TracerouteWidget';
+import HopDistributionWidget from '../../HopDistributionWidget';
+import DistanceDistributionWidget from '../../DistanceDistributionWidget';
+import HopDistanceHeatmapWidget from '../../HopDistanceHeatmapWidget';
 import {
   type CustomWidget,
   type FavoriteChart,
@@ -31,6 +34,9 @@ interface DashboardGridProps {
   onAddNodeToWidget: (widgetId: string, nodeId: string) => void;
   onRemoveNodeFromWidget: (widgetId: string, nodeId: string) => void;
   onSelectTracerouteNode: (widgetId: string, nodeId: string) => void;
+  onOpenNodeDetails?: (nodeId: string) => void;
+  onUpdateWidgetConfig: (widgetId: string, updates: Record<string, unknown>) => void;
+  distanceUnit: 'km' | 'mi';
 
   // Charts
   favorites: FavoriteChart[];
@@ -68,6 +74,9 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
   onAddNodeToWidget,
   onRemoveNodeFromWidget,
   onSelectTracerouteNode,
+  onOpenNodeDetails,
+  onUpdateWidgetConfig,
+  distanceUnit,
   favorites,
   nodes,
   currentNodeId,
@@ -126,9 +135,11 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
                     id={widget.id}
                     nodeIds={widget.nodeIds}
                     nodes={nodes}
+                    baseUrl={baseUrl}
                     onRemove={() => onRemoveWidget(widget.id)}
                     onAddNode={nodeId => onAddNodeToWidget(widget.id, nodeId)}
                     onRemoveNode={nodeId => onRemoveNodeFromWidget(widget.id, nodeId)}
+                    onOpenNodeDetails={onOpenNodeDetails}
                     canEdit={canEdit}
                   />
                 );
@@ -142,6 +153,44 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
                     nodes={nodes}
                     onRemove={() => onRemoveWidget(widget.id)}
                     onSelectNode={nodeId => onSelectTracerouteNode(widget.id, nodeId)}
+                    canEdit={canEdit}
+                  />
+                );
+              } else if (widget.type === 'hopDistribution') {
+                return (
+                  <HopDistributionWidget
+                    key={widget.id}
+                    id={widget.id}
+                    nodes={nodes}
+                    onRemove={() => onRemoveWidget(widget.id)}
+                    canEdit={canEdit}
+                  />
+                );
+              } else if (widget.type === 'distanceDistribution') {
+                return (
+                  <DistanceDistributionWidget
+                    key={widget.id}
+                    id={widget.id}
+                    bucketSize={widget.bucketSize}
+                    nodes={nodes}
+                    currentNodeId={currentNodeId}
+                    distanceUnit={distanceUnit}
+                    onRemove={() => onRemoveWidget(widget.id)}
+                    onBucketSizeChange={(size) => onUpdateWidgetConfig(widget.id, { bucketSize: size })}
+                    canEdit={canEdit}
+                  />
+                );
+              } else if (widget.type === 'hopDistanceHeatmap') {
+                return (
+                  <HopDistanceHeatmapWidget
+                    key={widget.id}
+                    id={widget.id}
+                    bucketSize={widget.bucketSize}
+                    nodes={nodes}
+                    currentNodeId={currentNodeId}
+                    distanceUnit={distanceUnit}
+                    onRemove={() => onRemoveWidget(widget.id)}
+                    onBucketSizeChange={(size) => onUpdateWidgetConfig(widget.id, { bucketSize: size })}
                     canEdit={canEdit}
                   />
                 );

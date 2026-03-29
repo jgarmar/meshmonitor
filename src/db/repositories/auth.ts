@@ -9,11 +9,10 @@ import { eq, lt, desc, and } from 'drizzle-orm';
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import {
-  usersSqlite, usersPostgres, usersMysql,
-  permissionsSqlite, permissionsPostgres, permissionsMysql,
-  sessionsSqlite, sessionsPostgres, sessionsMysql,
-  auditLogSqlite, auditLogPostgres, auditLogMysql,
-  apiTokensSqlite, apiTokensPostgres, apiTokensMysql,
+  usersPostgres,
+  permissionsPostgres,
+  auditLogPostgres,
+  apiTokensPostgres,
 } from '../schema/auth.js';
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType } from '../types.js';
@@ -92,9 +91,9 @@ export interface DbPermission {
   canViewOnMap: boolean;
   canRead: boolean;
   canWrite: boolean;
-  canDelete?: boolean; // PostgreSQL only
-  grantedAt?: number; // SQLite only
-  grantedBy?: number | null; // SQLite only
+  canDelete?: boolean; // PostgreSQL/MySQL only
+  grantedAt?: number;
+  grantedBy?: number | null;
 }
 
 /**
@@ -106,9 +105,9 @@ export interface CreatePermissionInput {
   canViewOnMap?: boolean;
   canRead?: boolean;
   canWrite?: boolean;
-  canDelete?: boolean; // PostgreSQL only
-  grantedAt?: number; // SQLite only
-  grantedBy?: number | null; // SQLite only
+  canDelete?: boolean; // PostgreSQL/MySQL only
+  grantedAt?: number;
+  grantedBy?: number | null;
 }
 
 /**
@@ -173,141 +172,67 @@ export class AuthRepository extends BaseRepository {
    * Get user by ID
    */
   async getUserById(id: number): Promise<DbUser | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(usersSqlite)
-        .where(eq(usersSqlite.id, id))
-        .limit(1);
+    const { users } = this.tables;
+    const result = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.id, id))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbUser;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(usersMysql)
-        .where(eq(usersMysql.id, id))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbUser;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(usersPostgres)
-        .where(eq(usersPostgres.id, id))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbUser;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbUser;
   }
 
   /**
    * Get user by username
    */
   async getUserByUsername(username: string): Promise<DbUser | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(usersSqlite)
-        .where(eq(usersSqlite.username, username))
-        .limit(1);
+    const { users } = this.tables;
+    const result = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.username, username))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbUser;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(usersMysql)
-        .where(eq(usersMysql.username, username))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbUser;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(usersPostgres)
-        .where(eq(usersPostgres.username, username))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbUser;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbUser;
   }
 
   /**
    * Get user by OIDC subject
    */
   async getUserByOidcSubject(oidcSubject: string): Promise<DbUser | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(usersSqlite)
-        .where(eq(usersSqlite.oidcSubject, oidcSubject))
-        .limit(1);
+    const { users } = this.tables;
+    const result = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.oidcSubject, oidcSubject))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbUser;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(usersMysql)
-        .where(eq(usersMysql.oidcSubject, oidcSubject))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbUser;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(usersPostgres)
-        .where(eq(usersPostgres.oidcSubject, oidcSubject))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbUser;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbUser;
   }
 
   /**
    * Get all users
    */
   async getAllUsers(): Promise<DbUser[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db.select().from(usersSqlite);
-      return result.map(u => this.normalizeBigInts(u) as DbUser);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db.select().from(usersMysql);
-      return result as DbUser[];
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db.select().from(usersPostgres);
-      return result as DbUser[];
-    }
+    const { users } = this.tables;
+    const result = await this.db.select().from(users);
+    return this.normalizeBigInts(result) as DbUser[];
   }
 
   /**
-   * Create a new user
+   * Create a new user.
+   * Keeps branching: SQLite lacks updatedAt column, different insertId patterns.
    */
   async createUser(user: CreateUserInput): Promise<number> {
+    const { users } = this.tables;
     if (this.isSQLite()) {
       const db = this.getSqliteDb();
       // SQLite doesn't have updatedAt column - remove it from the insert
       const { updatedAt, ...sqliteUser } = user;
-      const result = await db.insert(usersSqlite).values(sqliteUser);
+      const result = await db.insert(users).values(sqliteUser);
       return Number(result.lastInsertRowid);
     } else if (this.isMySQL()) {
       const db = this.getMysqlDb();
@@ -315,7 +240,7 @@ export class AuthRepository extends BaseRepository {
       if (!user.updatedAt) {
         user.updatedAt = Date.now();
       }
-      const result = await db.insert(usersMysql).values(user as Required<Pick<CreateUserInput, 'updatedAt'>> & CreateUserInput);
+      const result = await db.insert(users).values(user as Required<Pick<CreateUserInput, 'updatedAt'>> & CreateUserInput);
       return Number(result[0].insertId);
     } else {
       const db = this.getPostgresDb();
@@ -323,34 +248,27 @@ export class AuthRepository extends BaseRepository {
       if (!user.updatedAt) {
         user.updatedAt = Date.now();
       }
-      const result = await db.insert(usersPostgres).values(user as Required<Pick<CreateUserInput, 'updatedAt'>> & CreateUserInput).returning({ id: usersPostgres.id });
+      const result = await db.insert(users).values(user as Required<Pick<CreateUserInput, 'updatedAt'>> & CreateUserInput).returning({ id: usersPostgres.id });
       return result[0].id;
     }
   }
 
   /**
-   * Update user
+   * Update user.
+   * Keeps branching: SQLite lacks updatedAt column.
    */
   async updateUser(id: number, updates: UpdateUserInput): Promise<void> {
+    const { users } = this.tables;
     if (this.isSQLite()) {
-      const db = this.getSqliteDb();
       // SQLite doesn't have updatedAt column - remove it from the update
       const { updatedAt, ...sqliteUpdates } = updates;
-      await db.update(usersSqlite).set(sqliteUpdates).where(eq(usersSqlite.id, id));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      // Auto-set updatedAt for MySQL if not provided
-      if (!updates.updatedAt) {
-        updates.updatedAt = Date.now();
-      }
-      await db.update(usersMysql).set(updates).where(eq(usersMysql.id, id));
+      await this.db.update(users).set(sqliteUpdates).where(eq(users.id, id));
     } else {
-      const db = this.getPostgresDb();
-      // Auto-set updatedAt for PostgreSQL if not provided
+      // Auto-set updatedAt for MySQL/PostgreSQL if not provided
       if (!updates.updatedAt) {
         updates.updatedAt = Date.now();
       }
-      await db.update(usersPostgres).set(updates).where(eq(usersPostgres.id, id));
+      await this.db.update(users).set(updates).where(eq(users.id, id));
     }
   }
 
@@ -361,38 +279,18 @@ export class AuthRepository extends BaseRepository {
     const existing = await this.getUserById(id);
     if (!existing) return false;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db.delete(usersSqlite).where(eq(usersSqlite.id, id));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db.delete(usersMysql).where(eq(usersMysql.id, id));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      await db.delete(usersPostgres).where(eq(usersPostgres.id, id));
-      return true;
-    }
+    const { users } = this.tables;
+    await this.db.delete(users).where(eq(users.id, id));
+    return true;
   }
 
   /**
    * Get user count
    */
   async getUserCount(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db.select().from(usersSqlite);
-      return result.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db.select().from(usersMysql);
-      return result.length;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db.select().from(usersPostgres);
-      return result.length;
-    }
+    const { users } = this.tables;
+    const result = await this.db.select().from(users);
+    return result.length;
   }
 
   // ============ PERMISSIONS ============
@@ -401,55 +299,38 @@ export class AuthRepository extends BaseRepository {
    * Get permissions for a user
    */
   async getPermissionsForUser(userId: number): Promise<DbPermission[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(permissionsSqlite)
-        .where(eq(permissionsSqlite.userId, userId));
-      return result.map(p => this.normalizeBigInts(p) as DbPermission);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(permissionsMysql)
-        .where(eq(permissionsMysql.userId, userId));
-      return result as DbPermission[];
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(permissionsPostgres)
-        .where(eq(permissionsPostgres.userId, userId));
-      return result as DbPermission[];
-    }
+    const { permissions } = this.tables;
+    const result = await this.db
+      .select()
+      .from(permissions)
+      .where(eq(permissions.userId, userId));
+    return this.normalizeBigInts(result) as DbPermission[];
   }
 
   /**
-   * Create permission
+   * Create permission.
+   * Keeps branching: SQLite doesn't have canDelete, PG/MySQL do.
+   * All backends now support grantedAt/grantedBy.
    */
   async createPermission(permission: CreatePermissionInput): Promise<number> {
+    const { permissions } = this.tables;
+    const permissionWithGrantedAt = {
+      ...permission,
+      grantedAt: permission.grantedAt ?? Date.now(),
+    };
     if (this.isSQLite()) {
       const db = this.getSqliteDb();
-      // SQLite requires grantedAt, doesn't have canDelete
-      const { canDelete, ...rest } = permission;
-      const sqlitePermission = {
-        ...rest,
-        grantedAt: permission.grantedAt ?? Date.now(),
-      };
-      const result = await db.insert(permissionsSqlite).values(sqlitePermission);
+      // SQLite doesn't have canDelete
+      const { canDelete, ...rest } = permissionWithGrantedAt;
+      const result = await db.insert(permissions).values(rest);
       return Number(result.lastInsertRowid);
     } else if (this.isMySQL()) {
       const db = this.getMysqlDb();
-      // MySQL doesn't have grantedAt/grantedBy but has canDelete
-      const { grantedAt, grantedBy, ...mysqlPermission } = permission;
-      const result = await db.insert(permissionsMysql).values(mysqlPermission);
+      const result = await db.insert(permissions).values(permissionWithGrantedAt);
       return Number(result[0].insertId);
     } else {
       const db = this.getPostgresDb();
-      // PostgreSQL doesn't have grantedAt/grantedBy
-      const { grantedAt, grantedBy, ...postgresPermission } = permission;
-      const result = await db.insert(permissionsPostgres).values(postgresPermission).returning({ id: permissionsPostgres.id });
+      const result = await db.insert(permissions).values(permissionWithGrantedAt).returning({ id: permissionsPostgres.id });
       return result[0].id;
     }
   }
@@ -458,40 +339,16 @@ export class AuthRepository extends BaseRepository {
    * Delete permissions for a user
    */
   async deletePermissionsForUser(userId: number): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: permissionsSqlite.id })
-        .from(permissionsSqlite)
-        .where(eq(permissionsSqlite.userId, userId));
+    const { permissions } = this.tables;
+    const toDelete = await this.db
+      .select({ id: permissions.id })
+      .from(permissions)
+      .where(eq(permissions.userId, userId));
 
-      for (const p of toDelete) {
-        await db.delete(permissionsSqlite).where(eq(permissionsSqlite.id, p.id));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: permissionsMysql.id })
-        .from(permissionsMysql)
-        .where(eq(permissionsMysql.userId, userId));
-
-      for (const p of toDelete) {
-        await db.delete(permissionsMysql).where(eq(permissionsMysql.id, p.id));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: permissionsPostgres.id })
-        .from(permissionsPostgres)
-        .where(eq(permissionsPostgres.userId, userId));
-
-      for (const p of toDelete) {
-        await db.delete(permissionsPostgres).where(eq(permissionsPostgres.id, p.id));
-      }
-      return toDelete.length;
+    for (const p of toDelete) {
+      await this.db.delete(permissions).where(eq(permissions.id, p.id));
     }
+    return toDelete.length;
   }
 
   // ============ API TOKENS ============
@@ -500,82 +357,46 @@ export class AuthRepository extends BaseRepository {
    * Get API token by hash
    */
   async getApiTokenByHash(tokenHash: string): Promise<DbApiToken | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(apiTokensSqlite)
-        .where(eq(apiTokensSqlite.tokenHash, tokenHash))
-        .limit(1);
+    const { apiTokens } = this.tables;
+    const result = await this.db
+      .select()
+      .from(apiTokens)
+      .where(eq(apiTokens.tokenHash, tokenHash))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbApiToken;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(apiTokensMysql)
-        .where(eq(apiTokensMysql.tokenHash, tokenHash))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbApiToken;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(apiTokensPostgres)
-        .where(eq(apiTokensPostgres.tokenHash, tokenHash))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbApiToken;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbApiToken;
   }
 
   /**
    * Get API tokens for a user
    */
   async getApiTokensForUser(userId: number): Promise<DbApiToken[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(apiTokensSqlite)
-        .where(eq(apiTokensSqlite.userId, userId));
-      return result.map(t => this.normalizeBigInts(t) as DbApiToken);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(apiTokensMysql)
-        .where(eq(apiTokensMysql.userId, userId));
-      return result as DbApiToken[];
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(apiTokensPostgres)
-        .where(eq(apiTokensPostgres.userId, userId));
-      return result as DbApiToken[];
-    }
+    const { apiTokens } = this.tables;
+    const result = await this.db
+      .select()
+      .from(apiTokens)
+      .where(eq(apiTokens.userId, userId));
+    return this.normalizeBigInts(result) as DbApiToken[];
   }
 
   /**
-   * Create API token
+   * Create API token.
+   * Keeps branching: different insertId access patterns per dialect.
    */
   async createApiToken(token: CreateApiTokenInput): Promise<number> {
+    const { apiTokens } = this.tables;
     if (this.isSQLite()) {
       const db = this.getSqliteDb();
-      const result = await db.insert(apiTokensSqlite).values(token);
+      const result = await db.insert(apiTokens).values(token);
       return Number(result.lastInsertRowid);
     } else if (this.isMySQL()) {
       const db = this.getMysqlDb();
-      const result = await db.insert(apiTokensMysql).values(token);
+      const result = await db.insert(apiTokens).values(token);
       return Number(result[0].insertId);
     } else {
       const db = this.getPostgresDb();
-      const result = await db.insert(apiTokensPostgres).values(token).returning({ id: apiTokensPostgres.id });
+      const result = await db.insert(apiTokens).values(token).returning({ id: apiTokensPostgres.id });
       return result[0].id;
     }
   }
@@ -585,50 +406,22 @@ export class AuthRepository extends BaseRepository {
    */
   async updateApiTokenLastUsed(id: number): Promise<void> {
     const now = this.now();
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db.update(apiTokensSqlite).set({ lastUsedAt: now }).where(eq(apiTokensSqlite.id, id));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db.update(apiTokensMysql).set({ lastUsedAt: now }).where(eq(apiTokensMysql.id, id));
-    } else {
-      const db = this.getPostgresDb();
-      await db.update(apiTokensPostgres).set({ lastUsedAt: now }).where(eq(apiTokensPostgres.id, id));
-    }
+    const { apiTokens } = this.tables;
+    await this.db.update(apiTokens).set({ lastUsedAt: now }).where(eq(apiTokens.id, id));
   }
 
   /**
    * Delete API token
    */
   async deleteApiToken(id: number): Promise<boolean> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const existing = await db
-        .select({ id: apiTokensSqlite.id })
-        .from(apiTokensSqlite)
-        .where(eq(apiTokensSqlite.id, id));
-      if (existing.length === 0) return false;
-      await db.delete(apiTokensSqlite).where(eq(apiTokensSqlite.id, id));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const existing = await db
-        .select({ id: apiTokensMysql.id })
-        .from(apiTokensMysql)
-        .where(eq(apiTokensMysql.id, id));
-      if (existing.length === 0) return false;
-      await db.delete(apiTokensMysql).where(eq(apiTokensMysql.id, id));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      const existing = await db
-        .select({ id: apiTokensPostgres.id })
-        .from(apiTokensPostgres)
-        .where(eq(apiTokensPostgres.id, id));
-      if (existing.length === 0) return false;
-      await db.delete(apiTokensPostgres).where(eq(apiTokensPostgres.id, id));
-      return true;
-    }
+    const { apiTokens } = this.tables;
+    const existing = await this.db
+      .select({ id: apiTokens.id })
+      .from(apiTokens)
+      .where(eq(apiTokens.id, id));
+    if (existing.length === 0) return false;
+    await this.db.delete(apiTokens).where(eq(apiTokens.id, id));
+    return true;
   }
 
   /**
@@ -645,64 +438,25 @@ export class AuthRepository extends BaseRepository {
 
     // Extract prefix (first 12 chars: "mm_v1_" + first 6 chars of random part)
     const prefix = token.substring(0, 12);
+    const { apiTokens } = this.tables;
 
     // Find active tokens with matching prefix
+    const result = await this.db
+      .select({
+        id: apiTokens.id,
+        userId: apiTokens.userId,
+        tokenHash: apiTokens.tokenHash,
+      })
+      .from(apiTokens)
+      .where(and(
+        eq(apiTokens.prefix, prefix),
+        eq(apiTokens.isActive, true)
+      ))
+      .limit(1);
+
     let tokenRecord: { id: number; userId: number; tokenHash: string } | null = null;
-
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select({
-          id: apiTokensSqlite.id,
-          userId: apiTokensSqlite.userId,
-          tokenHash: apiTokensSqlite.tokenHash,
-        })
-        .from(apiTokensSqlite)
-        .where(and(
-          eq(apiTokensSqlite.prefix, prefix),
-          eq(apiTokensSqlite.isActive, true)
-        ))
-        .limit(1);
-
-      if (result.length > 0) {
-        tokenRecord = result[0];
-      }
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select({
-          id: apiTokensMysql.id,
-          userId: apiTokensMysql.userId,
-          tokenHash: apiTokensMysql.tokenHash,
-        })
-        .from(apiTokensMysql)
-        .where(and(
-          eq(apiTokensMysql.prefix, prefix),
-          eq(apiTokensMysql.isActive, true)
-        ))
-        .limit(1);
-
-      if (result.length > 0) {
-        tokenRecord = result[0];
-      }
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select({
-          id: apiTokensPostgres.id,
-          userId: apiTokensPostgres.userId,
-          tokenHash: apiTokensPostgres.tokenHash,
-        })
-        .from(apiTokensPostgres)
-        .where(and(
-          eq(apiTokensPostgres.prefix, prefix),
-          eq(apiTokensPostgres.isActive, true)
-        ))
-        .limit(1);
-
-      if (result.length > 0) {
-        tokenRecord = result[0];
-      }
+    if (result.length > 0) {
+      tokenRecord = result[0];
     }
 
     if (!tokenRecord) {
@@ -732,161 +486,64 @@ export class AuthRepository extends BaseRepository {
     createdAt: number;
     lastUsedAt: number | null;
   } | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select({
-          id: apiTokensSqlite.id,
-          prefix: apiTokensSqlite.prefix,
-          isActive: apiTokensSqlite.isActive,
-          createdAt: apiTokensSqlite.createdAt,
-          lastUsedAt: apiTokensSqlite.lastUsedAt,
-        })
-        .from(apiTokensSqlite)
-        .where(and(
-          eq(apiTokensSqlite.userId, userId),
-          eq(apiTokensSqlite.isActive, true)
-        ))
-        .limit(1);
+    const { apiTokens } = this.tables;
+    const result = await this.db
+      .select({
+        id: apiTokens.id,
+        prefix: apiTokens.prefix,
+        isActive: apiTokens.isActive,
+        createdAt: apiTokens.createdAt,
+        lastUsedAt: apiTokens.lastUsedAt,
+      })
+      .from(apiTokens)
+      .where(and(
+        eq(apiTokens.userId, userId),
+        eq(apiTokens.isActive, true)
+      ))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      const r = this.normalizeBigInts(result[0]);
-      return {
-        id: r.id as number,
-        prefix: r.prefix as string,
-        isActive: Boolean(r.isActive),
-        createdAt: r.createdAt as number,
-        lastUsedAt: r.lastUsedAt as number | null,
-      };
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select({
-          id: apiTokensMysql.id,
-          prefix: apiTokensMysql.prefix,
-          isActive: apiTokensMysql.isActive,
-          createdAt: apiTokensMysql.createdAt,
-          lastUsedAt: apiTokensMysql.lastUsedAt,
-        })
-        .from(apiTokensMysql)
-        .where(and(
-          eq(apiTokensMysql.userId, userId),
-          eq(apiTokensMysql.isActive, true)
-        ))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return {
-        id: result[0].id,
-        prefix: result[0].prefix,
-        isActive: Boolean(result[0].isActive),
-        createdAt: result[0].createdAt,
-        lastUsedAt: result[0].lastUsedAt,
-      };
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select({
-          id: apiTokensPostgres.id,
-          prefix: apiTokensPostgres.prefix,
-          isActive: apiTokensPostgres.isActive,
-          createdAt: apiTokensPostgres.createdAt,
-          lastUsedAt: apiTokensPostgres.lastUsedAt,
-        })
-        .from(apiTokensPostgres)
-        .where(and(
-          eq(apiTokensPostgres.userId, userId),
-          eq(apiTokensPostgres.isActive, true)
-        ))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return {
-        id: result[0].id,
-        prefix: result[0].prefix,
-        isActive: Boolean(result[0].isActive),
-        createdAt: result[0].createdAt,
-        lastUsedAt: result[0].lastUsedAt,
-      };
-    }
+    if (result.length === 0) return null;
+    const r = this.normalizeBigInts(result[0]);
+    return {
+      id: r.id as number,
+      prefix: r.prefix as string,
+      isActive: Boolean(r.isActive),
+      createdAt: r.createdAt as number,
+      lastUsedAt: r.lastUsedAt as number | null,
+    };
   }
 
   /**
-   * Revoke an API token by ID
+   * Revoke an API token by ID.
+   * Keeps branching: different result shapes for affected row count.
    */
   async revokeApiToken(tokenId: number, revokedBy: number): Promise<boolean> {
     const now = this.now();
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .update(apiTokensSqlite)
-        .set({ isActive: false, revokedAt: now, revokedBy })
-        .where(and(
-          eq(apiTokensSqlite.id, tokenId),
-          eq(apiTokensSqlite.isActive, true)
-        ));
-      return (result.changes ?? 0) > 0;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .update(apiTokensMysql)
-        .set({ isActive: false, revokedAt: now, revokedBy })
-        .where(and(
-          eq(apiTokensMysql.id, tokenId),
-          eq(apiTokensMysql.isActive, true)
-        ));
-      return (result[0].affectedRows ?? 0) > 0;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .update(apiTokensPostgres)
-        .set({ isActive: false, revokedAt: now, revokedBy })
-        .where(and(
-          eq(apiTokensPostgres.id, tokenId),
-          eq(apiTokensPostgres.isActive, true)
-        ))
-        .returning({ id: apiTokensPostgres.id });
-      return result.length > 0;
-    }
+    const { apiTokens } = this.tables;
+    const result = await this.db
+      .update(apiTokens)
+      .set({ isActive: false, revokedAt: now, revokedBy })
+      .where(and(
+        eq(apiTokens.id, tokenId),
+        eq(apiTokens.isActive, true)
+      ));
+    return this.getAffectedRows(result) > 0;
   }
 
   /**
-   * Revoke all active API tokens for a user
+   * Revoke all active API tokens for a user.
    */
   async revokeAllUserApiTokens(userId: number, revokedBy: number): Promise<number> {
     const now = this.now();
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .update(apiTokensSqlite)
-        .set({ isActive: false, revokedAt: now, revokedBy })
-        .where(and(
-          eq(apiTokensSqlite.userId, userId),
-          eq(apiTokensSqlite.isActive, true)
-        ));
-      return result.changes ?? 0;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .update(apiTokensMysql)
-        .set({ isActive: false, revokedAt: now, revokedBy })
-        .where(and(
-          eq(apiTokensMysql.userId, userId),
-          eq(apiTokensMysql.isActive, true)
-        ));
-      return result[0].affectedRows ?? 0;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .update(apiTokensPostgres)
-        .set({ isActive: false, revokedAt: now, revokedBy })
-        .where(and(
-          eq(apiTokensPostgres.userId, userId),
-          eq(apiTokensPostgres.isActive, true)
-        ))
-        .returning({ id: apiTokensPostgres.id });
-      return result.length;
-    }
+    const { apiTokens } = this.tables;
+    const result = await this.db
+      .update(apiTokens)
+      .set({ isActive: false, revokedAt: now, revokedBy })
+      .where(and(
+        eq(apiTokens.userId, userId),
+        eq(apiTokens.isActive, true)
+      ));
+    return this.getAffectedRows(result);
   }
 
   /**
@@ -941,47 +598,33 @@ export class AuthRepository extends BaseRepository {
   // ============ AUDIT LOG ============
 
   /**
-   * Create audit log entry
+   * Create audit log entry.
+   * Keeps branching: different insertId access patterns per dialect.
    */
   async createAuditLogEntry(entry: DbAuditLogEntry): Promise<number> {
+    const { auditLog } = this.tables;
+    const values = {
+      userId: entry.userId,
+      username: entry.username,
+      action: entry.action,
+      resource: entry.resource,
+      details: entry.details,
+      ipAddress: entry.ipAddress,
+      userAgent: entry.userAgent,
+      timestamp: entry.timestamp,
+    };
+
     if (this.isSQLite()) {
       const db = this.getSqliteDb();
-      const result = await db.insert(auditLogSqlite).values({
-        userId: entry.userId,
-        username: entry.username,
-        action: entry.action,
-        resource: entry.resource,
-        details: entry.details,
-        ipAddress: entry.ipAddress,
-        userAgent: entry.userAgent,
-        timestamp: entry.timestamp,
-      });
+      const result = await db.insert(auditLog).values(values);
       return Number(result.lastInsertRowid);
     } else if (this.isMySQL()) {
       const db = this.getMysqlDb();
-      const result = await db.insert(auditLogMysql).values({
-        userId: entry.userId,
-        username: entry.username,
-        action: entry.action,
-        resource: entry.resource,
-        details: entry.details,
-        ipAddress: entry.ipAddress,
-        userAgent: entry.userAgent,
-        timestamp: entry.timestamp,
-      });
+      const result = await db.insert(auditLog).values(values);
       return Number(result[0].insertId);
     } else {
       const db = this.getPostgresDb();
-      const result = await db.insert(auditLogPostgres).values({
-        userId: entry.userId,
-        username: entry.username,
-        action: entry.action,
-        resource: entry.resource,
-        details: entry.details,
-        ipAddress: entry.ipAddress,
-        userAgent: entry.userAgent,
-        timestamp: entry.timestamp,
-      }).returning({ id: auditLogPostgres.id });
+      const result = await db.insert(auditLog).values(values).returning({ id: auditLogPostgres.id });
       return result[0].id;
     }
   }
@@ -990,34 +633,14 @@ export class AuthRepository extends BaseRepository {
    * Get audit log entries with pagination
    */
   async getAuditLogEntries(limit: number = 100, offset: number = 0): Promise<DbAuditLogEntry[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(auditLogSqlite)
-        .orderBy(desc(auditLogSqlite.timestamp))
-        .limit(limit)
-        .offset(offset);
-      return result.map(e => this.normalizeBigInts(e) as DbAuditLogEntry);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(auditLogMysql)
-        .orderBy(desc(auditLogMysql.timestamp))
-        .limit(limit)
-        .offset(offset);
-      return result as DbAuditLogEntry[];
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(auditLogPostgres)
-        .orderBy(desc(auditLogPostgres.timestamp))
-        .limit(limit)
-        .offset(offset);
-      return result as DbAuditLogEntry[];
-    }
+    const { auditLog } = this.tables;
+    const result = await this.db
+      .select()
+      .from(auditLog)
+      .orderBy(desc(auditLog.timestamp))
+      .limit(limit)
+      .offset(offset);
+    return this.normalizeBigInts(result) as DbAuditLogEntry[];
   }
 
   /**
@@ -1025,41 +648,17 @@ export class AuthRepository extends BaseRepository {
    */
   async cleanupOldAuditLogs(days: number = 90): Promise<number> {
     const cutoff = this.now() - (days * 24 * 60 * 60 * 1000);
+    const { auditLog } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: auditLogSqlite.id })
-        .from(auditLogSqlite)
-        .where(lt(auditLogSqlite.timestamp, cutoff));
+    const toDelete = await this.db
+      .select({ id: auditLog.id })
+      .from(auditLog)
+      .where(lt(auditLog.timestamp, cutoff));
 
-      for (const entry of toDelete) {
-        await db.delete(auditLogSqlite).where(eq(auditLogSqlite.id, entry.id));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: auditLogMysql.id })
-        .from(auditLogMysql)
-        .where(lt(auditLogMysql.timestamp, cutoff));
-
-      for (const entry of toDelete) {
-        await db.delete(auditLogMysql).where(eq(auditLogMysql.id, entry.id));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: auditLogPostgres.id })
-        .from(auditLogPostgres)
-        .where(lt(auditLogPostgres.timestamp, cutoff));
-
-      for (const entry of toDelete) {
-        await db.delete(auditLogPostgres).where(eq(auditLogPostgres.id, entry.id));
-      }
-      return toDelete.length;
+    for (const entry of toDelete) {
+      await this.db.delete(auditLog).where(eq(auditLog.id, entry.id));
     }
+    return toDelete.length;
   }
 
   // ============ SESSIONS ============
@@ -1068,86 +667,31 @@ export class AuthRepository extends BaseRepository {
    * Get session by SID
    */
   async getSession(sid: string): Promise<{ sid: string; sess: string; expire: number } | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(sessionsSqlite)
-        .where(eq(sessionsSqlite.sid, sid))
-        .limit(1);
+    const { sessions } = this.tables;
+    const result = await this.db
+      .select()
+      .from(sessions)
+      .where(eq(sessions.sid, sid))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as { sid: string; sess: string; expire: number };
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(sessionsMysql)
-        .where(eq(sessionsMysql.sid, sid))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as { sid: string; sess: string; expire: number };
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(sessionsPostgres)
-        .where(eq(sessionsPostgres.sid, sid))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as { sid: string; sess: string; expire: number };
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as { sid: string; sess: string; expire: number };
   }
 
   /**
-   * Set session (upsert)
+   * Set session (upsert).
    */
   async setSession(sid: string, sess: string, expire: number): Promise<void> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .insert(sessionsSqlite)
-        .values({ sid, sess, expire })
-        .onConflictDoUpdate({
-          target: sessionsSqlite.sid,
-          set: { sess, expire },
-        });
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .insert(sessionsMysql)
-        .values({ sid, sess, expire })
-        .onDuplicateKeyUpdate({
-          set: { sess, expire },
-        });
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .insert(sessionsPostgres)
-        .values({ sid, sess, expire })
-        .onConflictDoUpdate({
-          target: sessionsPostgres.sid,
-          set: { sess, expire },
-        });
-    }
+    const { sessions } = this.tables;
+    await this.upsert(sessions, { sid, sess, expire }, sessions.sid, { sess, expire });
   }
 
   /**
    * Delete session
    */
   async deleteSession(sid: string): Promise<void> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db.delete(sessionsSqlite).where(eq(sessionsSqlite.sid, sid));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db.delete(sessionsMysql).where(eq(sessionsMysql.sid, sid));
-    } else {
-      const db = this.getPostgresDb();
-      await db.delete(sessionsPostgres).where(eq(sessionsPostgres.sid, sid));
-    }
+    const { sessions } = this.tables;
+    await this.db.delete(sessions).where(eq(sessions.sid, sid));
   }
 
   /**
@@ -1155,40 +699,122 @@ export class AuthRepository extends BaseRepository {
    */
   async cleanupExpiredSessions(): Promise<number> {
     const now = this.now();
+    const { sessions } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ sid: sessionsSqlite.sid })
-        .from(sessionsSqlite)
-        .where(lt(sessionsSqlite.expire, now));
+    const toDelete = await this.db
+      .select({ sid: sessions.sid })
+      .from(sessions)
+      .where(lt(sessions.expire, now));
 
-      for (const session of toDelete) {
-        await db.delete(sessionsSqlite).where(eq(sessionsSqlite.sid, session.sid));
+    for (const session of toDelete) {
+      await this.db.delete(sessions).where(eq(sessions.sid, session.sid));
+    }
+    return toDelete.length;
+  }
+
+  /**
+   * Migrate channel permissions when channels are moved between slots.
+   * Uses the same swap/move pattern as message migration.
+   */
+  async migratePermissionsForChannelMoves(moves: { from: number; to: number }[]): Promise<void> {
+    if (moves.length === 0) return;
+
+    const { permissions } = this.tables;
+
+    // Detect swap pairs
+    const swapPairs = new Set<string>();
+    for (const move of moves) {
+      const reverse = moves.find(m => m.from === move.to && m.to === move.from);
+      if (reverse) {
+        swapPairs.add([Math.min(move.from, move.to), Math.max(move.from, move.to)].join(','));
       }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ sid: sessionsMysql.sid })
-        .from(sessionsMysql)
-        .where(lt(sessionsMysql.expire, now));
+    }
 
-      for (const session of toDelete) {
-        await db.delete(sessionsMysql).where(eq(sessionsMysql.sid, session.sid));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ sid: sessionsPostgres.sid })
-        .from(sessionsPostgres)
-        .where(lt(sessionsPostgres.expire, now));
+    // Helper: read all permissions for a resource, delete them, re-insert with new resource
+    // Uses Drizzle ORM to handle column naming differences across backends
+    // and avoids SQLite CHECK constraint on resource values (no temp values needed)
+    const movePermissions = async (fromResource: string, toResource: string) => {
+      const rows = await this.db
+        .select()
+        .from(permissions)
+        .where(eq(permissions.resource, fromResource));
+      if (rows.length === 0) return;
 
-      for (const session of toDelete) {
-        await db.delete(sessionsPostgres).where(eq(sessionsPostgres.sid, session.sid));
+      await this.db.delete(permissions).where(eq(permissions.resource, fromResource));
+
+      for (const row of rows) {
+        const values: any = {
+          userId: (row as any).userId,
+          resource: toResource,
+          canViewOnMap: (row as any).canViewOnMap,
+          canRead: (row as any).canRead,
+          canWrite: (row as any).canWrite,
+          grantedAt: (row as any).grantedAt ?? Date.now(),
+          grantedBy: (row as any).grantedBy,
+        };
+        // PG/MySQL have canDelete, SQLite does not
+        if (!this.isSQLite()) {
+          values.canDelete = (row as any).canDelete;
+        }
+        await this.db.insert(permissions).values(values);
       }
-      return toDelete.length;
+    };
+
+    // Process swaps using delete + re-insert (avoids CHECK constraint issues)
+    const processedSwaps = new Set<string>();
+    for (const move of moves) {
+      const key = [Math.min(move.from, move.to), Math.max(move.from, move.to)].join(',');
+      if (swapPairs.has(key) && !processedSwaps.has(key)) {
+        processedSwaps.add(key);
+        const a = Math.min(move.from, move.to);
+        const b = Math.max(move.from, move.to);
+        const resourceA = 'channel_' + a;
+        const resourceB = 'channel_' + b;
+
+        // Read both before deleting either
+        const rowsA = await this.db.select().from(permissions).where(eq(permissions.resource, resourceA));
+        const rowsB = await this.db.select().from(permissions).where(eq(permissions.resource, resourceB));
+
+        // Delete both
+        await this.db.delete(permissions).where(eq(permissions.resource, resourceA));
+        await this.db.delete(permissions).where(eq(permissions.resource, resourceB));
+
+        // Re-insert swapped: A's permissions → resourceB, B's → resourceA
+        for (const row of rowsA) {
+          const values: any = {
+            userId: (row as any).userId,
+            resource: resourceB,
+            canViewOnMap: (row as any).canViewOnMap,
+            canRead: (row as any).canRead,
+            canWrite: (row as any).canWrite,
+            grantedAt: (row as any).grantedAt ?? Date.now(),
+            grantedBy: (row as any).grantedBy,
+          };
+          if (!this.isSQLite()) values.canDelete = (row as any).canDelete;
+          await this.db.insert(permissions).values(values);
+        }
+        for (const row of rowsB) {
+          const values: any = {
+            userId: (row as any).userId,
+            resource: resourceA,
+            canViewOnMap: (row as any).canViewOnMap,
+            canRead: (row as any).canRead,
+            canWrite: (row as any).canWrite,
+            grantedAt: (row as any).grantedAt ?? Date.now(),
+            grantedBy: (row as any).grantedBy,
+          };
+          if (!this.isSQLite()) values.canDelete = (row as any).canDelete;
+          await this.db.insert(permissions).values(values);
+        }
+      }
+    }
+
+    // Process simple moves using delete + re-insert (consistent approach across all backends)
+    for (const move of moves) {
+      const key = [Math.min(move.from, move.to), Math.max(move.from, move.to)].join(',');
+      if (!swapPairs.has(key)) {
+        await movePermissions('channel_' + move.from, 'channel_' + move.to);
+      }
     }
   }
 }

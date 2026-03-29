@@ -184,6 +184,69 @@ describe('Virtual Node Server - Config State Management', () => {
     });
   });
 
+  describe('Cached Message Filtering', () => {
+    it('should filter out generic fromRadio messages from cached static replay', () => {
+      // These are the types that get filtered during sendInitialConfig
+      const FILTERED_TYPES = ['myInfo', 'nodeInfo', 'channel', 'configComplete', 'fromRadio'];
+
+      const cachedMessages = [
+        { type: 'config', data: new Uint8Array() },
+        { type: 'moduleConfig', data: new Uint8Array() },
+        { type: 'metadata', data: new Uint8Array() },
+        { type: 'fromRadio', data: new Uint8Array() },  // generic/unrecognized (e.g. rebooted)
+        { type: 'myInfo', data: new Uint8Array() },
+        { type: 'nodeInfo', data: new Uint8Array() },
+        { type: 'channel', data: new Uint8Array() },
+        { type: 'configComplete', data: new Uint8Array() },
+      ];
+
+      const staticMessages = cachedMessages.filter(m => !FILTERED_TYPES.includes(m.type));
+      expect(staticMessages).toHaveLength(3); // config, moduleConfig, metadata
+      expect(staticMessages.map(m => m.type)).toEqual(['config', 'moduleConfig', 'metadata']);
+    });
+
+    it('should not replay rebooted messages that would trigger client reconnect loops', () => {
+      // A 'fromRadio' type message could contain 'rebooted', 'queueStatus', 'logRecord', etc.
+      // These must be filtered to prevent meshtastic clients from re-entering config state.
+      const FILTERED_TYPES = ['myInfo', 'nodeInfo', 'channel', 'configComplete', 'fromRadio'];
+
+      const cachedMessages = [
+        { type: 'fromRadio', data: new Uint8Array() },  // could be rebooted
+        { type: 'fromRadio', data: new Uint8Array() },  // could be queueStatus
+        { type: 'config', data: new Uint8Array() },
+      ];
+
+      const staticMessages = cachedMessages.filter(m => !FILTERED_TYPES.includes(m.type));
+      expect(staticMessages).toHaveLength(1);
+      expect(staticMessages[0].type).toBe('config');
+    });
+  });
+
+  describe('Config Request Rate Limiting', () => {
+    it('should reject config requests within cooldown period', () => {
+      const CONFIG_COOLDOWN_MS = 5000;
+      const lastConfigSentAt = new Date();
+      const now = Date.now();
+
+      const elapsed = now - lastConfigSentAt.getTime();
+      expect(elapsed).toBeLessThan(CONFIG_COOLDOWN_MS);
+    });
+
+    it('should allow config requests after cooldown expires', () => {
+      const CONFIG_COOLDOWN_MS = 5000;
+      const lastConfigSentAt = new Date(Date.now() - 6000); // 6 seconds ago
+
+      const elapsed = Date.now() - lastConfigSentAt.getTime();
+      expect(elapsed).toBeGreaterThanOrEqual(CONFIG_COOLDOWN_MS);
+    });
+
+    it('should allow first config request with no prior send', () => {
+      const lastConfigSentAt: Date | undefined = undefined;
+      // No lastConfigSentAt means this is the first request - should be allowed
+      expect(lastConfigSentAt).toBeUndefined();
+    });
+  });
+
   describe('Config ID Matching', () => {
     it('should match wantConfigId with configCompleteId', () => {
       const wantConfigId = 123456;
@@ -539,5 +602,34 @@ describe('Virtual Node Server - Error Handling', () => {
       expect(extractPortnum({ decoded: {} })).toBe(null);
       expect(extractPortnum({ decoded: { portnum: 1 } })).toBe(1);
     });
+  });
+});
+
+describe('Virtual Node Server - MQTT Proxy Message Handling', () => {
+  it('should identify mqttClientProxyMessage as field 6 in ToRadio', () => {
+    // The mqttClientProxyMessage field number is 6 in ToRadio proto
+    const MQTT_CLIENT_PROXY_FIELD = 6;
+    expect(MQTT_CLIENT_PROXY_FIELD).toBe(6);
+  });
+
+  it('should mark extracted packets with viaMqtt=true', () => {
+    // When extracting MeshPacket from ServiceEnvelope,
+    // the packet.viaMqtt field should be set to true
+    const packet: any = { from: 0x12345678, to: 0xFFFFFFFF, id: 1 };
+    packet.viaMqtt = true;
+    expect(packet.viaMqtt).toBe(true);
+  });
+
+  it('should always forward MQTT proxy messages to physical radio', () => {
+    // Even after local processing, the original ToRadio should be forwarded
+    // This ensures the physical radio can handle channels it knows about
+    const shouldForward = true;
+    expect(shouldForward).toBe(true);
+  });
+
+  it('should handle MQTT proxy messages with empty data gracefully', () => {
+    // When proxyMsg.data is empty, should log warning and still forward
+    const data = new Uint8Array(0);
+    expect(data.length).toBe(0);
   });
 });

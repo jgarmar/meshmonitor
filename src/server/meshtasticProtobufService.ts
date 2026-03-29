@@ -154,13 +154,16 @@ export class MeshtasticProtobufService {
       // Encode the Position as payload
       const payload = Position.encode(positionMessage).finish();
 
+      // For broadcast (0xFFFFFFFF), don't request response or ACK — just broadcast position
+      const isBroadcast = destination === 0xFFFFFFFF;
+
       // Create the Data message with POSITION_APP portnum
       const Data = root.lookupType('meshtastic.Data');
       const dataMessage = Data.create({
         portnum: PortNum.POSITION_APP,
         payload: payload,
         dest: destination,
-        wantResponse: true, // Request position exchange from destination
+        wantResponse: !isBroadcast, // Only request position exchange for unicast
         requestId: requestId
       });
 
@@ -171,7 +174,7 @@ export class MeshtasticProtobufService {
         to: destination,
         channel: channel || 0,
         decoded: dataMessage,
-        wantAck: true, // We want to know if the message was delivered
+        wantAck: !isBroadcast, // Broadcast packets don't get ACKed
         hopLimit: 3 // Default hop limit for position exchange
       });
 
@@ -191,12 +194,12 @@ export class MeshtasticProtobufService {
   /**
    * Create a NodeInfo request ToRadio using proper protobuf encoding
    * This sends a User message with wantResponse=true to request the destination node's user info
-   * Similar to "Exchange User Info" feature in mobile apps - triggers key exchange
+   * Similar to "Exchange Node Info" feature in mobile apps - triggers key exchange
    */
   createNodeInfoRequestMessage(
     destination: number,
     channel?: number,
-    userInfo?: { id: string; longName: string; shortName: string; hwModel?: number; role?: number; publicKey?: Uint8Array }
+    userInfo?: { id: string; longName: string; shortName: string; hwModel?: number; role?: number }
   ): { data: Uint8Array; packetId: number; requestId: number } {
     const root = getProtobufRoot();
     if (!root) {
@@ -225,9 +228,9 @@ export class MeshtasticProtobufService {
         if (userInfo.role !== undefined) {
           userData.role = userInfo.role;
         }
-        if (userInfo.publicKey && userInfo.publicKey.length > 0) {
-          userData.publicKey = userInfo.publicKey;
-        }
+        // NOTE: publicKey is intentionally omitted. The device firmware handles its own
+        // key distribution. Broadcasting a DB-cached key risks distributing stale keys
+        // if the device has regenerated its key pair. See issue #2275.
       }
       // If no user info provided, send empty user (fallback behavior)
 
@@ -1112,10 +1115,11 @@ export class MeshtasticProtobufService {
   async createChannel(channelData: {
     index: number;
     settings: {
-      name: string;
+      name?: string;
       psk?: Buffer;
-      uplinkEnabled: boolean;
-      downlinkEnabled: boolean;
+      uplinkEnabled?: boolean;
+      downlinkEnabled?: boolean;
+      positionPrecision?: number | null;
     };
     role: number;
   }): Promise<Uint8Array | null> {
@@ -1128,20 +1132,47 @@ export class MeshtasticProtobufService {
     try {
       const Channel = root.lookupType('meshtastic.Channel');
       const ChannelSettings = root.lookupType('meshtastic.ChannelSettings');
+      const ModuleSettings = root.lookupType('meshtastic.ModuleSettings');
       const FromRadio = root.lookupType('meshtastic.FromRadio');
 
-      const settings = ChannelSettings.create({
-        name: channelData.settings.name,
-        psk: channelData.settings.psk || Buffer.alloc(0),
-        uplinkEnabled: channelData.settings.uplinkEnabled,
-        downlinkEnabled: channelData.settings.downlinkEnabled,
-      });
+      // Build settings to match what the physical radio sends:
+      // - Only include non-default values (proto3 omits defaults on the wire)
+      // - Include moduleSettings.positionPrecision when available
+      // - Include PSK only when non-empty (empty = no encryption / red lock)
+      const settingsData: Record<string, any> = {};
 
-      const channel = Channel.create({
-        index: channelData.index,
-        settings: settings,
-        role: channelData.role,
-      });
+      if (channelData.settings.psk && channelData.settings.psk.length > 0) {
+        settingsData.psk = channelData.settings.psk;
+      }
+      if (channelData.settings.name) {
+        settingsData.name = channelData.settings.name;
+      }
+      // Only include uplink/downlink if true (false is proto3 default, radio omits it)
+      if (channelData.settings.uplinkEnabled) {
+        settingsData.uplinkEnabled = true;
+      }
+      if (channelData.settings.downlinkEnabled) {
+        settingsData.downlinkEnabled = true;
+      }
+      // Include moduleSettings with positionPrecision when available
+      if (channelData.settings.positionPrecision != null && channelData.settings.positionPrecision > 0) {
+        settingsData.moduleSettings = ModuleSettings.create({
+          positionPrecision: channelData.settings.positionPrecision,
+        });
+      }
+
+      const settings = ChannelSettings.create(settingsData);
+
+      // Only include non-default values in the Channel message
+      // (index=0 and role=DISABLED=0 are proto3 defaults)
+      const channelFields: Record<string, any> = { settings };
+      if (channelData.index !== 0) {
+        channelFields.index = channelData.index;
+      }
+      if (channelData.role !== 0) {
+        channelFields.role = channelData.role;
+      }
+      const channel = Channel.create(channelFields);
 
       const fromRadio = FromRadio.create({
         channel: channel,
@@ -1446,6 +1477,42 @@ export class MeshtasticProtobufService {
     } catch (error) {
       logger.error('❌ Failed to strip PKI encryption:', error);
       return toRadioBytes; // Return original on error
+    }
+  }
+
+  /**
+   * Decode a ServiceEnvelope from raw bytes (typically from mqttClientProxyMessage.data).
+   * Returns the decoded envelope with its MeshPacket, or null if decoding fails or packet is missing.
+   */
+  decodeServiceEnvelope(data: Uint8Array): { packet: any; channelId?: string; gatewayId?: string } | null {
+    const root = getProtobufRoot();
+    if (!root) {
+      logger.error('❌ Protobuf definitions not loaded');
+      return null;
+    }
+
+    if (!data || data.length === 0) {
+      logger.warn('⚠️ Empty data passed to decodeServiceEnvelope');
+      return null;
+    }
+
+    try {
+      const ServiceEnvelope = root.lookupType('meshtastic.ServiceEnvelope');
+      const decoded = ServiceEnvelope.decode(data) as any;
+
+      if (!decoded.packet) {
+        logger.warn('⚠️ ServiceEnvelope has no packet field');
+        return null;
+      }
+
+      return {
+        packet: decoded.packet,
+        channelId: decoded.channelId || undefined,
+        gatewayId: decoded.gatewayId || undefined,
+      };
+    } catch (error) {
+      logger.warn('⚠️ Failed to decode ServiceEnvelope:', error);
+      return null;
     }
   }
 

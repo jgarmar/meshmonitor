@@ -30,10 +30,11 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
     baseUrl,
     currentNodeId = null,
     canEdit = true,
+    onOpenNodeDetails,
   }) => {
     const { t } = useTranslation();
     const csrfFetch = useCsrfFetch();
-    const { solarMonitoringEnabled, preferredDashboardSortOption } = useSettings();
+    const { solarMonitoringEnabled, preferredDashboardSortOption, distanceUnit } = useSettings();
 
     // Modal state
     const [showAddWidgetModal, setShowAddWidgetModal] = useState(false);
@@ -119,7 +120,7 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
     });
 
     // Widgets hook
-    const { addWidget, removeWidget, addNodeToWidget, removeNodeFromWidget, selectTracerouteNode } = useCustomWidgets({
+    const { addWidget, removeWidget, addNodeToWidget, removeNodeFromWidget, selectTracerouteNode, updateWidgetConfig } = useCustomWidgets({
       baseUrl,
       customWidgets,
       setCustomWidgets,
@@ -285,6 +286,9 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
             onAddNodeToWidget={addNodeToWidget}
             onRemoveNodeFromWidget={removeNodeFromWidget}
             onSelectTracerouteNode={selectTracerouteNode}
+            onOpenNodeDetails={onOpenNodeDetails}
+            onUpdateWidgetConfig={updateWidgetConfig}
+            distanceUnit={distanceUnit}
             favorites={filteredAndSortedFavorites}
             nodes={nodes}
             currentNodeId={currentNodeId}

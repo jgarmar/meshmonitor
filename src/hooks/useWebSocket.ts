@@ -236,6 +236,8 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
       // Add message directly to cache - processPollData will run when cache updates
       // and handle timestamp conversion, notification sounds via the useEffect
       addMessageToCache(data);
+      // Invalidate unread counts so badges update promptly (#2316)
+      queryClient.invalidateQueries({ queryKey: ['unreadCounts'] });
     });
 
     socket.on('channel:updated', (data: Channel) => {
@@ -262,6 +264,11 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
       // For batched telemetry, invalidate the telemetry-related queries
       // The poll will refetch with updated telemetry data
       queryClient.invalidateQueries({ queryKey: POLL_QUERY_KEY });
+    });
+
+    socket.on('firmware:status', (data: unknown) => {
+      // Store firmware update status for the FirmwareUpdateSection to consume
+      queryClient.setQueryData(['firmware', 'liveStatus'], data);
     });
 
     // Cleanup on unmount

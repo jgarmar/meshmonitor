@@ -19,9 +19,16 @@ export class TcpTransport extends EventEmitter {
 
   // Stale connection detection
   private lastDataReceived: number = 0;
+  private lastMessageEmitted: number = 0;  // Last time a complete frame was successfully parsed
   private staleConnectionTimeout: number = 300000; // 5 minutes default (in milliseconds)
   private healthCheckInterval: NodeJS.Timeout | null = null;
   private readonly HEALTH_CHECK_INTERVAL_MS = 60000; // Check every minute
+  private readonly BUFFER_STALE_TIMEOUT_MS = 30000; // 30s: if buffer has data but no frames parsed, reset it
+
+  // Configurable TCP timing
+  private connectTimeoutMs: number = 10000; // 10 second default
+  private reconnectInitialDelayMs: number = 1000; // 1 second default
+  private reconnectMaxDelayMs: number = 60000; // 60 second default
 
   // Protocol constants
   private readonly START1 = 0x94;
@@ -40,6 +47,23 @@ export class TcpTransport extends EventEmitter {
     }
 
     logger.debug(`⏱️  Stale connection timeout set to ${timeoutMs}ms (${Math.floor(timeoutMs / 1000 / 60)} minute(s))`);
+  }
+
+  /**
+   * Set the initial TCP connection timeout in milliseconds
+   */
+  setConnectTimeout(timeoutMs: number): void {
+    this.connectTimeoutMs = timeoutMs;
+    logger.debug(`⏱️  TCP connect timeout set to ${timeoutMs}ms`);
+  }
+
+  /**
+   * Set the reconnect backoff parameters in milliseconds
+   */
+  setReconnectTiming(initialDelayMs: number, maxDelayMs: number): void {
+    this.reconnectInitialDelayMs = initialDelayMs;
+    this.reconnectMaxDelayMs = maxDelayMs;
+    logger.debug(`⏱️  Reconnect timing: initial=${initialDelayMs}ms, max=${maxDelayMs}ms`);
   }
 
   async connect(host: string, port: number = 4403): Promise<void> {
@@ -76,7 +100,7 @@ export class TcpTransport extends EventEmitter {
           this.socket.destroy();
           reject(new Error('Connection timeout'));
         }
-      }, 10000); // 10 second timeout
+      }, this.connectTimeoutMs);
 
       this.socket.once('connect', () => {
         clearTimeout(connectTimeout);
@@ -85,8 +109,9 @@ export class TcpTransport extends EventEmitter {
         this.reconnectAttempts = 0;
         this.buffer = Buffer.alloc(0); // Reset buffer on new connection
 
-        // Initialize last data received timestamp
+        // Initialize timestamps
         this.lastDataReceived = Date.now();
+        this.lastMessageEmitted = Date.now();
 
         // Start stale connection monitoring
         this.startHealthCheck();
@@ -138,8 +163,8 @@ export class TcpTransport extends EventEmitter {
 
     this.reconnectAttempts++;
 
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped at 60s)
-    const delay = Math.min(Math.pow(2, this.reconnectAttempts - 1) * 1000, 60000);
+    // Exponential backoff: initialDelay * 2^(attempts-1), capped at maxDelay
+    const delay = Math.min(Math.pow(2, this.reconnectAttempts - 1) * this.reconnectInitialDelayMs, this.reconnectMaxDelayMs);
 
     logger.debug(`🔄 Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts})...`);
 
@@ -197,15 +222,26 @@ export class TcpTransport extends EventEmitter {
         return;
       }
 
-      this.socket.write(packet, (error) => {
+      // Handle TCP backpressure: if the kernel buffer is full, socket.write()
+      // returns false and we must wait for 'drain' before sending more data.
+      // Without this, rapid writes overwhelm WiFi-connected devices (#2474).
+      const canContinue = this.socket.write(packet, (error) => {
         if (error) {
           logger.error('❌ Failed to send data:', error.message);
           reject(error);
-        } else {
-          logger.debug(`📤 Sent ${data.length} bytes`);
-          resolve();
         }
       });
+
+      if (canContinue) {
+        logger.debug(`📤 Sent ${data.length} bytes`);
+        resolve();
+      } else {
+        logger.debug(`📤 Sent ${data.length} bytes (waiting for drain)`);
+        this.socket.once('drain', () => {
+          logger.debug('📤 TCP drain — write buffer cleared');
+          resolve();
+        });
+      }
     });
   }
 
@@ -272,7 +308,8 @@ export class TcpTransport extends EventEmitter {
 
       logger.debug(`📥 Received frame: ${payloadLength} bytes`);
 
-      // Emit the message
+      // Emit the message and track last successful parse
+      this.lastMessageEmitted = Date.now();
       this.emit('message', new Uint8Array(payload));
 
       // Remove processed frame from buffer
@@ -358,10 +395,31 @@ export class TcpTransport extends EventEmitter {
       if (this.socket) {
         this.socket.destroy();
       }
-    } else {
-      // Log periodic health check status at debug level
-      const minutesSinceLastData = Math.floor(timeSinceLastData / 1000 / 60);
-      logger.debug(`💓 Connection health check: Last data received ${minutesSinceLastData} minute(s) ago`);
+      return;
     }
+
+    // Phantom connection detection: data arrives but no complete frames are parsed.
+    // This happens when a corrupted byte shifts frame alignment — the parser waits
+    // forever for a "phantom frame" while real data piles up unparsed. The connection
+    // looks alive (lastDataReceived updates) but no messages reach the application.
+    // Common with USB serial bridges that can inject noise bytes.
+    const timeSinceLastMessage = now - this.lastMessageEmitted;
+    if (this.buffer.length > 0 && timeSinceLastMessage > this.BUFFER_STALE_TIMEOUT_MS) {
+      logger.warn(`⚠️  Stale buffer detected: ${this.buffer.length} bytes buffered but no complete frame parsed for ${Math.floor(timeSinceLastMessage / 1000)}s. Resetting buffer to recover frame alignment.`);
+      this.buffer = Buffer.alloc(0);
+    } else if (timeSinceLastMessage > this.staleConnectionTimeout) {
+      // Data is arriving (lastDataReceived is fresh) but no messages are being parsed
+      // even after buffer reset — force reconnect
+      logger.warn(`⚠️  Phantom connection detected: Data arriving but no messages parsed for ${Math.floor(timeSinceLastMessage / 1000 / 60)} minute(s). Forcing reconnection...`);
+      this.emit('stale-connection', { timeSinceLastData: timeSinceLastMessage, timeout: this.staleConnectionTimeout });
+      if (this.socket) {
+        this.socket.destroy();
+      }
+      return;
+    }
+
+    // Log periodic health check status at debug level
+    const minutesSinceLastData = Math.floor(timeSinceLastData / 1000 / 60);
+    logger.debug(`💓 Connection health check: Last data received ${minutesSinceLastData} minute(s) ago, last message parsed ${Math.floor(timeSinceLastMessage / 1000)}s ago`);
   }
 }

@@ -1,26 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
+import { Filter, Trash2, ExternalLink, Download, Pause, Play } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { PacketLog, PacketFilters } from '../types/packet';
-import { clearPackets, exportPackets } from '../services/packetApi';
+import { clearPackets, exportPackets, getRelayNodes } from '../services/packetApi';
+import { RelayNodeOption } from '../types/packet';
 import apiService from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { useSettings } from '../contexts/SettingsContext';
 import { useDeviceConfig, useNodes } from '../hooks/useServerData';
 import { usePackets } from '../hooks/usePackets';
 import { formatDateTime } from '../utils/datetime';
-import { ResourceType } from '../types/permission';
 import RelayNodeModal from './RelayNodeModal';
 import './PacketMonitorPanel.css';
 
 interface PacketMonitorPanelProps {
   onClose: () => void;
   onNodeClick?: (nodeId: string) => void;
+  standalone?: boolean;
 }
 
-// Constants
-const LOAD_MORE_THRESHOLD = 10;
+
 
 // Transport mechanism display names (matches protobufs/meshtastic/mesh.proto TransportMechanism enum)
 const TRANSPORT_MECHANISM_NAMES: Record<number, { short: string; full: string }> = {
@@ -55,7 +56,7 @@ const safeJsonParse = <T,>(value: string | null, fallback: T): T => {
   }
 };
 
-const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNodeClick }) => {
+const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNodeClick, standalone }) => {
   const { t } = useTranslation();
   const { hasPermission, authStatus } = useAuth();
   const { timeFormat, dateFormat } = useSettings();
@@ -77,6 +78,9 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     safeJsonParse(localStorage.getItem('packetMonitor.hideOwnPackets'), true)
   );
 
+  // Relay node filter options (distinct values from packet_log)
+  const [relayNodeOptions, setRelayNodeOptions] = useState<RelayNodeOption[]>([]);
+
   // Relay node modal state
   const [relayModalOpen, setRelayModalOpen] = useState(false);
   const [selectedRelayNode, setSelectedRelayNode] = useState<number | null>(null);
@@ -86,16 +90,8 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
 
   const parentRef = useRef<HTMLDivElement>(null);
 
-  // Check permissions - user needs to have at least one channel permission and messages permission
-  const hasAnyChannelPermission = () => {
-    for (let i = 0; i < 8; i++) {
-      if (hasPermission(`channel_${i}` as ResourceType, 'read')) {
-        return true;
-      }
-    }
-    return false;
-  };
-  const canView = hasAnyChannelPermission() && hasPermission('messages', 'read');
+  // Check permissions - user needs packetmonitor:read permission
+  const canView = hasPermission('packetmonitor', 'read');
 
   // Get own node number for filtering
   // Convert nodeId (hex string like "!43588558") to number
@@ -110,12 +106,11 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     packets,
     total,
     loading,
+    loadingMore,
     hasMore,
     rateLimitError,
     loadMore,
     refresh: fetchPackets,
-    markUserScrolled,
-    shouldLoadMore,
   } = usePackets({
     canView,
     filters,
@@ -131,31 +126,26 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     overscan: 10, // Number of items to render outside of visible area
   });
 
-  // Track scroll to enable infinite loading only after user interaction
-  useEffect(() => {
-    const scrollElement = parentRef.current;
-    if (!scrollElement) return;
-
-    const handleScroll = () => {
-      // Mark that user has scrolled - this enables infinite scroll loading
-      if (scrollElement.scrollTop > 50) {
-        markUserScrolled();
-      }
-    };
-
-    scrollElement.addEventListener('scroll', handleScroll, { passive: true });
-    return () => scrollElement.removeEventListener('scroll', handleScroll);
-  }, [markUserScrolled]);
-
-  // Load more packets when scrolling near the end
+  // Infinite scroll: load more when user scrolls near the end of loaded data.
+  // Uses the virtualizer's visible items rather than IntersectionObserver,
+  // because the virtualizer only renders visible rows — the loading row at
+  // index 100+ may never be in the DOM if the user hasn't scrolled there.
   const virtualItems = rowVirtualizer.getVirtualItems();
-  const lastVisibleIndex = virtualItems.length > 0 ? virtualItems[virtualItems.length - 1]?.index ?? -1 : -1;
+  const lastVirtualItemIndex = virtualItems[virtualItems.length - 1]?.index;
 
   useEffect(() => {
-    if (shouldLoadMore(lastVisibleIndex, LOAD_MORE_THRESHOLD)) {
+    if (lastVirtualItemIndex === undefined) return;
+
+    // When the last visible virtual item is within 10 items of the end, load more
+    if (
+      lastVirtualItemIndex >= packets.length - 10 &&
+      hasMore &&
+      !loadingMore &&
+      packets.length > 0
+    ) {
       loadMore();
     }
-  }, [lastVisibleIndex, shouldLoadMore, loadMore]);
+  }, [lastVirtualItemIndex, packets.length, hasMore, loadingMore, loadMore]);
 
   // Persist filter settings to localStorage
   useEffect(() => {
@@ -173,6 +163,14 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
   useEffect(() => {
     localStorage.setItem('packetMonitor.autoScroll', JSON.stringify(autoScroll));
   }, [autoScroll]);
+
+  // Fetch distinct relay nodes for filter dropdown
+  useEffect(() => {
+    if (!canView) return;
+    getRelayNodes()
+      .then(setRelayNodeOptions)
+      .catch(() => setRelayNodeOptions([]));
+  }, [canView]);
 
   // Fetch direct neighbor stats on mount for relay estimation
   useEffect(() => {
@@ -229,7 +227,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     event.stopPropagation(); // Prevent row click
     // Set relay node to 0 if undefined/null (triggers "unknown relay" mode in modal)
     setSelectedRelayNode(packet.relay_node ?? 0);
-    setSelectedRxTime(new Date(packet.timestamp * 1000));
+    setSelectedRxTime(new Date(toMs(packet.timestamp)));
     setSelectedMessageRssi(packet.rssi ?? undefined);
 
     // Fetch direct neighbor stats (refresh to ensure up-to-date data)
@@ -298,9 +296,34 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     }
   };
 
-  // Format timestamp
+  // Convert timestamp to milliseconds (handles both old seconds and new ms data)
+  const toMs = (ts: number) => ts < 10_000_000_000 ? ts * 1000 : ts;
+
+  // Format date column — "Today" or short date
+  const formatDateColumn = (timestamp: number): string => {
+    const date = new Date(toMs(timestamp));
+    const now = new Date();
+    const isToday = date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate();
+
+    if (isToday) {
+      return t('packet_monitor.today', 'Today');
+    }
+
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    if (dateFormat === 'DD/MM/YYYY') {
+      return `${day}/${month}`;
+    } else if (dateFormat === 'YYYY-MM-DD') {
+      return `${month}-${day}`;
+    }
+    return `${month}/${day}`;
+  };
+
+  // Format time column — time with milliseconds
   const formatTimestamp = (timestamp: number): string => {
-    const date = new Date(timestamp * 1000);
+    const date = new Date(toMs(timestamp));
     const time = date.toLocaleTimeString('en-US', {
       hour12: timeFormat === '12',
       hour: '2-digit',
@@ -308,7 +331,10 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
       second: '2-digit',
     });
     const ms = String(date.getMilliseconds()).padStart(3, '0');
-    return `${time}.${ms}`;
+    // Insert ms before AM/PM if 12h format (e.g. "12:09:55 PM" → "12:09:55.979 PM")
+    return timeFormat === '12'
+      ? time.replace(/(\d{2}:\d{2}:\d{2})\s*(AM|PM)/i, `$1.${ms} $2`)
+      : `${time}.${ms}`;
   };
 
   // Calculate hops
@@ -421,10 +447,10 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
 
   if (!canView) {
     return (
-      <div className="packet-monitor-panel">
+      <div className={`packet-monitor-panel${standalone ? ' packet-monitor-standalone' : ''}`}>
         <div className="packet-monitor-header">
           <h3>{t('packet_monitor.title')}</h3>
-          <button className="close-btn" onClick={onClose}>
+          <button className="close-btn" onClick={onClose} aria-label={t('common.close')}>
             ×
           </button>
         </div>
@@ -439,7 +465,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
 
   return (
     <>
-      <div className="packet-monitor-panel">
+      <div className={`packet-monitor-panel${standalone ? ' packet-monitor-standalone' : ''}`}>
         <div className="packet-monitor-header">
           <h3>{t('packet_monitor.title')}</h3>
           <div
@@ -453,29 +479,31 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
               className="control-btn"
               onClick={() => setAutoScroll(!autoScroll)}
               title={autoScroll ? t('packet_monitor.pause_autoscroll') : t('packet_monitor.resume_autoscroll')}
+              aria-label={autoScroll ? t('packet_monitor.pause_autoscroll') : t('packet_monitor.resume_autoscroll')}
             >
-              {autoScroll ? '⏸️' : '▶️'}
+              {autoScroll ? <Pause size={14} /> : <Play size={14} />}
             </button>
-            <button className="control-btn" onClick={() => setShowFilters(!showFilters)} title={t('packet_monitor.toggle_filters')}>
-              🔍
+            <button className="control-btn" onClick={() => setShowFilters(!showFilters)} title={t('packet_monitor.toggle_filters')} aria-label={t('packet_monitor.toggle_filters')}>
+              <Filter size={14} />
             </button>
             <button
               className="control-btn"
               onClick={handleExport}
               title={t('packet_monitor.export_title')}
+              aria-label={t('packet_monitor.export_title')}
               disabled={total === 0}
             >
-              📥
+              <Download size={14} />
             </button>
             {authStatus?.user?.isAdmin && (
-              <button className="control-btn" onClick={handleClear} title={t('packet_monitor.clear_all')}>
-                🗑️
+              <button className="control-btn" onClick={handleClear} title={t('packet_monitor.clear_all')} aria-label={t('packet_monitor.clear_all')}>
+                <Trash2 size={14} />
               </button>
             )}
-            <button className="control-btn" onClick={handlePopout} title={t('packet_monitor.popout')}>
-              ⧉
+            <button className="control-btn" onClick={handlePopout} title={t('packet_monitor.popout')} aria-label={t('packet_monitor.popout')}>
+              <ExternalLink size={14} />
             </button>
-            <button className="close-btn" onClick={onClose}>
+            <button className="close-btn" onClick={onClose} aria-label={t('common.close')}>
               ×
             </button>
           </div>
@@ -528,6 +556,40 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                 ))}
             </select>
 
+            <select
+              value={filters.relay_node !== undefined ? String(filters.relay_node) : ''}
+              onChange={e => {
+                const val = e.target.value;
+                setFilters({
+                  ...filters,
+                  relay_node: val === '' ? undefined : val === 'unknown' ? 'unknown' : parseInt(val),
+                });
+              }}
+              title={t('packet_monitor.filter.last_hop_tooltip')}
+            >
+              <option value="">{t('packet_monitor.filter.all_last_hops')}</option>
+              <option value="unknown">{t('packet_monitor.filter.unknown_hop')}</option>
+              {relayNodeOptions
+                .sort((a, b) => {
+                  const aName = a.matching_nodes[0]?.longName || a.matching_nodes[0]?.shortName || '';
+                  const bName = b.matching_nodes[0]?.longName || b.matching_nodes[0]?.shortName || '';
+                  return aName.localeCompare(bName);
+                })
+                .map(rn => {
+                  const names = rn.matching_nodes
+                    .map(n => n.longName || n.shortName)
+                    .filter(Boolean);
+                  const label = names.length > 0
+                    ? names.join(', ')
+                    : `!..${rn.relay_node.toString(16).padStart(2, '0')}`;
+                  return (
+                    <option key={rn.relay_node} value={rn.relay_node}>
+                      {label}
+                    </option>
+                  );
+                })}
+            </select>
+
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
               <input
                 type="checkbox"
@@ -568,26 +630,28 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
             <div style={{ width: '100%' }}>
               <table className="packet-table packet-table-fixed">
                 <colgroup>
-                  <col style={{ width: '60px' }} />
-                  <col style={{ width: '35px' }} />
-                  <col style={{ width: '45px' }} />
-                  <col style={{ width: '110px' }} />
-                  <col style={{ width: '140px' }} />
-                  <col style={{ width: '140px' }} />
-                  <col style={{ width: '120px' }} />
-                  <col style={{ width: '110px' }} />
-                  <col style={{ width: '60px' }} />
-                  <col style={{ width: '60px' }} />
-                  <col style={{ width: '60px' }} />
-                  <col style={{ width: '80px' }} />
-                  <col style={{ width: '60px' }} />
-                  <col style={{ minWidth: '200px' }} />
+                  <col style={{ width: '60px' }} />   {/* # */}
+                  <col style={{ width: '35px' }} />   {/* Dir */}
+                  <col style={{ width: '45px' }} />   {/* Via */}
+                  <col style={{ width: '55px' }} />   {/* Date */}
+                  <col style={{ width: '110px' }} />  {/* Time */}
+                  <col style={{ width: '140px' }} />  {/* From */}
+                  <col style={{ width: '140px' }} />  {/* To */}
+                  <col style={{ width: '120px' }} />  {/* Type */}
+                  <col style={{ width: '110px' }} />  {/* Slot */}
+                  <col style={{ width: '60px' }} />   {/* SNR */}
+                  <col style={{ width: '60px' }} />   {/* RSSI */}
+                  <col style={{ width: '60px' }} />   {/* Hops */}
+                  <col style={{ width: '80px' }} />   {/* Last Hop */}
+                  <col style={{ width: '60px' }} />   {/* Size */}
+                  <col style={{ minWidth: '200px' }} /> {/* Content */}
                 </colgroup>
                 <thead>
                   <tr>
                     <th style={{ width: '60px' }}>#</th>
                     <th style={{ width: '35px' }}>{t('packet_monitor.column.dir')}</th>
                     <th style={{ width: '45px' }}>{t('packet_monitor.column.via')}</th>
+                    <th style={{ width: '55px' }}>{t('packet_monitor.column.date')}</th>
                     <th style={{ width: '110px' }}>{t('packet_monitor.column.time')}</th>
                     <th style={{ width: '140px' }}>{t('packet_monitor.column.from')}</th>
                     <th style={{ width: '140px' }}>{t('packet_monitor.column.to')}</th>
@@ -635,6 +699,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                         return (
                           <tr
                             key="loader"
+                            onClick={() => loadMore()}
                             style={{
                               position: 'absolute',
                               top: 0,
@@ -644,10 +709,11 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                               transform: `translateY(${virtualRow.start}px)`,
                               display: 'table',
                               tableLayout: 'fixed',
+                              cursor: 'pointer',
                             }}
                           >
-                            <td colSpan={14} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>
-                              {t('packet_monitor.loading_more')}
+                            <td colSpan={14} style={{ textAlign: 'center', color: 'var(--ctp-blue, var(--text-secondary))' }}>
+                              {loadingMore ? t('packet_monitor.loading_more') : t('packet_monitor.load_more_click', 'Click to load more packets...')}
                             </td>
                           </tr>
                         );
@@ -675,22 +741,28 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                           </td>
                           <td
                             className={`direction ${packet.direction === 'tx' ? 'direction-tx' : 'direction-rx'}`}
-                            style={{ width: '35px', textAlign: 'center' }}
+                            style={{ width: '35px' }}
                             title={packet.direction === 'tx' ? t('packet_monitor.direction_tx') : t('packet_monitor.direction_rx')}
                           >
                             {packet.direction === 'tx' ? 'TX' : 'RX'}
                           </td>
                           <td
                             className={`transport-mechanism transport-${packet.transport_mechanism ?? 'unknown'}`}
-                            style={{ width: '45px', textAlign: 'center' }}
+                            style={{ width: '45px' }}
                             title={getTransportMechanismName(packet.transport_mechanism).full}
                           >
                             {getTransportMechanismName(packet.transport_mechanism).short}
                           </td>
                           <td
+                            className="date"
+                            style={{ width: '55px' }}
+                          >
+                            {formatDateColumn(packet.timestamp)}
+                          </td>
+                          <td
                             className="timestamp"
                             style={{ width: '110px' }}
-                            title={formatDateTime(new Date(packet.timestamp * 1000), timeFormat, dateFormat)}
+                            title={formatDateTime(new Date(toMs(packet.timestamp)), timeFormat, dateFormat)}
                           >
                             {formatTimestamp(packet.timestamp)}
                           </td>
@@ -746,10 +818,10 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                                   onClick={(e) => handleRelayClick(packet, e)}
                                   title={t('packet_monitor.click_for_relay')}
                                 >
-                                  {hops}
+                                  {hops}/{packet.hop_start}
                                 </span>
                               ) : (
-                                hops
+                                <>{hops}/{packet.hop_start}</>
                               )
                             ) : (
                               t('common.na')
@@ -833,7 +905,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
             <div className="packet-detail-content" onClick={e => e.stopPropagation()}>
               <div className="packet-detail-header">
                 <h4>{t('packet_monitor.details_title')}</h4>
-                <button className="close-btn" onClick={() => setSelectedPacket(null)}>
+                <button className="close-btn" onClick={() => setSelectedPacket(null)} aria-label={t('common.close')}>
                   ×
                 </button>
               </div>
@@ -894,7 +966,30 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                     Object.entries(displayData).filter(([, v]) => v !== undefined && v !== null)
                   );
 
-                  return <pre className="packet-json">{JSON.stringify(cleanedData, null, 2)}</pre>;
+                  // Format field names for display (snake_case → Title Case)
+                  const formatLabel = (key: string) => key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+                  return (
+                    <div className="packet-detail-fields">
+                      {Object.entries(cleanedData).map(([key, value]) => {
+                        // Show decoded_payload and complex objects as formatted JSON
+                        if (typeof value === 'object' && value !== null) {
+                          return (
+                            <div key={key} className="detail-row detail-row-full">
+                              <span className="detail-label">{formatLabel(key)}</span>
+                              <pre className="detail-value-json">{JSON.stringify(value, null, 2)}</pre>
+                            </div>
+                          );
+                        }
+                        return (
+                          <div key={key} className="detail-row">
+                            <span className="detail-label">{formatLabel(key)}</span>
+                            <span className="detail-value">{String(value)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
                 })()}
               </div>
             </div>

@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 
-// Mock node-cron using vi.hoisted() to avoid hoisting issues
+// Mock cron scheduler using vi.hoisted() to avoid hoisting issues
 const { mockStart, mockStop, mockSchedule, mockValidate } = vi.hoisted(() => {
   const mockStart = vi.fn();
   const mockStop = vi.fn();
@@ -22,14 +22,14 @@ const { mockStart, mockStop, mockSchedule, mockValidate } = vi.hoisted(() => {
   return { mockStart, mockStop, mockSchedule, mockValidate };
 });
 
-vi.mock('node-cron', () => ({
-  schedule: mockSchedule,
-  validate: mockValidate
+vi.mock('../utils/cronScheduler.js', () => ({
+  scheduleCron: mockSchedule,
+  validateCron: mockValidate
 }));
 
 // Create in-memory database for tests
 let testDb: Database.Database;
-const mockGetSettingAsync = vi.fn();
+const mockGetSetting = vi.fn();
 const mockUpsertSolarEstimateAsync = vi.fn();
 const mockGetRecentSolarEstimatesAsync = vi.fn();
 const mockGetSolarEstimatesInRangeAsync = vi.fn();
@@ -38,7 +38,9 @@ const mockSetSetting = vi.fn();
 // Mock the database service
 vi.mock('../../services/database.js', () => ({
   default: {
-    getSettingAsync: (...args: unknown[]) => mockGetSettingAsync(...args),
+    settings: {
+      getSetting: (...args: unknown[]) => mockGetSetting(...args),
+    },
     setSetting: (...args: unknown[]) => mockSetSetting(...args),
     upsertSolarEstimateAsync: (...args: unknown[]) => mockUpsertSolarEstimateAsync(...args),
     getRecentSolarEstimatesAsync: (...args: unknown[]) => mockGetRecentSolarEstimatesAsync(...args),
@@ -80,7 +82,7 @@ describe('SolarMonitoringService', () => {
     solarEstimates = [];
 
     // Set up default mock implementations
-    mockGetSettingAsync.mockImplementation(async (key: string) => {
+    mockGetSetting.mockImplementation(async (key: string) => {
       const row = testDb.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
       return row?.value || null;
     });
@@ -160,10 +162,11 @@ describe('SolarMonitoringService', () => {
       );
     });
 
-    it('should explicitly start the cron job', () => {
+    it('should schedule the cron job (croner auto-starts)', () => {
       solarMonitoringService.initialize();
 
-      expect(mockStart).toHaveBeenCalled();
+      // croner jobs start automatically — no explicit .start() needed
+      expect(mockSchedule).toHaveBeenCalled();
     });
   });
 

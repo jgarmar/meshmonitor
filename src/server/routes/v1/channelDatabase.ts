@@ -13,6 +13,7 @@ import express, { Request, Response } from 'express';
 import databaseService from '../../../services/database.js';
 import { channelDecryptionService } from '../../services/channelDecryptionService.js';
 import { retroactiveDecryptionService } from '../../services/retroactiveDecryptionService.js';
+import { expandShorthandPsk } from '../../constants/meshtastic.js';
 import { logger } from '../../../utils/logger.js';
 
 const router = express.Router();
@@ -61,7 +62,7 @@ router.get('/', async (req: Request, res: Response) => {
       });
     }
 
-    const channels = await databaseService.getAllChannelDatabaseEntriesAsync();
+    const channels = await databaseService.channelDatabase.getAllAsync();
 
     res.json({
       success: true,
@@ -141,7 +142,7 @@ router.get('/:id', async (req: Request, res: Response) => {
       });
     }
 
-    const channel = await databaseService.getChannelDatabaseByIdAsync(id);
+    const channel = await databaseService.channelDatabase.getByIdAsync(id);
 
     if (!channel) {
       return res.status(404).json({
@@ -202,24 +203,43 @@ router.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    // Validate PSK is valid Base64
+    // Validate PSK is valid Base64 and expand shorthand keys
+    let finalPsk = psk;
+    let finalPskLength: number;
     try {
       const pskBuffer = Buffer.from(psk, 'base64');
-      if (pskBuffer.length !== 16 && pskBuffer.length !== 32) {
+
+      // Expand shorthand PSK (1-byte keys like AQ==) to full 16-byte key
+      const expandedPsk = expandShorthandPsk(pskBuffer);
+      if (!expandedPsk) {
         return res.status(400).json({
           success: false,
           error: 'Bad Request',
-          message: 'PSK must be 16 bytes (AES-128) or 32 bytes (AES-256) when decoded'
+          message: 'PSK value 0 means no encryption, which is not supported for channel database'
         });
       }
 
-      // Validate pskLength matches actual length
-      const expectedLength = pskLength ?? pskBuffer.length;
-      if (expectedLength !== pskBuffer.length) {
+      if (expandedPsk.length !== 16 && expandedPsk.length !== 32) {
         return res.status(400).json({
           success: false,
           error: 'Bad Request',
-          message: `pskLength (${expectedLength}) does not match actual PSK length (${pskBuffer.length})`
+          message: 'PSK must be 1 byte (shorthand), 16 bytes (AES-128), or 32 bytes (AES-256) when decoded'
+        });
+      }
+
+      // Use expanded key if it was a shorthand
+      if (expandedPsk.length !== pskBuffer.length) {
+        finalPsk = expandedPsk.toString('base64');
+        logger.debug(`Expanded shorthand PSK (${pskBuffer.length} byte) to ${expandedPsk.length}-byte key`);
+      }
+      finalPskLength = expandedPsk.length;
+
+      // Validate pskLength if explicitly provided
+      if (pskLength !== undefined && pskLength !== finalPskLength) {
+        return res.status(400).json({
+          success: false,
+          error: 'Bad Request',
+          message: `pskLength (${pskLength}) does not match actual PSK length (${finalPskLength})`
         });
       }
     } catch (_err) {
@@ -230,10 +250,10 @@ router.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    const newChannelId = await databaseService.createChannelDatabaseEntryAsync({
+    const newChannelId = await databaseService.channelDatabase.createAsync({
       name,
-      psk,
-      pskLength: pskLength ?? Buffer.from(psk, 'base64').length,
+      psk: finalPsk,
+      pskLength: finalPskLength,
       description: description ?? null,
       isEnabled: isEnabled ?? true,
       enforceNameValidation: enforceNameValidation ?? false,
@@ -241,7 +261,7 @@ router.post('/', async (req: Request, res: Response) => {
     });
 
     // Get the created entry
-    const newChannel = await databaseService.getChannelDatabaseByIdAsync(newChannelId);
+    const newChannel = await databaseService.channelDatabase.getByIdAsync(newChannelId);
 
     // Invalidate the decryption cache so the new channel is available
     channelDecryptionService.invalidateCache();
@@ -328,7 +348,7 @@ router.put('/reorder', async (req: Request, res: Response) => {
       });
     }
 
-    await databaseService.reorderChannelDatabaseEntriesAsync(updates);
+    await databaseService.channelDatabase.reorderAsync(updates);
 
     // Invalidate the decryption cache
     channelDecryptionService.invalidateCache();
@@ -377,7 +397,7 @@ router.put('/:id', async (req: Request, res: Response) => {
     }
 
     // Check if entry exists
-    const existing = await databaseService.getChannelDatabaseByIdAsync(id);
+    const existing = await databaseService.channelDatabase.getByIdAsync(id);
     if (!existing) {
       return res.status(404).json({
         success: false,
@@ -411,15 +431,23 @@ router.put('/:id', async (req: Request, res: Response) => {
 
       try {
         const pskBuffer = Buffer.from(psk, 'base64');
-        if (pskBuffer.length !== 16 && pskBuffer.length !== 32) {
+        const expandedPsk = expandShorthandPsk(pskBuffer);
+        if (!expandedPsk) {
           return res.status(400).json({
             success: false,
             error: 'Bad Request',
-            message: 'PSK must be 16 bytes (AES-128) or 32 bytes (AES-256) when decoded'
+            message: 'PSK value 0 means no encryption, which is not supported for channel database'
           });
         }
-        updates.psk = psk;
-        updates.pskLength = pskBuffer.length;
+        if (expandedPsk.length !== 16 && expandedPsk.length !== 32) {
+          return res.status(400).json({
+            success: false,
+            error: 'Bad Request',
+            message: 'PSK must be 1 byte (shorthand), 16 bytes (AES-128), or 32 bytes (AES-256) when decoded'
+          });
+        }
+        updates.psk = expandedPsk.length !== pskBuffer.length ? expandedPsk.toString('base64') : psk;
+        updates.pskLength = expandedPsk.length;
       } catch (_err) {
         return res.status(400).json({
           success: false,
@@ -468,7 +496,7 @@ router.put('/:id', async (req: Request, res: Response) => {
       });
     }
 
-    await databaseService.updateChannelDatabaseEntryAsync(id, updates);
+    await databaseService.channelDatabase.updateAsync(id, updates);
 
     // Invalidate the decryption cache
     channelDecryptionService.invalidateCache();
@@ -481,7 +509,7 @@ router.put('/:id', async (req: Request, res: Response) => {
     }
 
     // Get updated entry
-    const updatedChannel = await databaseService.getChannelDatabaseByIdAsync(id);
+    const updatedChannel = await databaseService.channelDatabase.getByIdAsync(id);
 
     logger.info(`Channel database entry ${id} updated by user ${user?.username ?? 'unknown'}`);
 
@@ -528,7 +556,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
     }
 
     // Check if entry exists
-    const existing = await databaseService.getChannelDatabaseByIdAsync(id);
+    const existing = await databaseService.channelDatabase.getByIdAsync(id);
     if (!existing) {
       return res.status(404).json({
         success: false,
@@ -537,7 +565,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
       });
     }
 
-    await databaseService.deleteChannelDatabaseEntryAsync(id);
+    await databaseService.channelDatabase.deleteAsync(id);
 
     // Invalidate the decryption cache
     channelDecryptionService.invalidateCache();
@@ -586,7 +614,7 @@ router.post('/:id/retroactive-decrypt', async (req: Request, res: Response) => {
     }
 
     // Check if entry exists
-    const existing = await databaseService.getChannelDatabaseByIdAsync(id);
+    const existing = await databaseService.channelDatabase.getByIdAsync(id);
     if (!existing) {
       return res.status(404).json({
         success: false,
@@ -663,7 +691,7 @@ router.get('/:id/permissions', async (req: Request, res: Response) => {
     }
 
     // Check if entry exists
-    const channel = await databaseService.getChannelDatabaseByIdAsync(id);
+    const channel = await databaseService.channelDatabase.getByIdAsync(id);
     if (!channel) {
       return res.status(404).json({
         success: false,
@@ -672,7 +700,7 @@ router.get('/:id/permissions', async (req: Request, res: Response) => {
       });
     }
 
-    const permissions = await databaseService.getChannelDatabasePermissionsForChannelAsync(id);
+    const permissions = await databaseService.channelDatabase.getPermissionsForChannelAsync(id);
 
     res.json({
       success: true,
@@ -734,7 +762,7 @@ router.put('/:id/permissions/:userId', async (req: Request, res: Response) => {
     }
 
     // Check if channel exists
-    const channel = await databaseService.getChannelDatabaseByIdAsync(channelId);
+    const channel = await databaseService.channelDatabase.getByIdAsync(channelId);
     if (!channel) {
       return res.status(404).json({
         success: false,
@@ -764,7 +792,7 @@ router.put('/:id/permissions/:userId', async (req: Request, res: Response) => {
       });
     }
 
-    await databaseService.setChannelDatabasePermissionAsync({
+    await databaseService.channelDatabase.setPermissionAsync({
       userId: targetUserId,
       channelDatabaseId: channelId,
       canViewOnMap,
@@ -831,7 +859,7 @@ router.delete('/:id/permissions/:userId', async (req: Request, res: Response) =>
     }
 
     // Check if channel exists
-    const channel = await databaseService.getChannelDatabaseByIdAsync(channelId);
+    const channel = await databaseService.channelDatabase.getByIdAsync(channelId);
     if (!channel) {
       return res.status(404).json({
         success: false,
@@ -840,7 +868,7 @@ router.delete('/:id/permissions/:userId', async (req: Request, res: Response) =>
       });
     }
 
-    await databaseService.deleteChannelDatabasePermissionAsync(targetUserId, channelId);
+    await databaseService.channelDatabase.deletePermissionAsync(targetUserId, channelId);
 
     logger.info(`Channel database permission deleted: user ${targetUserId} on channel ${channelId} by ${user?.username ?? 'unknown'}`);
 

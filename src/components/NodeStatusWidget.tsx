@@ -15,14 +15,17 @@ import { useTranslation } from 'react-i18next';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { type NodeInfo } from './TelemetryChart';
+import { useNodeVoltages } from '../hooks/useTelemetry';
 
 interface NodeStatusWidgetProps {
   id: string;
   nodeIds: string[];
   nodes: Map<string, NodeInfo>;
+  baseUrl: string;
   onRemove: () => void;
   onAddNode: (nodeId: string) => void;
   onRemoveNode: (nodeId: string) => void;
+  onOpenNodeDetails?: (nodeId: string) => void;
   canEdit?: boolean;
 }
 
@@ -33,15 +36,28 @@ interface NodeStatusRow {
   hopsAway: number | null;
   snr: number | null;
   rssi: number | null;
+  voltage: number | null;
+  uptimeSeconds: number | null;
 }
+
+type NodeStatusInfo = NodeInfo & {
+  deviceMetrics?: {
+    voltage?: number;
+    uptimeSeconds?: number;
+  };
+  voltage?: number;
+  uptimeSeconds?: number;
+};
 
 const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
   id,
   nodeIds,
   nodes,
+  baseUrl,
   onRemove,
   onAddNode,
   onRemoveNode,
+  onOpenNodeDetails,
   canEdit = true,
 }) => {
   const { t } = useTranslation();
@@ -71,11 +87,22 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
     }
   }, [showSearch]);
 
+  // Fetch fallback voltages for nodes missing voltage via React Query (cached, deduplicated)
+  const missingVoltageNodeIds = useMemo(() => {
+    return nodeIds.filter(nodeId => {
+      const node = nodes.get(nodeId) as NodeStatusInfo | undefined;
+      const voltage = node?.deviceMetrics?.voltage ?? node?.voltage;
+      return voltage === undefined || voltage === null;
+    });
+  }, [nodeIds, nodes]);
+
+  const fallbackVoltageByNode = useNodeVoltages({ nodeIds: missingVoltageNodeIds, baseUrl });
+
   // Build node status rows sorted by last heard (most recent first)
   const nodeRows = useMemo((): NodeStatusRow[] => {
     return nodeIds
       .map(nodeId => {
-        const node = nodes.get(nodeId);
+        const node = nodes.get(nodeId) as NodeStatusInfo | undefined;
         return {
           nodeId,
           name: node?.user?.longName || node?.user?.shortName || nodeId,
@@ -83,6 +110,8 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
           hopsAway: node?.hopsAway ?? null,
           snr: node?.snr ?? null,
           rssi: node?.rssi ?? null,
+          voltage: node?.deviceMetrics?.voltage ?? node?.voltage ?? fallbackVoltageByNode.get(nodeId) ?? null,
+          uptimeSeconds: node?.deviceMetrics?.uptimeSeconds ?? node?.uptimeSeconds ?? null,
         };
       })
       .sort((a, b) => {
@@ -92,7 +121,7 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
         if (b.lastHeard === null) return -1;
         return b.lastHeard - a.lastHeard;
       });
-  }, [nodeIds, nodes]);
+  }, [nodeIds, nodes, fallbackVoltageByNode]);
 
   // Filter available nodes for search
   const availableNodes = useMemo(() => {
@@ -137,6 +166,18 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
     return t('common.days_ago', { count: Math.floor(diff / 86400000) });
   };
 
+  const formatUptime = (uptimeSeconds: number | null): string => {
+    if (uptimeSeconds === null || uptimeSeconds < 0) return '-';
+
+    const days = Math.floor(uptimeSeconds / 86400);
+    const hours = Math.floor((uptimeSeconds % 86400) / 3600);
+    const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+
+    if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  };
+
   return (
     <div ref={setNodeRef} style={style} className="dashboard-chart-container node-status-widget">
       <div className="dashboard-chart-header">
@@ -144,7 +185,7 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
           ⋮⋮
         </span>
         <h3 className="dashboard-chart-title">{t('dashboard.widget.node_status.title')}</h3>
-        <button className="dashboard-remove-btn" onClick={onRemove} title={t('dashboard.remove_widget')}>
+        <button className="dashboard-remove-btn" onClick={onRemove} title={t('dashboard.remove_widget')} aria-label={t('dashboard.remove_widget')}>
           ×
         </button>
       </div>
@@ -183,14 +224,29 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
               <tr>
                 <th>{t('nodes.node')}</th>
                 <th>{t('nodes.last_heard')}</th>
-                <th>{t('nodes.hops')}</th>
+                <th className="node-status-hops-header">{t('nodes.signal_hops')}</th>
+                <th>{t('nodes.voltage')}</th>
+                <th>{t('nodes.uptime')}</th>
                 {canEdit && <th></th>}
               </tr>
             </thead>
             <tbody>
               {nodeRows.map(row => (
                 <tr key={row.nodeId}>
-                  <td className="node-status-name">{row.name}</td>
+                  <td className="node-status-name">
+                    {onOpenNodeDetails ? (
+                      <button
+                        type="button"
+                        className="node-status-name-link"
+                        onClick={() => onOpenNodeDetails(row.nodeId)}
+                        title={t('nodes.send_dm')}
+                      >
+                        {row.name}
+                      </button>
+                    ) : (
+                      row.name
+                    )}
+                  </td>
                   <td className="node-status-time">{formatLastHeard(row.lastHeard)}</td>
                   <td className="node-status-hops">
                     {row.hopsAway === 0 && (row.snr !== null || row.rssi !== null) ? (
@@ -205,12 +261,15 @@ const NodeStatusWidget: React.FC<NodeStatusWidgetProps> = ({
                       '-'
                     )}
                   </td>
+                  <td>{row.voltage !== null ? `${row.voltage.toFixed(2)}V` : '-'}</td>
+                  <td>{formatUptime(row.uptimeSeconds)}</td>
                   {canEdit && (
                     <td className="node-status-actions">
                       <button
                         className="node-status-remove-node"
                         onClick={() => onRemoveNode(row.nodeId)}
                         title={t('dashboard.widget.node_status.remove_node')}
+                        aria-label={t('dashboard.widget.node_status.remove_node')}
                       >
                         ×
                       </button>

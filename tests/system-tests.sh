@@ -22,6 +22,14 @@ PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 cd "$PROJECT_ROOT"
 
+# Shut down any running dev containers to avoid port conflicts
+echo -e "${BLUE}Stopping dev containers to avoid port conflicts...${NC}"
+for profile in sqlite postgres mysql; do
+    docker compose -f docker-compose.dev.yml --profile "$profile" down 2>/dev/null || true
+done
+echo -e "${GREEN}✓${NC} Dev containers stopped"
+echo ""
+
 # Cleanup function
 cleanup() {
     if [ "$KEEP_ALIVE" = "true" ]; then
@@ -164,6 +172,7 @@ else
     BACKUP_RESTORE_RESULT="SKIPPED"
     DB_MIGRATION_RESULT="SKIPPED"
     DB_BACKING_RESULT="SKIPPED"
+    API_EXERCISE_RESULT="SKIPPED"
     # Skip to results
     echo ""
     echo "=========================================="
@@ -180,6 +189,7 @@ else
     echo -e "Backup & Restore Test:    ${YELLOW}⊘ SKIPPED${NC}"
     echo -e "Database Migration Test:  ${YELLOW}⊘ SKIPPED${NC}"
     echo -e "DB Backing Consistency:  ${YELLOW}⊘ SKIPPED${NC}"
+    echo -e "API Exercise (3 DBs):    ${YELLOW}⊘ SKIPPED${NC}"
     echo ""
     echo -e "${RED}===========================================${NC}"
     echo -e "${RED}✗ SYSTEM TESTS FAILED${NC}"
@@ -334,6 +344,23 @@ else
 fi
 echo ""
 
+echo "=========================================="
+echo -e "${BLUE}Running API Exercise Test (All Backends)${NC}"
+echo "=========================================="
+echo ""
+
+# Run API Exercise test on all 3 database backends
+if bash "$SCRIPT_DIR/test-api-exercise-all-backends.sh"; then
+    API_EXERCISE_RESULT="PASSED"
+    echo ""
+    echo -e "${GREEN}✓ API Exercise test PASSED (all backends)${NC}"
+else
+    API_EXERCISE_RESULT="FAILED"
+    echo ""
+    echo -e "${RED}✗ API Exercise test FAILED${NC}"
+fi
+echo ""
+
 # Summary
 echo "=========================================="
 echo "System Test Results"
@@ -402,6 +429,14 @@ elif [ "$DB_BACKING_RESULT" = "SKIPPED" ]; then
     echo -e "DB Backing Consistency:  ${YELLOW}⊘ SKIPPED${NC}"
 else
     echo -e "DB Backing Consistency:  ${RED}✗ FAILED${NC}"
+fi
+
+if [ "$API_EXERCISE_RESULT" = "PASSED" ]; then
+    echo -e "API Exercise (3 DBs):    ${GREEN}✓ PASSED${NC}"
+elif [ "$API_EXERCISE_RESULT" = "SKIPPED" ]; then
+    echo -e "API Exercise (3 DBs):    ${YELLOW}⊘ SKIPPED${NC}"
+else
+    echo -e "API Exercise (3 DBs):    ${RED}✗ FAILED${NC}"
 fi
 
 echo ""
@@ -481,11 +516,19 @@ else
     echo "| DB Backing Consistency | ❌ FAILED |" >> "$REPORT_FILE"
 fi
 
+if [ "$API_EXERCISE_RESULT" = "PASSED" ]; then
+    echo "| API Exercise (3 DBs) | ✅ PASSED |" >> "$REPORT_FILE"
+elif [ "$API_EXERCISE_RESULT" = "SKIPPED" ]; then
+    echo "| API Exercise (3 DBs) | ⊘ SKIPPED |" >> "$REPORT_FILE"
+else
+    echo "| API Exercise (3 DBs) | ❌ FAILED |" >> "$REPORT_FILE"
+fi
+
 echo "" >> "$REPORT_FILE"
 
 # Overall result (config import is optional, so only fail if it actually failed, not if skipped)
 REQUIRED_TESTS_PASSED=true
-if [ "$QUICKSTART_RESULT" != "PASSED" ] || [ "$SECURITY_RESULT" != "PASSED" ] || [ "$V1_API_RESULT" != "PASSED" ] || [ "$REVERSE_PROXY_RESULT" != "PASSED" ] || [ "$OIDC_RESULT" != "PASSED" ] || [ "$VIRTUAL_NODE_CLI_RESULT" != "PASSED" ] || [ "$BACKUP_RESTORE_RESULT" != "PASSED" ] || [ "$DB_MIGRATION_RESULT" != "PASSED" ] || [ "$DB_BACKING_RESULT" != "PASSED" ]; then
+if [ "$QUICKSTART_RESULT" != "PASSED" ] || [ "$SECURITY_RESULT" != "PASSED" ] || [ "$V1_API_RESULT" != "PASSED" ] || [ "$REVERSE_PROXY_RESULT" != "PASSED" ] || [ "$OIDC_RESULT" != "PASSED" ] || [ "$VIRTUAL_NODE_CLI_RESULT" != "PASSED" ] || [ "$BACKUP_RESTORE_RESULT" != "PASSED" ] || [ "$DB_MIGRATION_RESULT" != "PASSED" ] || [ "$DB_BACKING_RESULT" != "PASSED" ] || [ "$API_EXERCISE_RESULT" != "PASSED" ]; then
     REQUIRED_TESTS_PASSED=false
 fi
 

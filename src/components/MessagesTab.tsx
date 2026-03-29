@@ -6,6 +6,7 @@
  */
 
 import React, { useRef, useCallback, useState, useMemo, useEffect } from 'react';
+import '../styles/messages.css';
 import { useResizable } from '../hooks/useResizable';
 import { useTranslation, Trans } from 'react-i18next';
 import { DeviceInfo, Channel } from '../types/device';
@@ -28,6 +29,7 @@ import { isNodeComplete, isInfrastructureNode, hasValidPosition, parseNodeId } f
 import { getEffectiveHops } from '../utils/nodeHops';
 import { useMapContext } from '../contexts/MapContext';
 import { useSettings } from '../contexts/SettingsContext';
+import { useDeviceNodes } from '../hooks/useServerData';
 import HopCountDisplay from './HopCountDisplay';
 import LinkPreview from './LinkPreview';
 import NodeDetailsBlock from './NodeDetailsBlock';
@@ -166,6 +168,7 @@ export interface MessagesTabProps {
 
   // Handlers
   handleSendDirectMessage: (destinationNodeId: string) => Promise<void>;
+  onSendBell?: (destination: string, text: string) => Promise<void>;
   handleResendMessage: (message: MeshMessage) => Promise<void>;
   handleTraceroute: (nodeId: string) => Promise<void>;
   handleExchangePosition: (nodeId: string, channel?: number) => Promise<void>;
@@ -178,6 +181,7 @@ export interface MessagesTabProps {
   getRecentTraceroute: (nodeId: string) => TracerouteData | null;
   toggleIgnored: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
   toggleFavorite: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
+  toggleFavoriteLock: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
 
   // Modal controls
   setShowTracerouteHistoryModal: (show: boolean) => void;
@@ -243,6 +247,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   baseUrl,
   hasPermission,
   handleSendDirectMessage,
+  onSendBell,
   handleResendMessage,
   handleTraceroute,
   handleExchangePosition,
@@ -255,6 +260,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   getRecentTraceroute,
   toggleIgnored,
   toggleFavorite,
+  toggleFavoriteLock,
   setShowTracerouteHistoryModal,
   setShowPurgeDataModal,
   setShowPositionOverrideModal,
@@ -270,6 +276,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   // Get settings and context for effective hops calculation
   const { nodeHopsCalculation } = useSettings();
   const { traceroutes, neighborInfo, setNeighborInfo } = useMapContext();
+  const deviceNodeNums = useDeviceNodes();
   const currentNodeNum = currentNodeId ? parseNodeId(currentNodeId) : null;
 
   // Local state for actions menu
@@ -283,6 +290,37 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   const [selectedMessageRssi, setSelectedMessageRssi] = useState<number | undefined>(undefined);
   const [directNeighborStats, setDirectNeighborStats] = useState<Record<number, { avgRssi: number; packetCount: number; lastHeard: number }>>({});
   const [homoglyphEnabled, setHomoglyphEnabled] = useState(false);
+
+  // State for "Jump to Bottom" button
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+
+  // Handle scroll to detect if user has scrolled up
+  const handleScroll = useCallback(() => {
+    const container = dmMessagesContainerRef.current;
+    if (!container) return;
+    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+    setShowJumpToBottom(!isNearBottom);
+  }, [dmMessagesContainerRef]);
+
+  // Scroll to bottom function
+  const scrollToBottom = useCallback(() => {
+    const container = dmMessagesContainerRef.current;
+    if (container) {
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+  }, [dmMessagesContainerRef]);
+
+  // Attach scroll listener
+  useEffect(() => {
+    const container = dmMessagesContainerRef.current;
+    if (container) {
+      container.addEventListener('scroll', handleScroll);
+      return () => container.removeEventListener('scroll', handleScroll);
+    }
+  }, [handleScroll]);
 
   // Fetch homoglyph optimization setting
   useEffect(() => {
@@ -713,6 +751,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                     className="filter-clear-btn"
                     onClick={() => setMessagesNodeFilter('')}
                     title={t('common.clear_filter')}
+                    aria-label={t('common.clear_filter')}
                     type="button"
                   >
                     ✕
@@ -750,8 +789,10 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       key={node.nodeNum}
                       className={`node-item ${selectedDMNode === node.user?.id ? 'selected' : ''}`}
                       onClick={() => {
-                        setSelectedDMNode(node.user?.id || '');
+                        const nodeId = node.user?.id || '';
+                        setSelectedDMNode(nodeId);
                         setReplyingTo(null);
+                        if (nodeId) markMessagesAsRead(undefined, -1, nodeId);
                       }}
                     >
                       <div className="node-header">
@@ -817,7 +858,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                             className="last-message-preview"
                             style={{
                               fontSize: '0.85rem',
-                              color: 'var(--ctp-subtext0)',
+                              color: selectedDMNode === node.user?.id ? '#000000' : 'var(--ctp-subtext0)',
                               fontStyle: 'italic',
                               overflow: 'hidden',
                               textOverflow: 'ellipsis',
@@ -911,8 +952,10 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
             className="node-dropdown-select"
             value={selectedDMNode || ''}
             onChange={e => {
-              setSelectedDMNode(e.target.value);
+              const nodeId = e.target.value;
+              setSelectedDMNode(nodeId);
               setReplyingTo(null);
+              if (nodeId) markMessagesAsRead(undefined, -1, nodeId);
             }}
           >
             <option value="">{t('messages.select_conversation')}</option>
@@ -1026,7 +1069,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                               }}
                               disabled={connectionStatus !== 'connected' || nodeInfoLoading === selectedDMNode}
                             >
-                              🔑 {t('messages.exchange_user_info')}
+                              🔑 {t('messages.exchange_node_info')}
                               {nodeInfoLoading === selectedDMNode && <span className="spinner"></span>}
                             </button>
                             <button
@@ -1070,6 +1113,15 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                               }}
                             >
                               {selectedNode.isFavorite ? `⭐ ${t('nodes.remove_favorite')}` : `☆ ${t('nodes.add_favorite')}`}
+                            </button>
+                            <button
+                              className="actions-menu-item"
+                              onClick={(e) => {
+                                toggleFavoriteLock(selectedNode, e);
+                                setShowActionsMenu(false);
+                              }}
+                            >
+                              {selectedNode.favoriteLocked ? `🔓 ${t('nodes.unlock_favorite', 'Remove Favorite Lock')}` : `🔒 ${t('nodes.lock_favorite', 'Set Favorite Lock')}`}
                             </button>
                             <button
                               className="actions-menu-item"
@@ -1149,8 +1201,57 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
               </div>
             )}
 
+            {/* Not in device DB warning - node exists in MeshMonitor but not on the radio */}
+            {selectedNodeNum !== undefined && deviceNodeNums.size > 0 && !deviceNodeNums.has(selectedNodeNum) && (
+              <div
+                style={{
+                  backgroundColor: 'var(--ctp-peach, #fab387)',
+                  color: 'var(--ctp-base, #1e1e2e)',
+                  padding: '10px 12px',
+                  marginBottom: '10px',
+                  borderRadius: '4px',
+                  textAlign: 'center',
+                }}
+              >
+                {t('messages.not_in_device_db', 'This node is not in your radio\'s database. Direct messages will fail until the node exchanges keys with your radio. Use "Exchange Node Info" to request key exchange.')}
+              </div>
+            )}
+
             {/* Messages Container */}
-            <div className="messages-container" ref={dmMessagesContainerRef}>
+            <div className="messages-container" ref={dmMessagesContainerRef} style={{ position: 'relative' }}>
+              {showJumpToBottom && (
+                <div
+                  style={{
+                    position: 'sticky',
+                    top: '0.5rem',
+                    zIndex: 10,
+                    display: 'flex',
+                    justifyContent: 'center',
+                    marginBottom: '0.5rem',
+                  }}
+                >
+                  <button
+                    className="jump-to-bottom-btn"
+                    onClick={scrollToBottom}
+                    style={{
+                      padding: '0.5rem 1rem',
+                      backgroundColor: 'var(--ctp-blue)',
+                      border: 'none',
+                      borderRadius: '20px',
+                      cursor: 'pointer',
+                      fontSize: '0.85rem',
+                      color: 'var(--ctp-base)',
+                      fontWeight: 'bold',
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                    }}
+                  >
+                    <span>↓</span> {t('channels.jump_to_bottom', 'Jump to Bottom')}
+                  </button>
+                </div>
+              )}
               {selectedDMMessages.length > 0 ? (
                 selectedDMMessages.map((msg, index) => {
                   const isTraceroute = msg.portnum === 70;
@@ -1254,6 +1355,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                   className="resend-button"
                                   onClick={() => handleResendMessage(msg)}
                                   title={t('messages.resend_button_title')}
+                                  aria-label={t('messages.resend_button_title')}
                                 >
                                   ↻
                                 </button>
@@ -1265,6 +1367,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                     dmMessageInputRef.current?.focus();
                                   }}
                                   title={t('messages.reply_button_title')}
+                                  aria-label={t('messages.reply_button_title')}
                                 >
                                   ↩
                                 </button>
@@ -1273,6 +1376,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                 className="emoji-picker-button"
                                 onClick={() => setEmojiPickerMessage(msg)}
                                 title={t('messages.emoji_button_title')}
+                                aria-label={t('messages.emoji_button_title')}
                               >
                                 😄
                               </button>
@@ -1280,6 +1384,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                 className="delete-button"
                                 onClick={() => handleDeleteMessage(msg)}
                                 title={t('messages.delete_button_title')}
+                                aria-label={t('messages.delete_button_title')}
                               >
                                 🗑️
                               </button>
@@ -1358,7 +1463,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       <div className="reply-indicator-label">{t('messages.replying_to', { name: getNodeName(replyingTo.from) })}</div>
                       <div className="reply-indicator-text">{replyingTo.text}</div>
                     </div>
-                    <button className="reply-indicator-close" onClick={() => setReplyingTo(null)} title={t('messages.cancel_reply_title')}>
+                    <button className="reply-indicator-close" onClick={() => setReplyingTo(null)} title={t('messages.cancel_reply_title')} aria-label={t('messages.cancel_reply_title')}>
                       ×
                     </button>
                   </div>
@@ -1384,9 +1489,18 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       </div>
                     </div>
                     <button
+                      onClick={() => { onSendBell?.(selectedDMNode, newMessage); setNewMessage(''); }}
+                      className="send-btn channel-action-btn"
+                      title="Send alert bell"
+                      aria-label="Send alert bell"
+                    >
+                      🔔
+                    </button>
+                    <button
                       onClick={() => handleSendDirectMessage(selectedDMNode)}
                       disabled={!newMessage.trim()}
                       className="send-btn"
+                      aria-label={t('common.send')}
                     >
                       →
                     </button>
@@ -1624,7 +1738,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                     fontSize: '0.9rem'
                   }}
                 >
-                  {nodeInfoLoading === selectedDMNode ? <span className="spinner"></span> : '🔑'} {t('messages.exchange_user_info')}
+                  {nodeInfoLoading === selectedDMNode ? <span className="spinner"></span> : '🔑'} {t('messages.exchange_node_info')}
                 </button>
               )}
 
@@ -1656,6 +1770,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       }}
                       disabled={connectionStatus !== 'connected' || positionLoading === selectedDMNode}
                       title={t('messages.exchange_position_channel')}
+                      aria-label={t('messages.exchange_position_channel')}
                       style={{
                         padding: '0.5rem 0.5rem',
                         backgroundColor: 'var(--ctp-blue)',

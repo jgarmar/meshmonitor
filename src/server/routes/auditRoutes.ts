@@ -57,21 +57,8 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 // Get audit log statistics (must be before /:id to avoid route conflict)
-router.get('/stats/summary', (req: Request, res: Response) => {
+router.get('/stats/summary', async (req: Request, res: Response) => {
   try {
-    // For PostgreSQL/MySQL, audit stats not yet implemented
-    if (databaseService.drizzleDbType === 'postgres' || databaseService.drizzleDbType === 'mysql') {
-      return res.json({
-        stats: {
-          actionStats: [],
-          userStats: [],
-          dailyStats: [],
-          totalEvents: 0
-        },
-        days: parseInt(req.query.days as string, 10) || 30
-      });
-    }
-
     const daysParam = req.query.days as string;
 
     // Validate days parameter if provided
@@ -83,7 +70,7 @@ router.get('/stats/summary', (req: Request, res: Response) => {
     }
 
     const days = parseInt(daysParam, 10) || 30;
-    const stats = databaseService.getAuditStats(days);
+    const stats = await databaseService.getAuditStatsAsync(days);
 
     return res.json({
       stats,
@@ -117,9 +104,9 @@ router.get('/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Audit log entry not found' });
     }
 
-    // Use getAuditLogs with no filters but get all to find specific ID
+    // Use getAuditLogsAsync with no filters but get all to find specific ID
     // This is inefficient but works for now
-    const result = databaseService.getAuditLogs({ limit: 10000 });
+    const result = await databaseService.getAuditLogsAsync({ limit: 10000 });
     const log = result.logs.find((l: any) => l.id === id);
 
     if (!log) {
@@ -134,7 +121,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 // Cleanup old audit logs (admin only)
-router.post('/cleanup', requirePermission('audit', 'write'), (req: Request, res: Response) => {
+router.post('/cleanup', requirePermission('audit', 'write'), async (req: Request, res: Response) => {
   try {
     // Require admin for cleanup operations
     if (!req.user?.isAdmin) {
@@ -158,10 +145,10 @@ router.post('/cleanup', requirePermission('audit', 'write'), (req: Request, res:
       });
     }
 
-    const deletedCount = databaseService.cleanupAuditLogs(days);
+    const deletedCount = await databaseService.cleanupAuditLogsAsync(days);
 
     // Log the cleanup action
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'audit_cleanup',
       'audit',

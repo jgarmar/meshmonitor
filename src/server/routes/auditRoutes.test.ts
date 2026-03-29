@@ -11,17 +11,7 @@ import session from 'express-session';
 import request from 'supertest';
 import { UserModel } from '../models/User.js';
 import { PermissionModel } from '../models/Permission.js';
-import { migration as authMigration } from '../migrations/001_add_auth_tables.js';
-import { migration as auditEnhancementMigration } from '../migrations/005_enhance_audit_log.js';
-import { migration as auditPermissionMigration } from '../migrations/006_add_audit_permission.js';
-import { migration as securityPermissionMigration } from '../migrations/016_add_security_permission.js';
-import { migration as themesMigration } from '../migrations/022_add_custom_themes.js';
-import { migration as passwordLockedMigration } from '../migrations/023_add_password_locked_flag.js';
-import { migration as perChannelPermissionsMigration } from '../migrations/024_add_per_channel_permissions.js';
-import { migration as nodesPrivatePermissionMigration } from '../migrations/044_add_nodes_private_permission.js';
-import { migration as viewOnMapPermissionMigration } from '../migrations/053_add_view_on_map_permission.js';
-import { migration as mfaMigration } from '../migrations/068_add_mfa_columns.js';
-import { migration as meshcorePermissionMigration } from '../migrations/071_add_meshcore_permission.js';
+import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
 import auditRoutes from './auditRoutes.js';
 import authRoutes from './authRoutes.js';
 
@@ -80,18 +70,8 @@ describe('Audit Log Routes', () => {
     db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
 
-    // Run migrations
-    authMigration.up(db);
-    auditEnhancementMigration.up(db);
-    auditPermissionMigration.up(db);
-    securityPermissionMigration.up(db);
-    themesMigration.up(db);
-    passwordLockedMigration.up(db);
-    perChannelPermissionsMigration.up(db);
-    nodesPrivatePermissionMigration.up(db);
-    viewOnMapPermissionMigration.up(db);
-    mfaMigration.up(db);
-    meshcorePermissionMigration.up(db);
+    // Run baseline migration (creates all tables)
+    baselineMigration.up(db);
 
     userModel = new UserModel(db);
     permissionModel = new PermissionModel(db);
@@ -101,7 +81,7 @@ describe('Audit Log Routes', () => {
     (DatabaseService as any).permissionModel = permissionModel;
 
     // Mock audit log methods
-    (DatabaseService as any).auditLog = (
+    (DatabaseService as any).auditLogAsync = (
       userId: number | null,
       action: string,
       resource: string | null,
@@ -185,6 +165,10 @@ describe('Audit Log Routes', () => {
       return (DatabaseService as any).getAuditLogs(options);
     };
 
+    (DatabaseService as any).getAuditStatsAsync = async (days: number = 30) => {
+      return (DatabaseService as any).getAuditStats(days);
+    };
+
     (DatabaseService as any).getAuditStats = (days: number = 30) => {
       const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
 
@@ -230,6 +214,10 @@ describe('Audit Log Routes', () => {
         DELETE FROM audit_log WHERE timestamp < ?
       `).run(cutoff);
       return result.changes;
+    };
+
+    (DatabaseService as any).cleanupAuditLogsAsync = async (days: number) => {
+      return (DatabaseService as any).cleanupAuditLogs(days);
     };
 
     // Add async method mocks for authMiddleware compatibility
@@ -297,10 +285,10 @@ describe('Audit Log Routes', () => {
     permissionModel.grantDefaultPermissions(user.id, false);
 
     // Create some test audit log entries
-    DatabaseService.auditLog(adminUserId, 'login_success', 'auth', 'Admin logged in', '192.168.1.1');
-    DatabaseService.auditLog(adminUserId, 'settings_updated', 'settings', 'Changed theme', '192.168.1.1');
-    DatabaseService.auditLog(regularUserId, 'login_success', 'auth', 'User logged in', '192.168.1.2');
-    DatabaseService.auditLog(adminUserId, 'api_token_used', 'auth', 'API token access', '192.168.1.3');
+    DatabaseService.auditLogAsync(adminUserId, 'login_success', 'auth', 'Admin logged in', '192.168.1.1');
+    DatabaseService.auditLogAsync(adminUserId, 'settings_updated', 'settings', 'Changed theme', '192.168.1.1');
+    DatabaseService.auditLogAsync(regularUserId, 'login_success', 'auth', 'User logged in', '192.168.1.2');
+    DatabaseService.auditLogAsync(adminUserId, 'api_token_used', 'auth', 'API token access', '192.168.1.3');
   });
 
   describe('GET /api/audit', () => {

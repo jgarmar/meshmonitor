@@ -14,7 +14,7 @@ import L from 'leaflet';
 import { useSettings } from '../contexts/SettingsContext';
 import { getTilesetById } from '../config/tilesets';
 import { useTraceroutes } from '../hooks/useTraceroutes';
-import { generateCurvedPath, getLineWeight, generateCurvedArrowMarkers } from '../utils/mapHelpers';
+import { generateCurvedPath, getLineWeight, generateCurvedArrowMarkers, isMqttSnr } from '../utils/mapHelpers';
 import 'leaflet/dist/leaflet.css';
 
 // Component to fit map bounds
@@ -379,7 +379,7 @@ const TracerouteWidget: React.FC<TracerouteWidgetProps> = ({
                       📍
                     </span>
                   )}
-                  {hop.snr !== undefined && <span className="traceroute-snr">{hop.snr.toFixed(1)} dB</span>}
+                  {hop.snr !== undefined && <span className="traceroute-snr">{isMqttSnr(hop.snr) ? 'IP' : `${hop.snr.toFixed(1)} dB`}</span>}
                 </span>
                 {idx < fullPath.length - 1 && <span className="traceroute-arrow">→</span>}
               </React.Fragment>
@@ -404,7 +404,7 @@ const TracerouteWidget: React.FC<TracerouteWidgetProps> = ({
           {t('dashboard.widget.traceroute.title')}
           {targetNodeName ? `: ${targetNodeName}` : ''}
         </h3>
-        <button className="dashboard-remove-btn" onClick={onRemove} title={t('dashboard.remove_widget')}>
+        <button className="dashboard-remove-btn" onClick={onRemove} title={t('dashboard.remove_widget')} aria-label={t('dashboard.remove_widget')}>
           ×
         </button>
       </div>

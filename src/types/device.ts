@@ -30,6 +30,7 @@ export interface DeviceInfo {
   isMobile?: boolean;
   mobile?: number; // Database field: 0 = not mobile, 1 = mobile (moved >100m)
   isFavorite?: boolean;
+  favoriteLocked?: boolean;
   isIgnored?: boolean;
   keyIsLowEntropy?: boolean;
   duplicateKeyDetected?: boolean;
@@ -100,6 +101,11 @@ export interface TelemetryNodeInfo extends BasicNodeInfo {
   hopsAway?: number;
   snr?: number;
   rssi?: number;
+  position?: {
+    latitude?: number;
+    longitude?: number;
+    altitude?: number;
+  };
 }
 
 /**

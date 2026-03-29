@@ -21,6 +21,7 @@ export interface EnrichedNeighborInfo extends DbNeighborInfo {
   nodeLongitude?: number;
   neighborLatitude?: number;
   neighborLongitude?: number;
+  bidirectional?: boolean;
 }
 
 // MeshCore node for map display
@@ -54,6 +55,8 @@ interface MapContextType {
   setShowEstimatedPositions: (show: boolean) => void;
   showAccuracyRegions: boolean;
   setShowAccuracyRegions: (show: boolean) => void;
+  showPolarGrid: boolean;
+  setShowPolarGrid: (show: boolean) => void;
   animatedNodes: Set<string>;
   triggerNodeAnimation: (nodeId: string) => void;
   mapCenterTarget: [number, number] | null;
@@ -83,7 +86,7 @@ interface MapProviderProps {
 }
 
 export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
-  const { getToken: getCsrfToken } = useCsrf();
+  const { getToken: getCsrfToken, refreshToken: refreshCsrfToken } = useCsrf();
 
   // Initialize with defaults (will be overridden by server preferences when loaded)
   const [showPaths, setShowPathsState] = useState<boolean>(false);
@@ -99,6 +102,7 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     return saved !== null ? saved === 'true' : true; // Default to true
   });
   const [showAccuracyRegions, setShowAccuracyRegionsState] = useState<boolean>(false);
+  const [showPolarGrid, setShowPolarGridState] = useState<boolean>(false);
   const [animatedNodes, setAnimatedNodes] = useState<Set<string>>(new Set());
   const [mapCenterTarget, setMapCenterTarget] = useState<[number, number] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number] | null>(() => {
@@ -127,7 +131,6 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   const [positionHistory, setPositionHistory] = useState<PositionHistoryItem[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [positionHistoryHours, setPositionHistoryHoursState] = useState<number | null>(null);
-
   // Create wrapper setters that persist to server (no localStorage)
   const setShowPaths = React.useCallback((value: boolean) => {
     setShowPathsState(value);
@@ -176,14 +179,16 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     savePreferenceToServer({ showAccuracyRegions: value });
   }, []);
 
+  const setShowPolarGrid = React.useCallback((value: boolean) => {
+    setShowPolarGridState(value);
+    savePreferenceToServer({ showPolarGrid: value });
+  }, []);
+
   // Helper function to save preference to server
-  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean | number | null>) => {
+  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean | number | null>, isRetry = false) => {
     try {
       const baseUrl = await api.getBaseUrl();
       const csrfToken = getCsrfToken();
-      console.log('[MapContext] Saving preference to server:', preference);
-      console.log('[MapContext] CSRF token:', csrfToken ? 'present' : 'MISSING');
-      console.log('[MapContext] Base URL:', baseUrl);
 
       const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
@@ -198,16 +203,24 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
         body: JSON.stringify(preference)
       });
 
-      console.log('[MapContext] Save response status:', response.status);
       if (!response.ok) {
+        // On CSRF failure, refresh token and retry once
+        if (response.status === 403 && !isRetry) {
+          const error = await response.json().catch(() => ({ error: '' }));
+          if (error.error && error.error.toLowerCase().includes('csrf')) {
+            console.warn('[MapContext] CSRF error - refreshing token and retrying...');
+            sessionStorage.removeItem('csrfToken');
+            await refreshCsrfToken();
+            return savePreferenceToServer(preference, true);
+          }
+        }
         const errorText = await response.text();
         console.error('[MapContext] Save failed:', errorText);
       }
     } catch (error) {
-      // Silently fail - localStorage will still work
       console.error('[MapContext] Failed to save map preference to server:', error);
     }
-  }, [getCsrfToken]);
+  }, [getCsrfToken, refreshCsrfToken]);
 
   // Create wrapper setter for positionHistoryHours that persists to server with debouncing
   const positionHistoryDebounceRef = useRef<NodeJS.Timeout | null>(null);
@@ -265,6 +278,9 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
               setShowAccuracyRegionsState(preferences.showAccuracyRegions);
             } else if (preferences.showAccuracyCircles !== undefined) {
               setShowAccuracyRegionsState(preferences.showAccuracyCircles);
+            }
+            if (preferences.showPolarGrid !== undefined) {
+              setShowPolarGridState(preferences.showPolarGrid);
             }
             if (preferences.positionHistoryHours !== undefined) {
               setPositionHistoryHoursState(preferences.positionHistoryHours);
@@ -332,6 +348,8 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
         setShowEstimatedPositions,
         showAccuracyRegions,
         setShowAccuracyRegions,
+        showPolarGrid,
+        setShowPolarGrid,
         animatedNodes,
         triggerNodeAnimation,
         mapCenterTarget,

@@ -82,11 +82,6 @@ class InactiveNodeNotificationService {
    */
   private async checkInactiveNodes(): Promise<void> {
     try {
-      // For PostgreSQL/MySQL, inactive node notifications not yet implemented
-      if (databaseService.drizzleDbType === 'postgres' || databaseService.drizzleDbType === 'mysql') {
-        return;
-      }
-
       // Capture current parameter values at the start of the check to ensure consistency
       // throughout the entire check cycle, even if the service is restarted mid-check
       const thresholdHours = this.currentThresholdHours;
@@ -95,18 +90,8 @@ class InactiveNodeNotificationService {
       const now = Date.now();
       const cutoffSeconds = Math.floor(now / 1000) - thresholdHours * 60 * 60;
 
-      // Get all users who have inactive node notifications enabled
-      const usersStmt = databaseService.db.prepare(`
-        SELECT user_id, monitored_nodes
-        FROM user_notification_preferences
-        WHERE notify_on_inactive_node = 1
-          AND (enable_web_push = 1 OR enable_apprise = 1)
-      `);
-
-      const users = usersStmt.all() as Array<{
-        user_id: number;
-        monitored_nodes: string | null;
-      }>;
+      // Get all users who have inactive node notifications enabled (database-agnostic via Drizzle ORM)
+      const users = await databaseService.notifications.getUsersWithInactiveNodeNotifications();
 
       if (users.length === 0) {
         logger.debug('✅ No users have inactive node notifications enabled');
@@ -120,65 +105,50 @@ class InactiveNodeNotificationService {
         let monitoredNodeIds: string[] = [];
 
         // Parse monitored nodes list
-        if (user.monitored_nodes) {
+        if (user.monitoredNodes) {
           try {
-            monitoredNodeIds = JSON.parse(user.monitored_nodes);
+            monitoredNodeIds = JSON.parse(user.monitoredNodes);
           } catch (error) {
-            logger.warn(`Failed to parse monitored_nodes for user ${user.user_id}:`, error);
+            logger.warn(`Failed to parse monitored_nodes for user ${user.userId}:`, error);
             continue;
           }
         }
 
         // If user has no monitored nodes, skip (they need to select nodes first)
         if (monitoredNodeIds.length === 0) {
-          logger.debug(`⏭️  User ${user.user_id} has no monitored nodes, skipping`);
+          logger.debug(`⏭️  User ${user.userId} has no monitored nodes, skipping`);
           continue;
         }
 
-        // Get inactive nodes that are in this user's monitored list
-        const placeholders = monitoredNodeIds.map(() => '?').join(',');
-        const stmt = databaseService.db.prepare(`
-          SELECT nodeNum, nodeId, longName, shortName, lastHeard
-          FROM nodes
-          WHERE nodeId IN (${placeholders})
-            AND lastHeard IS NOT NULL 
-            AND lastHeard < ?
-          ORDER BY lastHeard ASC
-        `);
-
-        const inactiveNodes = stmt.all(...monitoredNodeIds, cutoffSeconds) as Array<{
-          nodeNum: number;
-          nodeId: string;
-          longName: string;
-          shortName: string;
-          lastHeard: number;
-        }>;
+        // Get inactive nodes that are in this user's monitored list (database-agnostic via Drizzle ORM)
+        const inactiveNodes = await databaseService.nodes.getInactiveMonitoredNodes(monitoredNodeIds, cutoffSeconds);
 
         if (inactiveNodes.length === 0) {
           continue; // No inactive nodes for this user
         }
 
-        logger.debug(`🔍 Found ${inactiveNodes.length} inactive monitored node(s) for user ${user.user_id}`);
+        logger.debug(`🔍 Found ${inactiveNodes.length} inactive monitored node(s) for user ${user.userId}`);
 
         // Check each inactive node and send notification if needed
         for (const node of inactiveNodes) {
+          if (node.lastHeard == null) continue;
           const lastHeardMs = node.lastHeard * 1000;
           const inactiveHours = Math.floor((now - lastHeardMs) / (60 * 60 * 1000));
 
           // Check if we've already notified this user about this node recently
-          const notificationKey = `${user.user_id}:${node.nodeId}`;
+          const notificationKey = `${user.userId}:${node.nodeId}`;
           const lastNotification = this.lastNotifiedNodes.get(notificationKey);
           const cooldownMs = cooldownHours * 60 * 60 * 1000;
 
           if (lastNotification && now - lastNotification < cooldownMs) {
             logger.debug(
-              `⏭️  Skipping notification for user ${user.user_id}, node ${node.nodeId} (already notified recently)`
+              `⏭️  Skipping notification for user ${user.userId}, node ${node.nodeId} (already notified recently)`
             );
             continue;
           }
 
           // Send notification to this specific user
-          await this.sendInactiveNodeNotification(user.user_id, {
+          await this.sendInactiveNodeNotification(user.userId, {
             nodeId: node.nodeId,
             nodeNum: node.nodeNum,
             longName: node.longName || node.shortName || `Node ${node.nodeNum}`,

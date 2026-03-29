@@ -26,14 +26,14 @@ async function hasNodesReadPermission(userId: number | null, isAdmin: boolean): 
 }
 
 /**
- * Enrich node data with latest uptime from telemetry
+ * Enrich node data with latest uptime from telemetry (async - works with all DB backends)
  */
-function enrichNodeWithUptime(node: DbNode): DbNode & { uptimeSeconds?: number } {
-  const uptimeTelemetry = databaseService.getLatestTelemetryForType(node.nodeId, 'uptimeSeconds');
-  return {
+async function enrichNodesWithUptime(nodes: DbNode[]): Promise<(DbNode & { uptimeSeconds?: number })[]> {
+  const uptimeMap = await databaseService.telemetry.getLatestTelemetryValueForAllNodes('uptimeSeconds');
+  return nodes.map(node => ({
     ...node,
-    uptimeSeconds: uptimeTelemetry?.value
-  };
+    uptimeSeconds: uptimeMap.get(node.nodeId)
+  }));
 }
 
 /**
@@ -68,14 +68,14 @@ router.get('/', async (req: Request, res: Response) => {
     if (active) {
       nodes = databaseService.getActiveNodes(sinceDays);
     } else {
-      nodes = await databaseService.getAllNodesAsync();
+      nodes = await databaseService.nodes.getAllNodes() as unknown as DbNode[];
     }
 
     // Filter nodes based on channel read permissions
     const filteredNodes = await filterNodesByChannelPermission(nodes, user);
 
     // Enrich nodes with uptime data from telemetry
-    const enrichedNodes = filteredNodes.map(enrichNodeWithUptime);
+    const enrichedNodes = await enrichNodesWithUptime(filteredNodes);
 
     res.json({
       success: true,
@@ -114,7 +114,7 @@ router.get('/:nodeId', async (req: Request, res: Response) => {
     }
 
     const { nodeId } = req.params;
-    const allNodes = await databaseService.getAllNodesAsync();
+    const allNodes = await databaseService.nodes.getAllNodes() as unknown as DbNode[];
     const node = allNodes.find(n => n.nodeId === nodeId);
 
     if (!node) {
@@ -137,7 +137,7 @@ router.get('/:nodeId', async (req: Request, res: Response) => {
     }
 
     // Enrich with uptime data from telemetry
-    const enrichedNode = enrichNodeWithUptime(filteredNode);
+    const [enrichedNode] = await enrichNodesWithUptime([filteredNode]);
 
     res.json({
       success: true,

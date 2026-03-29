@@ -20,12 +20,14 @@ import NodesTab from './components/NodesTab';
 import MessagesTab from './components/MessagesTab';
 import ChannelsTab from './components/ChannelsTab';
 import { MeshCoreTab } from './components/MeshCore';
+import PacketMonitorPanel from './components/PacketMonitorPanel';
 import AutoAcknowledgeSection from './components/AutoAcknowledgeSection';
 import AutoTracerouteSection from './components/AutoTracerouteSection';
 import AutoAnnounceSection from './components/AutoAnnounceSection';
 import AutoWelcomeSection from './components/AutoWelcomeSection';
 import AutoResponderSection from './components/AutoResponderSection';
 import AutoKeyManagementSection from './components/AutoKeyManagementSection';
+import AutoDeleteByDistanceSection from './components/AutoDeleteByDistanceSection';
 import TimerTriggersSection from './components/TimerTriggersSection';
 import GeofenceTriggersSection from './components/GeofenceTriggersSection';
 import RemoteAdminScannerSection from './components/RemoteAdminScannerSection';
@@ -54,6 +56,7 @@ import { MeshMessage } from './types/message';
 import { SortField, SortDirection, NodeFilters } from './types/ui';
 import { ResourceType } from './types/permission';
 import api, { type ChannelDatabaseEntry } from './services/api';
+import { getPacketStats } from './services/packetApi';
 import { logger } from './utils/logger';
 // generateArrowMarkers moved to useTraceroutePaths hook
 import { isNodeComplete, getEffectivePosition } from './utils/nodeHelpers';
@@ -65,6 +68,7 @@ import { MapProvider, useMapContext } from './contexts/MapContext';
 import { DataProvider, useData } from './contexts/DataContext';
 import { MessagingProvider, useMessaging } from './contexts/MessagingContext';
 import { UIProvider, useUI } from './contexts/UIContext';
+import { AutomationProvider, useAutomation } from './contexts/AutomationContext';
 import { useAuth } from './contexts/AuthContext';
 import { useCsrf } from './contexts/CsrfContext';
 import { useWebSocketConnected } from './contexts/WebSocketContext';
@@ -77,6 +81,7 @@ import LoginModal from './components/LoginModal';
 import LoginPage from './components/LoginPage';
 import { SaveBarProvider } from './contexts/SaveBarContext';
 import { SaveBar } from './components/SaveBar';
+import ErrorBoundary from './components/common/ErrorBoundary';
 
 // Track pending favorite requests outside component to persist across remounts
 // Maps nodeNum -> expected isFavorite state
@@ -146,6 +151,7 @@ function App() {
   const [emojiPickerMessage, setEmojiPickerMessage] = useState<MeshMessage | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [focusMessageId, setFocusMessageId] = useState<string | null>(null);
+  const [packetLogEnabled, setPacketLogEnabled] = useState(false);
 
   // Check if mobile viewport and default to collapsed on mobile
   const isMobileViewport = () => window.innerWidth <= 768;
@@ -174,6 +180,9 @@ function App() {
         if (parsed.showIgnored === undefined) {
           parsed.showIgnored = false;
         }
+        if (parsed.showFavoriteLocked === undefined) {
+          parsed.showFavoriteLocked = false;
+        }
         return parsed;
       } catch (e) {
         logger.error('Failed to parse saved node filters:', e);
@@ -192,6 +201,7 @@ function App() {
       showRemoteAdmin: false,
       showUnknown: false,
       showIgnored: false,
+      showFavoriteLocked: false,
       deviceRoles: [] as number[], // Empty array means show all roles
       channels: [] as number[],
     };
@@ -214,7 +224,6 @@ function App() {
   const dmMessagesContainerRef = useRef<HTMLDivElement>(null);
   const lastScrollLoadTimeRef = useRef<number>(0); // Throttle scroll-triggered loads (200ms)
 
-  // const lastNotificationTime = useRef<number>(0) // Disabled for now
   // Detect base URL from pathname
   const detectBaseUrl = () => {
     const pathname = window.location.pathname;
@@ -270,6 +279,7 @@ function App() {
     dateFormat,
     mapTileset,
     mapPinStyle,
+    iconStyle,
     theme,
     language,
     solarMonitoringEnabled,
@@ -296,6 +306,7 @@ function App() {
     setDateFormat,
     setMapTileset,
     setMapPinStyle,
+    setIconStyle,
     setTheme,
     setLanguage,
     setSolarMonitoringEnabled,
@@ -319,6 +330,7 @@ function App() {
     setPositionHistory,
     selectedNodeId,
     setSelectedNodeId,
+    mapZoom,
   } = useMapContext();
 
   // Data context
@@ -398,6 +410,7 @@ function App() {
     tracerouteReturn: schemeColors.tracerouteReturn,
     mqttSegment: schemeColors.mqttSegment,
     neighborLine: schemeColors.neighborLine,
+    snrColors: schemeColors.snrColors,
   }), [themeColors, schemeColors]);
 
   // Channel Database entries for displaying names of server-decrypted channels
@@ -437,6 +450,21 @@ function App() {
     };
     checkUnreadNews();
   }, [authStatus?.authenticated]);
+
+  // Check if packet logging is enabled on the server
+  // Re-check when auth status changes (permissions may have changed)
+  useEffect(() => {
+    const checkPacketLogStatus = async () => {
+      try {
+        const stats = await getPacketStats();
+        setPacketLogEnabled(stats.enabled === true);
+      } catch {
+        // 403 means no permission - packet log may still be enabled but user can't see it
+        setPacketLogEnabled(false);
+      }
+    };
+    checkPacketLogStatus();
+  }, [authStatus]);
 
   // Messaging context
   const {
@@ -490,93 +518,63 @@ function App() {
     setSystemStatus,
     nodePopup,
     setNodePopup,
-    autoAckEnabled,
-    setAutoAckEnabled,
-    autoAckRegex,
-    setAutoAckRegex,
-    autoAckMessage,
-    setAutoAckMessage,
-    autoAckMessageDirect,
-    setAutoAckMessageDirect,
-    autoAckChannels,
-    setAutoAckChannels,
-    autoAckDirectMessages,
-    setAutoAckDirectMessages,
-    autoAckUseDM,
-    setAutoAckUseDM,
-    autoAckSkipIncompleteNodes,
-    setAutoAckSkipIncompleteNodes,
-    autoAckTapbackEnabled,
-    setAutoAckTapbackEnabled,
-    autoAckReplyEnabled,
-    setAutoAckReplyEnabled,
-    autoAckDirectEnabled,
-    setAutoAckDirectEnabled,
-    autoAckDirectTapbackEnabled,
-    setAutoAckDirectTapbackEnabled,
-    autoAckDirectReplyEnabled,
-    setAutoAckDirectReplyEnabled,
-    autoAckMultihopEnabled,
-    setAutoAckMultihopEnabled,
-    autoAckMultihopTapbackEnabled,
-    setAutoAckMultihopTapbackEnabled,
-    autoAckMultihopReplyEnabled,
-    setAutoAckMultihopReplyEnabled,
-    autoAckTestMessages,
-    setAutoAckTestMessages,
-    autoAnnounceEnabled,
-    setAutoAnnounceEnabled,
-    autoAnnounceIntervalHours,
-    setAutoAnnounceIntervalHours,
-    autoAnnounceMessage,
-    setAutoAnnounceMessage,
-    autoAnnounceChannelIndex,
-    setAutoAnnounceChannelIndex,
-    autoAnnounceOnStart,
-    setAutoAnnounceOnStart,
-    autoAnnounceUseSchedule,
-    setAutoAnnounceUseSchedule,
-    autoAnnounceSchedule,
-    setAutoAnnounceSchedule,
-    autoAnnounceNodeInfoEnabled,
-    setAutoAnnounceNodeInfoEnabled,
-    autoAnnounceNodeInfoChannels,
-    setAutoAnnounceNodeInfoChannels,
-    autoAnnounceNodeInfoDelaySeconds,
-    setAutoAnnounceNodeInfoDelaySeconds,
-    autoWelcomeEnabled,
-    setAutoWelcomeEnabled,
-    autoWelcomeMessage,
-    setAutoWelcomeMessage,
-    autoWelcomeTarget,
-    setAutoWelcomeTarget,
-    autoWelcomeWaitForName,
-    setAutoWelcomeWaitForName,
-    autoWelcomeMaxHops,
-    setAutoWelcomeMaxHops,
-    autoResponderEnabled,
-    setAutoResponderEnabled,
-    autoResponderTriggers,
-    setAutoResponderTriggers,
-    autoResponderSkipIncompleteNodes,
-    setAutoResponderSkipIncompleteNodes,
-    autoKeyManagementEnabled,
-    setAutoKeyManagementEnabled,
-    autoKeyManagementIntervalMinutes,
-    setAutoKeyManagementIntervalMinutes,
-    autoKeyManagementMaxExchanges,
-    setAutoKeyManagementMaxExchanges,
-    autoKeyManagementAutoPurge,
-    setAutoKeyManagementAutoPurge,
-    timerTriggers,
-    setTimerTriggers,
-    geofenceTriggers,
-    setGeofenceTriggers,
     showNodeFilterPopup,
     setShowNodeFilterPopup,
     showIncompleteNodes,
     setShowIncompleteNodes,
   } = useUI();
+
+  // Automation context
+  const {
+    autoAckEnabled, setAutoAckEnabled,
+    autoAckRegex, setAutoAckRegex,
+    autoAckMessage, setAutoAckMessage,
+    autoAckMessageDirect, setAutoAckMessageDirect,
+    autoAckChannels, setAutoAckChannels,
+    autoAckDirectMessages, setAutoAckDirectMessages,
+    autoAckUseDM, setAutoAckUseDM,
+    autoAckSkipIncompleteNodes, setAutoAckSkipIncompleteNodes,
+    autoAckIgnoredNodes, setAutoAckIgnoredNodes,
+    autoAckTapbackEnabled, setAutoAckTapbackEnabled,
+    autoAckReplyEnabled, setAutoAckReplyEnabled,
+    autoAckDirectEnabled, setAutoAckDirectEnabled,
+    autoAckDirectTapbackEnabled, setAutoAckDirectTapbackEnabled,
+    autoAckDirectReplyEnabled, setAutoAckDirectReplyEnabled,
+    autoAckMultihopEnabled, setAutoAckMultihopEnabled,
+    autoAckMultihopTapbackEnabled, setAutoAckMultihopTapbackEnabled,
+    autoAckMultihopReplyEnabled, setAutoAckMultihopReplyEnabled,
+    autoAckTestMessages, setAutoAckTestMessages,
+    autoAnnounceEnabled, setAutoAnnounceEnabled,
+    autoAnnounceIntervalHours, setAutoAnnounceIntervalHours,
+    autoAnnounceMessage, setAutoAnnounceMessage,
+    autoAnnounceChannelIndexes, setAutoAnnounceChannelIndexes,
+    autoAnnounceOnStart, setAutoAnnounceOnStart,
+    autoAnnounceUseSchedule, setAutoAnnounceUseSchedule,
+    autoAnnounceSchedule, setAutoAnnounceSchedule,
+    autoAnnounceNodeInfoEnabled, setAutoAnnounceNodeInfoEnabled,
+    autoAnnounceNodeInfoChannels, setAutoAnnounceNodeInfoChannels,
+    autoAnnounceNodeInfoDelaySeconds, setAutoAnnounceNodeInfoDelaySeconds,
+    autoWelcomeEnabled, setAutoWelcomeEnabled,
+    autoWelcomeMessage, setAutoWelcomeMessage,
+    autoWelcomeTarget, setAutoWelcomeTarget,
+    autoWelcomeWaitForName, setAutoWelcomeWaitForName,
+    autoWelcomeMaxHops, setAutoWelcomeMaxHops,
+    autoResponderEnabled, setAutoResponderEnabled,
+    autoResponderTriggers, setAutoResponderTriggers,
+    autoResponderSkipIncompleteNodes, setAutoResponderSkipIncompleteNodes,
+    autoKeyManagementEnabled, setAutoKeyManagementEnabled,
+    autoKeyManagementIntervalMinutes, setAutoKeyManagementIntervalMinutes,
+    autoKeyManagementMaxExchanges, setAutoKeyManagementMaxExchanges,
+    autoKeyManagementAutoPurge, setAutoKeyManagementAutoPurge,
+    autoKeyManagementImmediatePurge, setAutoKeyManagementImmediatePurge,
+    timerTriggers, setTimerTriggers,
+    geofenceTriggers, setGeofenceTriggers,
+    autoDeleteByDistanceEnabled, setAutoDeleteByDistanceEnabled,
+    autoDeleteByDistanceIntervalHours, setAutoDeleteByDistanceIntervalHours,
+    autoDeleteByDistanceThresholdKm, setAutoDeleteByDistanceThresholdKm,
+    autoDeleteByDistanceLat, setAutoDeleteByDistanceLat,
+    autoDeleteByDistanceLon, setAutoDeleteByDistanceLon,
+  } = useAutomation();
 
   // Check tab permissions and redirect if unauthorized
   // This prevents users from accessing protected tabs via direct URL navigation
@@ -600,6 +598,7 @@ function App() {
       admin: () => isAdmin,
       audit: () => hasPermission('audit', 'read'),
       security: () => hasPermission('security', 'read'),
+      packetmonitor: () => hasPermission('packetmonitor', 'read'),
     };
 
     // Check if current tab requires permission
@@ -977,6 +976,10 @@ function App() {
             setAutoAckSkipIncompleteNodes(settings.autoAckSkipIncompleteNodes === 'true');
           }
 
+          if (settings.autoAckIgnoredNodes !== undefined) {
+            setAutoAckIgnoredNodes(settings.autoAckIgnoredNodes);
+          }
+
           if (settings.autoAckTapbackEnabled !== undefined) {
             setAutoAckTapbackEnabled(settings.autoAckTapbackEnabled === 'true');
           }
@@ -1022,9 +1025,19 @@ function App() {
             setAutoAnnounceMessage(settings.autoAnnounceMessage);
           }
 
-          if (settings.autoAnnounceChannelIndex !== undefined) {
+          if (settings.autoAnnounceChannelIndexes) {
+            try {
+              const channels = JSON.parse(settings.autoAnnounceChannelIndexes);
+              if (Array.isArray(channels)) {
+                setAutoAnnounceChannelIndexes(channels);
+              }
+            } catch (e) {
+              console.error('Failed to parse autoAnnounceChannelIndexes:', e);
+            }
+          } else if (settings.autoAnnounceChannelIndex !== undefined) {
+            // Legacy migration: convert single index to array
             const value = parseInt(settings.autoAnnounceChannelIndex);
-            setAutoAnnounceChannelIndex(value);
+            setAutoAnnounceChannelIndexes([value]);
           }
 
           if (settings.autoAnnounceOnStart !== undefined) {
@@ -1107,6 +1120,26 @@ function App() {
           }
           if (settings.autoKeyManagementAutoPurge !== undefined) {
             setAutoKeyManagementAutoPurge(settings.autoKeyManagementAutoPurge === 'true');
+          }
+          if (settings.autoKeyManagementImmediatePurge !== undefined) {
+            setAutoKeyManagementImmediatePurge(settings.autoKeyManagementImmediatePurge === 'true');
+          }
+
+          // Auto delete by distance settings
+          if (settings.autoDeleteByDistanceEnabled !== undefined) {
+            setAutoDeleteByDistanceEnabled(settings.autoDeleteByDistanceEnabled === 'true');
+          }
+          if (settings.autoDeleteByDistanceIntervalHours !== undefined) {
+            setAutoDeleteByDistanceIntervalHours(parseInt(settings.autoDeleteByDistanceIntervalHours) || 24);
+          }
+          if (settings.autoDeleteByDistanceThresholdKm !== undefined) {
+            setAutoDeleteByDistanceThresholdKm(parseFloat(settings.autoDeleteByDistanceThresholdKm) || 100);
+          }
+          if (settings.autoDeleteByDistanceLat !== undefined) {
+            setAutoDeleteByDistanceLat(settings.autoDeleteByDistanceLat ? parseFloat(settings.autoDeleteByDistanceLat) : null);
+          }
+          if (settings.autoDeleteByDistanceLon !== undefined) {
+            setAutoDeleteByDistanceLon(settings.autoDeleteByDistanceLon ? parseFloat(settings.autoDeleteByDistanceLon) : null);
           }
 
           if (settings.timerTriggers) {
@@ -1709,6 +1742,63 @@ function App() {
     }
   }, [selectedChannel, activeTab]);
 
+  // Auto-scroll to bottom when new messages arrive and user is already at the bottom
+  const prevChannelMsgCountRef = useRef<Record<number, number>>({});
+  useEffect(() => {
+    const currentMessages = channelMessages[selectedChannel] || [];
+    const prevCount = prevChannelMsgCountRef.current[selectedChannel] || 0;
+    const currentCount = currentMessages.length;
+
+    if (currentCount > prevCount && prevCount > 0) {
+      // New messages arrived — auto-scroll if user was near the bottom
+      const container = channelMessagesContainerRef.current;
+      if (container) {
+        const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 150;
+        if (isNearBottom) {
+          setTimeout(() => {
+            if (channelMessagesContainerRef.current) {
+              channelMessagesContainerRef.current.scrollTo({
+                top: channelMessagesContainerRef.current.scrollHeight,
+                behavior: 'smooth'
+              });
+            }
+          }, 50);
+        }
+      }
+    }
+
+    prevChannelMsgCountRef.current = {
+      ...prevChannelMsgCountRef.current,
+      [selectedChannel]: currentCount
+    };
+  }, [channelMessages, selectedChannel]);
+
+  // Auto-scroll DMs to bottom when new messages arrive and user is at the bottom
+  const prevDMMsgCountRef = useRef(0);
+  useEffect(() => {
+    const currentCount = messages.length;
+    const prevCount = prevDMMsgCountRef.current;
+
+    if (currentCount > prevCount && prevCount > 0 && activeTab === 'messages') {
+      const container = dmMessagesContainerRef.current;
+      if (container) {
+        const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 150;
+        if (isNearBottom) {
+          setTimeout(() => {
+            if (dmMessagesContainerRef.current) {
+              dmMessagesContainerRef.current.scrollTo({
+                top: dmMessagesContainerRef.current.scrollHeight,
+                behavior: 'smooth'
+              });
+            }
+          }, 50);
+        }
+      }
+    }
+
+    prevDMMsgCountRef.current = currentCount;
+  }, [messages, activeTab]);
+
   // Auto-load more channel messages if container doesn't have a scrollbar
   // This fixes the case where a channel has no recent messages and infinite scroll never triggers
   useEffect(() => {
@@ -1785,25 +1875,27 @@ function App() {
 
   // Unread counts polling is now handled by useUnreadCounts hook in MessagingContext
 
-  // Mark messages as read when viewing a channel
+  // Mark messages as read when viewing a channel — also re-fires when new messages arrive
+  // so that incoming messages are immediately marked as read while the user is viewing the channel.
+  // Without the message count dependency, new messages would show as "unread" until the user
+  // clicks away and back (#2316).
+  const currentChannelMsgCount = (channelMessages[selectedChannel] || []).length;
   useEffect(() => {
     if (activeTab === 'channels' && selectedChannel >= 0) {
-      // Mark all messages in the selected channel as read
-      console.log('📖 Marking channel messages as read:', selectedChannel);
-      logger.debug('📖 Marking channel messages as read:', selectedChannel);
       markMessagesAsRead(undefined, selectedChannel);
     }
-  }, [selectedChannel, activeTab, markMessagesAsRead]);
+  }, [selectedChannel, activeTab, markMessagesAsRead, currentChannelMsgCount]);
 
-  // Mark messages as read when viewing a DM conversation
+  // Mark messages as read when viewing a DM conversation — also re-fires on new messages
+  // Filter to only the selected conversation so we don't fire on messages from other DMs
+  const currentDMMsgCount = selectedDMNode
+    ? messages.filter(msg => msg.fromNodeId === selectedDMNode || msg.toNodeId === selectedDMNode).length
+    : 0;
   useEffect(() => {
     if (activeTab === 'messages' && selectedDMNode) {
-      // Mark all DMs with the selected node as read
-      console.log('📖 Marking DM messages as read with node:', selectedDMNode);
-      logger.debug('📖 Marking DM messages as read with node:', selectedDMNode);
       markMessagesAsRead(undefined, undefined, selectedDMNode);
     }
-  }, [selectedDMNode, activeTab, markMessagesAsRead]);
+  }, [selectedDMNode, activeTab, markMessagesAsRead, currentDMMsgCount]);
 
   // Handle push notification navigation (click on notification -> navigate to channel/DM and scroll to message)
   useNotificationNavigationHandler(
@@ -3154,6 +3246,42 @@ function App() {
     }
   };
 
+  const handlePurgePositionHistory = async (nodeNum: number) => {
+    const node = nodes.find(n => n.nodeNum === nodeNum);
+    const nodeName = node?.user?.shortName || node?.user?.longName || `Node ${nodeNum}`;
+
+    if (
+      !window.confirm(
+        `Are you sure you want to purge position history for ${nodeName}? This action cannot be undone.`
+      )
+    ) {
+      return;
+    }
+
+    try {
+      const response = await authFetch(`${baseUrl}/api/messages/nodes/${nodeNum}/position-history`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        showToast(t('toast.purged_position_history', { count: data.deletedCount, node: nodeName }), 'success');
+        refetchPoll();
+      } else {
+        const errorData = await response.json();
+        showToast(t('toast.failed_purge_position_history', { error: errorData.message || t('errors.unknown') }), 'error');
+      }
+    } catch (err) {
+      showToast(
+        t('toast.failed_purge_position_history', { error: err instanceof Error ? err.message : t('errors.network') }),
+        'error'
+      );
+    }
+  };
+
   const handleDeleteNode = async (nodeNum: number) => {
     const node = nodes.find(n => n.nodeNum === nodeNum);
     const nodeName = node?.user?.shortName || node?.user?.longName || `Node ${nodeNum}`;
@@ -3407,6 +3535,77 @@ function App() {
         pendingMessagesRef.current = updated; // Update ref
         return updated;
       });
+    }
+  };
+
+  // Send a bell character (0x07) on a channel, optionally prepended to current text
+  const handleSendBell = async (channel: number, currentText: string) => {
+    if (connectionStatus !== 'connected') return;
+
+    const bellText = currentText.trim() ? `\x07${currentText}` : '\x07';
+    setNewMessage('');
+
+    try {
+      const response = await authFetch(`${baseUrl}/api/messages/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: bellText, channel }),
+      });
+
+      if (response.ok) {
+        setTimeout(() => refetchPoll(), 1000);
+      } else {
+        const errorData = await response.json();
+        setError(`Failed to send bell: ${errorData.error}`);
+      }
+    } catch (err) {
+      setError(`Failed to send bell: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  // Send a bell character (0x07) as a direct message
+  const handleSendBellDM = async (destinationNodeId: string, currentText: string) => {
+    if (connectionStatus !== 'connected') return;
+
+    const bellText = currentText.trim() ? `\x07${currentText}` : '\x07';
+    setNewMessage('');
+
+    try {
+      const response = await authFetch(`${baseUrl}/api/messages/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: bellText, channel: 0, destination: destinationNodeId }),
+      });
+
+      if (response.ok) {
+        logger.debug('Bell DM sent successfully');
+      } else {
+        setError('Failed to send bell DM');
+      }
+    } catch (err) {
+      setError(`Failed to send bell DM: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  // Broadcast local node's position on a channel
+  const handleSendPosition = async (channel: number) => {
+    if (connectionStatus !== 'connected') return;
+
+    try {
+      const response = await authFetch(`${baseUrl}/api/position/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destination: 4294967295, channel }),
+      });
+
+      if (response.ok) {
+        setTimeout(() => refetchPoll(), 1000);
+      } else {
+        const errorData = await response.json();
+        setError(`Failed to send position: ${errorData.error}`);
+      }
+    } catch (err) {
+      setError(`Failed to send position: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
   };
 
@@ -3745,6 +3944,13 @@ function App() {
         return false;
       }
 
+      // Favorite locked filter
+      if (nodeFilters.showFavoriteLocked) {
+        const matches = !!node.favoriteLocked;
+        if (isShowMode && !matches) return false;
+        if (!isShowMode && matches) return false;
+      }
+
       // Device role filter
       if (nodeFilters.deviceRoles.length > 0) {
         const role = typeof node.user?.role === 'number' ? node.user.role : parseInt(node.user?.role || '0');
@@ -3880,6 +4086,50 @@ function App() {
     }
     // Note: On success, the polling logic will remove from pendingFavoriteRequests
     // when it detects the server has caught up
+  };
+
+  // Function to toggle node favorite lock status
+  const toggleFavoriteLock = async (node: DeviceInfo, event: React.MouseEvent) => {
+    event.stopPropagation();
+
+    if (!node.user?.id) {
+      logger.error('Cannot toggle favorite lock: node has no user ID');
+      return;
+    }
+
+    const newLocked = !node.favoriteLocked;
+
+    try {
+      // Optimistically update the UI
+      flushSync(() => {
+        setNodes(prevNodes =>
+          prevNodes.map(n =>
+            n.nodeNum === node.nodeNum ? { ...n, favoriteLocked: newLocked } : n
+          )
+        );
+      });
+
+      const response = await authFetch(`${baseUrl}/api/nodes/${node.user.id}/favorite-lock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locked: newLocked }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      logger.debug(`${newLocked ? '🔒' : '🔓'} Node ${node.user.id} favorite lock set to: ${newLocked}`);
+    } catch (error) {
+      logger.error('Error toggling favorite lock:', error);
+      // Revert
+      setNodes(prevNodes =>
+        prevNodes.map(n =>
+          n.nodeNum === node.nodeNum ? { ...n, favoriteLocked: !newLocked } : n
+        )
+      );
+      showToast(t('toast.failed_update_favorite_lock', 'Failed to update favorite lock'), 'error');
+    }
   };
 
   // Function to toggle node ignored status
@@ -4048,11 +4298,12 @@ function App() {
               id: n.user.id,
             }
           : undefined,
+        viaMqtt: n.viaMqtt ?? false,
       };
     });
   }, [nodes.map(n => {
     const pos = getEffectivePosition(n);
-    return `${n.nodeNum}-${pos.latitude}-${pos.longitude}`;
+    return `${n.nodeNum}-${pos.latitude}-${pos.longitude}-${n.viaMqtt ? '1' : '0'}`;
   }).join(',')]);
 
   const traceroutesDigest = useMemo(() => {
@@ -4119,6 +4370,7 @@ function App() {
     themeColors: mergedThemeColors,
     callbacks: tracerouteCallbacks,
     visibleNodeNums,
+    mapZoom,
   });
 
   // Navigate to message from search result
@@ -4147,16 +4399,21 @@ function App() {
   }, [setActiveTab, setSelectedDMNode, setSelectedChannel]);
 
   // Ctrl+K / Cmd+K keyboard shortcut to toggle search modal
+  const canSearch = hasPermission('messages', 'read') ||
+    Array.from({ length: 8 }, (_, i) =>
+      hasPermission(`channel_${i}` as ResourceType, 'read')
+    ).some(Boolean);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
-        setIsSearchOpen(prev => !prev);
+        if (canSearch) setIsSearchOpen(prev => !prev);
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [canSearch]);
 
   // If anonymous is disabled and user is not authenticated, show login page
   if (authStatus?.anonymousDisabled && !authStatus?.authenticated) {
@@ -4165,6 +4422,9 @@ function App() {
 
   return (
     <div className="app">
+      <a href="#main-content" className="skip-to-content">
+        Skip to content
+      </a>
       <AdvancedNodeFilterPopup
         isOpen={showNodeFilterPopup}
         nodeFilters={nodeFilters}
@@ -4236,6 +4496,7 @@ function App() {
         onPurgeMessages={handlePurgeDirectMessages}
         onPurgeTraceroutes={handlePurgeNodeTraceroutes}
         onPurgeTelemetry={handlePurgeNodeTelemetry}
+        onPurgePositionHistory={handlePurgePositionHistory}
         onDeleteNode={handleDeleteNode}
         onPurgeFromDevice={handlePurgeNodeFromDevice}
         getNodeName={getNodeName}
@@ -4322,10 +4583,11 @@ function App() {
         baseUrl={baseUrl}
         connectedNodeName={connectedNodeName}
         meshcoreEnabled={authStatus?.meshcoreEnabled || false}
+        packetLogEnabled={packetLogEnabled}
         onSearchClick={() => setIsSearchOpen(true)}
       />
 
-      <main className="app-main">
+      <main id="main-content" className="app-main">
         {error && (
           <div className="error-panel">
             <h3>Connection Error</h3>
@@ -4342,11 +4604,13 @@ function App() {
         )}
 
         {activeTab === 'nodes' && (
+          <ErrorBoundary fallbackTitle="Nodes failed to load">
           <NodesTab
             processedNodes={processedNodes}
             shouldShowData={shouldShowData}
             centerMapOnNode={centerMapOnNode}
             toggleFavorite={toggleFavorite}
+            toggleFavoriteLock={toggleFavoriteLock}
             setActiveTab={setActiveTab}
             setSelectedDMNode={setSelectedDMNode}
             markerRefs={markerRefs}
@@ -4359,8 +4623,10 @@ function App() {
             connectionStatus={connectionStatus}
             tracerouteLoading={tracerouteLoading}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'channels' && (
+          <ErrorBoundary fallbackTitle="Channels failed to load">
           <ChannelsTab
             channels={channels}
             channelDatabaseEntries={channelDatabaseEntries}
@@ -4393,6 +4659,8 @@ function App() {
             handleSendTapback={handleSendTapback}
             handlePurgeChannelMessages={handlePurgeChannelMessages}
             handleSenderClick={handleSenderClick}
+            onSendBell={handleSendBell}
+            onSendPosition={handleSendPosition}
             shouldShowData={shouldShowData}
             getNodeName={getNodeName}
             getNodeShortName={getNodeShortName}
@@ -4402,8 +4670,10 @@ function App() {
             focusMessageId={focusMessageId}
             onFocusMessageHandled={() => setFocusMessageId(null)}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'messages' && (
+          <ErrorBoundary fallbackTitle="Messages failed to load">
           <MessagesTab
             processedNodes={processedNodes}
             nodes={nodes}
@@ -4448,6 +4718,7 @@ function App() {
             baseUrl={baseUrl}
             hasPermission={hasPermission}
             handleSendDirectMessage={handleSendDirectMessage}
+            onSendBell={handleSendBellDM}
             handleResendMessage={handleResendMessage}
             handleTraceroute={handleTraceroute}
             handleExchangePosition={handleExchangePosition}
@@ -4468,6 +4739,7 @@ function App() {
             onFocusMessageHandled={() => setFocusMessageId(null)}
             toggleIgnored={toggleIgnored}
             toggleFavorite={toggleFavorite}
+            toggleFavoriteLock={toggleFavoriteLock}
             handleShowOnMap={(nodeId: string) => {
               const node = nodes.find(n => n.user?.id === nodeId);
               if (node?.position?.latitude != null && node?.position?.longitude != null) {
@@ -4477,8 +4749,10 @@ function App() {
               }
             }}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'info' && (
+          <ErrorBoundary fallbackTitle="Info failed to load">
           <InfoTab
             connectionStatus={connectionStatus}
             nodeAddress={nodeAddress}
@@ -4498,8 +4772,10 @@ function App() {
             dateFormat={dateFormat}
             isAuthenticated={authStatus?.authenticated || false}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'dashboard' && (
+          <ErrorBoundary fallbackTitle="Dashboard failed to load">
           <Dashboard
             temperatureUnit={temperatureUnit}
             telemetryHours={telemetryVisualizationHours}
@@ -4507,9 +4783,15 @@ function App() {
             baseUrl={baseUrl}
             currentNodeId={currentNodeId}
             canEdit={hasPermission('dashboard', 'write')}
+            onOpenNodeDetails={(nodeId: string) => {
+              setSelectedDMNode(nodeId);
+              setActiveTab('messages');
+            }}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'settings' && (
+          <ErrorBoundary fallbackTitle="Settings failed to load">
           <SettingsTab
             maxNodeAgeHours={maxNodeAgeHours}
             inactiveNodeThresholdHours={inactiveNodeThresholdHours}
@@ -4526,6 +4808,7 @@ function App() {
             dateFormat={dateFormat}
             mapTileset={mapTileset}
             mapPinStyle={mapPinStyle}
+            iconStyle={iconStyle}
             theme={theme}
             language={language}
             solarMonitoringEnabled={solarMonitoringEnabled}
@@ -4551,6 +4834,7 @@ function App() {
             onDateFormatChange={setDateFormat}
             onMapTilesetChange={setMapTileset}
             onMapPinStyleChange={setMapPinStyle}
+            onIconStyleChange={setIconStyle}
             onThemeChange={setTheme}
             onLanguageChange={setLanguage}
             onSolarMonitoringEnabledChange={setSolarMonitoringEnabled}
@@ -4559,8 +4843,10 @@ function App() {
             onSolarMonitoringAzimuthChange={setSolarMonitoringAzimuth}
             onSolarMonitoringDeclinationChange={setSolarMonitoringDeclination}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'automation' && (
+          <ErrorBoundary fallbackTitle="Automation failed to load">
           <div className="settings-tab">
             <SectionNav
               items={[
@@ -4576,6 +4862,7 @@ function App() {
                 { id: 'auto-key-management', label: t('automation.auto_key_management.title', 'Auto Key Management') },
                 { id: 'timer-triggers', label: t('automation.timer_triggers.title', 'Timer Triggers') },
                 { id: 'geofence-triggers', label: t('automation.geofence_triggers.title', 'Geofence Triggers') },
+                { id: 'auto-delete-by-distance', label: t('automation.distance_delete.title', 'Auto Delete by Distance') },
                 { id: 'ignored-nodes', label: t('automation.ignored_nodes.title', 'Ignored Nodes') },
               ]}
             />
@@ -4632,6 +4919,7 @@ function App() {
                   directMessagesEnabled={autoAckDirectMessages}
                   useDM={autoAckUseDM}
                   skipIncompleteNodes={autoAckSkipIncompleteNodes}
+                  ignoredNodes={autoAckIgnoredNodes}
                   tapbackEnabled={autoAckTapbackEnabled}
                   replyEnabled={autoAckReplyEnabled}
                   directEnabled={autoAckDirectEnabled}
@@ -4650,6 +4938,7 @@ function App() {
                   onDirectMessagesChange={setAutoAckDirectMessages}
                   onUseDMChange={setAutoAckUseDM}
                   onSkipIncompleteNodesChange={setAutoAckSkipIncompleteNodes}
+                  onIgnoredNodesChange={setAutoAckIgnoredNodes}
                   onTapbackEnabledChange={setAutoAckTapbackEnabled}
                   onReplyEnabledChange={setAutoAckReplyEnabled}
                   onDirectEnabledChange={setAutoAckDirectEnabled}
@@ -4666,7 +4955,7 @@ function App() {
                   enabled={autoAnnounceEnabled}
                   intervalHours={autoAnnounceIntervalHours}
                   message={autoAnnounceMessage}
-                  channelIndex={autoAnnounceChannelIndex}
+                  channelIndexes={autoAnnounceChannelIndexes}
                   announceOnStart={autoAnnounceOnStart}
                   useSchedule={autoAnnounceUseSchedule}
                   schedule={autoAnnounceSchedule}
@@ -4675,7 +4964,7 @@ function App() {
                   onEnabledChange={setAutoAnnounceEnabled}
                   onIntervalChange={setAutoAnnounceIntervalHours}
                   onMessageChange={setAutoAnnounceMessage}
-                  onChannelChange={setAutoAnnounceChannelIndex}
+                  onChannelIndexesChange={setAutoAnnounceChannelIndexes}
                   onAnnounceOnStartChange={setAutoAnnounceOnStart}
                   onUseScheduleChange={setAutoAnnounceUseSchedule}
                   onScheduleChange={setAutoAnnounceSchedule}
@@ -4705,11 +4994,13 @@ function App() {
                   intervalMinutes={autoKeyManagementIntervalMinutes}
                   maxExchanges={autoKeyManagementMaxExchanges}
                   autoPurge={autoKeyManagementAutoPurge}
+                  immediatePurge={autoKeyManagementImmediatePurge}
                   baseUrl={baseUrl}
                   onEnabledChange={setAutoKeyManagementEnabled}
                   onIntervalChange={setAutoKeyManagementIntervalMinutes}
                   onMaxExchangesChange={setAutoKeyManagementMaxExchanges}
                   onAutoPurgeChange={setAutoKeyManagementAutoPurge}
+                  onImmediatePurgeChange={setAutoKeyManagementImmediatePurge}
                 />
               </div>
               <div id="timer-triggers">
@@ -4729,6 +5020,23 @@ function App() {
                   onTriggersChange={setGeofenceTriggers}
                 />
               </div>
+              <div id="auto-delete-by-distance">
+                <AutoDeleteByDistanceSection
+                  enabled={autoDeleteByDistanceEnabled}
+                  intervalHours={autoDeleteByDistanceIntervalHours}
+                  thresholdKm={autoDeleteByDistanceThresholdKm}
+                  homeLat={autoDeleteByDistanceLat}
+                  homeLon={autoDeleteByDistanceLon}
+                  localNodeLat={currentNodeId ? nodes.find((n: any) => n.user?.id === currentNodeId)?.position?.latitude : undefined}
+                  localNodeLon={currentNodeId ? nodes.find((n: any) => n.user?.id === currentNodeId)?.position?.longitude : undefined}
+                  baseUrl={baseUrl}
+                  onEnabledChange={setAutoDeleteByDistanceEnabled}
+                  onIntervalChange={setAutoDeleteByDistanceIntervalHours}
+                  onThresholdChange={setAutoDeleteByDistanceThresholdKm}
+                  onHomeLatChange={setAutoDeleteByDistanceLat}
+                  onHomeLonChange={setAutoDeleteByDistanceLon}
+                />
+              </div>
               <div id="ignored-nodes">
                 <IgnoredNodesSection
                   baseUrl={baseUrl}
@@ -4736,8 +5044,10 @@ function App() {
               </div>
             </div>
           </div>
+          </ErrorBoundary>
         )}
         {activeTab === 'configuration' && (
+          <ErrorBoundary fallbackTitle="Configuration failed to load">
           <ConfigurationTab
             baseUrl={baseUrl}
             nodes={nodes}
@@ -4747,22 +5057,34 @@ function App() {
             onChannelsUpdated={() => fetchChannels()}
             refreshTrigger={configRefreshTrigger}
           />
+          </ErrorBoundary>
         )}
-        {activeTab === 'notifications' && <NotificationsTab isAdmin={authStatus?.user?.isAdmin || false} />}
-        {activeTab === 'users' && <UsersTab />}
-        {activeTab === 'audit' && <AuditLogTab />}
+        {activeTab === 'notifications' && <ErrorBoundary fallbackTitle="Notifications failed to load"><NotificationsTab isAdmin={authStatus?.user?.isAdmin || false} /></ErrorBoundary>}
+        {activeTab === 'users' && <ErrorBoundary fallbackTitle="Users failed to load"><UsersTab /></ErrorBoundary>}
+        {activeTab === 'audit' && <ErrorBoundary fallbackTitle="Audit Log failed to load"><AuditLogTab /></ErrorBoundary>}
         {activeTab === 'admin' && authStatus?.user?.isAdmin && (
+          <ErrorBoundary fallbackTitle="Admin Commands failed to load">
           <AdminCommandsTab
             nodes={nodes}
             currentNodeId={currentNodeId}
             channels={channels}
             onChannelsUpdated={fetchChannels}
           />
+          </ErrorBoundary>
         )}
         {activeTab === 'security' && (
+          <ErrorBoundary fallbackTitle="Security failed to load">
           <SecurityTab onTabChange={setActiveTab} onSelectDMNode={setSelectedDMNode} setNewMessage={setNewMessage} />
+          </ErrorBoundary>
         )}
-        {activeTab === 'meshcore' && <MeshCoreTab baseUrl={baseUrl} />}
+        {activeTab === 'meshcore' && <ErrorBoundary fallbackTitle="MeshCore failed to load"><MeshCoreTab baseUrl={baseUrl} /></ErrorBoundary>}
+        {activeTab === 'packetmonitor' && (
+          <ErrorBoundary fallbackTitle="Packet Monitor failed to load">
+            <div style={{ height: 'calc(100vh - var(--header-height, 60px) - 4rem)', overflow: 'hidden' }}>
+              <PacketMonitorPanel onClose={() => setActiveTab('nodes')} />
+            </div>
+          </ErrorBoundary>
+        )}
       </main>
 
       {/* Node Popup */}
@@ -4815,12 +5137,16 @@ function App() {
         isOpen={isSearchOpen}
         onClose={() => setIsSearchOpen(false)}
         onNavigateToMessage={handleNavigateToMessage}
-        channels={channels.map(ch => ({ id: ch.id, name: ch.name }))}
+        channels={channels
+          .filter(ch => hasPermission(`channel_${ch.id}` as ResourceType, 'read'))
+          .map(ch => ({ id: ch.id, name: ch.name }))}
         nodes={nodes.map(n => ({
           nodeId: n.user?.id || String(n.nodeNum),
           longName: n.user?.longName || `!${n.nodeNum.toString(16)}`,
           shortName: n.user?.shortName || '????',
         }))}
+        canSearchDms={hasPermission('messages', 'read')}
+        canSearchMeshcore={hasPermission('meshcore', 'read')}
       />
 
       {/* SaveBar for unified save/dismiss actions */}
@@ -4862,11 +5188,13 @@ const AppWithToast = () => {
         <DataProvider>
           <MessagingProvider baseUrl={initialBaseUrl}>
             <UIProvider>
+              <AutomationProvider>
               <ToastProvider>
                 <SaveBarProvider>
                   <App />
                 </SaveBarProvider>
               </ToastProvider>
+              </AutomationProvider>
             </UIProvider>
           </MessagingProvider>
         </DataProvider>

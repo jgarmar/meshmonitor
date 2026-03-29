@@ -1,6 +1,7 @@
 # Logs
 logs
 *.log
+tests/soak-logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -71,3 +72,6 @@ tiles/*.pbf
 
 # Test output
 test-results.txt
+
+# Git worktrees
+.worktrees/

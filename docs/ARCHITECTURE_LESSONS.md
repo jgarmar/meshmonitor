@@ -47,7 +47,7 @@ Frontend → Backend API → Command Queue → Serial/TCP → Node
 - Supplement with mesh-propagated telemetry (other nodes)
 - Store both with proper timestamps and attribution
 
-**Location**: `src/services/telemetry.ts` - NodeInfo handling (PR #427)
+**Location**: `src/db/repositories/telemetry.ts`, `src/db/schema/telemetry.ts`, `src/server/routes/v1/telemetry.ts` - NodeInfo handling (PR #427)
 
 ### Protocol Constants
 
@@ -88,7 +88,7 @@ logger.info(`Received ${getPortNumName(portnum)} packet`);
 
 **Common Mistake**: Sending generic config without respecting the requested ID.
 
-**Reference**: Virtual Node implementation - `src/services/virtualNode.ts`
+**Reference**: Virtual Node implementation - `src/server/virtualNodeServer.ts`
 
 ---
 
@@ -166,6 +166,17 @@ if (pendingOp) {
 # Set via environment variable (in milliseconds)
 MESHTASTIC_STALE_CONNECTION_TIMEOUT=300000  # 5 minutes (default)
 MESHTASTIC_STALE_CONNECTION_TIMEOUT=0       # Disable (not recommended)
+
+# TCP connect/reconnect timing (for advanced troubleshooting)
+MESHTASTIC_CONNECT_TIMEOUT_MS=10000         # Initial TCP connect timeout (default: 10s)
+MESHTASTIC_RECONNECT_INITIAL_DELAY_MS=1000  # First reconnect delay (default: 1s)
+MESHTASTIC_RECONNECT_MAX_DELAY_MS=60000     # Max reconnect delay cap (default: 60s)
+# Reconnect uses exponential backoff: initial * 2^(attempt-1), capped at max
+# Set initial = max for fixed delay (e.g., both = 60000 for 1-minute fixed delay)
+
+# Module config request throttling
+MESHTASTIC_MODULE_CONFIG_DELAY_MS=100       # Delay between config requests (default: 100ms)
+# Increase to 250-1000ms if device shows queue overflow during config loading
 ```
 
 **Why Needed**:
@@ -181,6 +192,8 @@ MESHTASTIC_STALE_CONNECTION_TIMEOUT=0       # Disable (not recommended)
 - Manual reconnect fixes the issue
 
 **Related**: Issue #492 - Serial-connected device stops responding after idle
+**Related**: Issue #2213 - Configurable TCP connect/reconnect timing
+**Related**: Issue #2214 - Configurable module config request delay
 
 ---
 
@@ -342,7 +355,7 @@ async function sendWithRetry(operation: Operation) {
 **Structure**:
 ```json
 {
-  "version": "2.0",
+  "backupVersion": "1.0",
   "meshmonitorVersion": "2.13.0",
   "timestamp": "2025-01-15T10:30:00Z",
   "schemaVersion": 12,
@@ -397,7 +410,7 @@ async function sendWithRetry(operation: Operation) {
 - Fast iteration cycles
 - Protocol validation
 
-**Location**: `src/services/virtualNode.ts`, `tests/test-virtual-node-cli.sh`
+**Location**: `src/server/virtualNodeServer.ts`, `tests/test-virtual-node-cli.sh`
 
 ### Integration Testing is Critical
 
@@ -647,6 +660,79 @@ async updateNodeAsync(nodeNum: number, data: Partial<DbNode>): Promise<void> {
 - Validate data integrity with row counts
 - Provide verbose logging for troubleshooting
 
+### Migration Registry System
+
+**Problem**: The old migration system required adding migration calls in 3 separate places in `database.ts` (SQLite init, Postgres init, MySQL init), which was error-prone and hard to maintain.
+
+**Solution**: Centralized `MigrationRegistry` in `src/db/migrations.ts`. Each migration is registered once with functions for all three backends.
+
+**Architecture**:
+```
+src/db/
+  migrations.ts          # Registry barrel - imports and registers all migrations
+  migrationRegistry.ts   # MigrationRegistry class (runner logic)
+src/server/migrations/
+  001_v37_baseline.ts    # v3.7 baseline (selfIdempotent)
+  002_*.ts - 013_*.ts    # Incremental migrations
+```
+
+**Pattern for new migrations** (e.g., migration 014):
+```typescript
+// src/server/migrations/014_description.ts
+import type { Database } from 'better-sqlite3';
+import { logger } from '../../utils/logger.js';
+
+// SQLite
+export const migration = {
+  up: (db: Database): void => {
+    try {
+      db.exec('ALTER TABLE foo ADD COLUMN bar TEXT');
+    } catch (e: any) {
+      if (e.message?.includes('duplicate column')) {
+        logger.debug('foo.bar already exists, skipping');
+      } else { throw e; }
+    }
+  },
+  down: (_db: Database): void => {}
+};
+
+// PostgreSQL
+export async function runMigration014Postgres(client: import('pg').PoolClient): Promise<void> {
+  await client.query('ALTER TABLE foo ADD COLUMN IF NOT EXISTS bar TEXT');
+}
+
+// MySQL
+export async function runMigration014Mysql(pool: import('mysql2/promise').Pool): Promise<void> {
+  const [rows] = await pool.query(`
+    SELECT COLUMN_NAME FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'foo' AND COLUMN_NAME = 'bar'
+  `);
+  if (!Array.isArray(rows) || rows.length === 0) {
+    await pool.query('ALTER TABLE foo ADD COLUMN bar TEXT');
+  }
+}
+```
+
+Then register in `src/db/migrations.ts`:
+```typescript
+import { migration as descriptionMigration, runMigration014Postgres, runMigration014Mysql } from '../server/migrations/014_description.js';
+
+registry.register({
+  number: 14,
+  name: 'description',
+  settingsKey: 'migration_014_description',
+  sqlite: (db) => descriptionMigration.up(db),
+  postgres: (client) => runMigration014Postgres(client),
+  mysql: (pool) => runMigration014Mysql(pool),
+});
+```
+
+**Key Rules**:
+- Migration 001 is `selfIdempotent` (detects existing v3.7+ databases). All others use `settingsKey` for tracking.
+- Migrations MUST be idempotent: SQLite uses try/catch (`duplicate column`), PostgreSQL uses `IF NOT EXISTS`, MySQL uses `information_schema` checks.
+- Column naming: SQLite uses `snake_case`, PostgreSQL/MySQL use `camelCase` (quoted `"camelCase"` in raw PG SQL).
+- Update `src/db/migrations.test.ts` when adding migrations (count, last migration assertions).
+
 ### Test Mocking for Multi-Database
 
 **Problem**: Tests that mock DatabaseService fail when auth middleware calls async methods.
@@ -720,5 +806,58 @@ beforeEach(() => {
 
 ---
 
-**Last Updated**: 2026-01-12
-**Related PRs**: #427, #429, #430, #431, #432, #433, #1359 (packet filtering), #1360 (protocol constants), #1404 (PostgreSQL support), #1405 (MySQL support), #1436 (async test fixes)
+## Key Management & PKI
+
+### Key Authority Model
+
+**Problem**: A node's public key can come from two sources: the connected device's local database (device sync) and mesh-received NodeInfo packets. These can disagree after a remote node regenerates its key.
+
+**Rule**: Mesh-received keys are authoritative. Device-synced keys may be stale.
+
+**Implementation** (PR #2243):
+- `lastMeshReceivedKey` field tracks keys received via mesh NodeInfo
+- `keyMismatchDetected` flag marks nodes where device key ≠ mesh key
+- Mismatch detection in `processNodeInfoMessageProtobuf`
+- Resolution in device DB sync when device picks up the new key
+
+### Key Repair Channel Routing
+
+**Problem**: When keys are mismatched, PKI-encrypted DMs fail because they use the wrong (old) key.
+
+**Solution**: Send key repair NodeInfo exchanges on the node's **channel** (shared PSK), not as DMs.
+
+```typescript
+// ✅ DO: Use the node's channel for key repair
+const nodeData = databaseService.getNode(nodeNum);
+await this.sendNodeInfoRequest(nodeNum, nodeData?.channel ?? 0);
+
+// ❌ DON'T: Hardcode channel 0 (DM with PKI encryption)
+await this.sendNodeInfoRequest(nodeNum, 0);
+```
+
+**Location**: `src/server/meshtasticManager.ts` — `processKeyRepairs()` and immediate purge path
+
+### PKI Error Detection
+
+**Problem**: PKI routing errors (`PKI_UNKNOWN_PUBKEY`, `PKI_SEND_FAIL_PUBLIC_KEY`, `PKI_FAILED`) should always flag `keyMismatchDetected` on the target node.
+
+**Rule**: Never suppress PKI error detection based on device DB state. All three PKI errors must trigger key mismatch detection regardless of whether the target node is in the radio's local database. The mismatch flag clears naturally when keys are re-synced (via NodeInfo exchange or device sync).
+
+**Anti-pattern**: Don't gate PKI error handling on `isNodeInDeviceDb()` — the radio not having the node is exactly the scenario where `PKI_UNKNOWN_PUBKEY` fires.
+
+**Location**: `src/server/meshtasticManager.ts` — `processRoutingErrorMessage()`, both Path A (request packets) and Path B (message-tracked packets).
+
+**Helper**: `isPkiError(errorReason)` in `src/server/constants/meshtastic.ts` classifies all three PKI error codes.
+
+### Settings Allowlist
+
+**Problem**: New settings silently fail to save if not added to the allowlist.
+
+**Rule**: When adding any new setting key that gets saved via `POST /api/settings`, add it to `VALID_SETTINGS_KEYS` in `src/server/constants/settings.ts`.
+
+**Location**: `src/server/constants/settings.ts`
+
+---
+
+**Last Updated**: 2026-03-22
+**Related PRs**: #427, #429, #430, #431, #432, #433, #1359 (packet filtering), #1360 (protocol constants), #1404 (PostgreSQL support), #1405 (MySQL support), #1436 (async test fixes), #2243 (key mismatch detection), #2246 (neighbor info zoom setting), #2365 (key mismatch clearing), #2382 (PKI error detection)

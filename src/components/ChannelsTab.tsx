@@ -7,6 +7,7 @@
 
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import '../styles/messages.css';
 import { Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
 import { ResourceType } from '../types/permission';
@@ -102,6 +103,8 @@ export interface ChannelsTabProps {
   handleSendTapback: (emoji: string, message: MeshMessage) => void;
   handlePurgeChannelMessages: (channelId: number) => Promise<void>;
   handleSenderClick: (nodeId: string, event: React.MouseEvent) => void;
+  onSendBell?: (channel: number, text: string) => Promise<void>;
+  onSendPosition?: (channel: number) => Promise<void>;
 
   // Helper functions
   shouldShowData: () => boolean;
@@ -152,6 +155,8 @@ export default function ChannelsTab({
   handleSendTapback,
   handlePurgeChannelMessages,
   handleSenderClick,
+  onSendBell,
+  onSendPosition,
   shouldShowData,
   getNodeName,
   getNodeShortName,
@@ -342,8 +347,15 @@ export default function ChannelsTab({
           return false;
         }
 
-        // Check if user has permission to read this channel
-        if (!hasPermission(`channel_${ch}` as ResourceType, 'read')) {
+        // Check permissions: Channel Database channels (>= 100) use channel database permissions,
+        // device channels (0-7) use standard channel permissions
+        if (ch >= CHANNEL_DB_OFFSET) {
+          // Channel Database channels are accessible if the entry exists in channelDatabaseEntries
+          const channelDbId = ch - CHANNEL_DB_OFFSET;
+          if (!channelDatabaseEntries.some(entry => entry.id === channelDbId)) {
+            return false;
+          }
+        } else if (!hasPermission(`channel_${ch}` as ResourceType, 'read')) {
           return false;
         }
 
@@ -415,6 +427,7 @@ export default function ChannelsTab({
                   setSelectedChannel(channelId);
                   selectedChannelRef.current = channelId;
                   setReplyingTo(null);
+                  markMessagesAsRead(undefined, channelId);
                   setUnreadCounts(prev => {
                     const updated = { ...prev, [channelId]: 0 };
                     logger.debug('📝 Setting unread counts:', updated);
@@ -458,6 +471,7 @@ export default function ChannelsTab({
                       setSelectedChannel(channelId);
                       selectedChannelRef.current = channelId;
                       setReplyingTo(null);
+                      markMessagesAsRead(undefined, channelId);
                       setUnreadCounts(prev => {
                         const updated = { ...prev, [channelId]: 0 };
                         logger.debug('📝 Setting unread counts:', updated);
@@ -739,6 +753,7 @@ export default function ChannelsTab({
                                             className="resend-button"
                                             onClick={() => handleResendMessage(msg)}
                                             title={t('channels.resend_button_title')}
+                                            aria-label={t('channels.resend_button_title')}
                                           >
                                             ↻
                                           </button>
@@ -750,6 +765,7 @@ export default function ChannelsTab({
                                               channelMessageInputRef.current?.focus();
                                             }}
                                             title={t('channels.reply_button_title')}
+                                            aria-label={t('channels.reply_button_title')}
                                           >
                                             ↩
                                           </button>
@@ -761,6 +777,7 @@ export default function ChannelsTab({
                                           className="emoji-picker-button"
                                           onClick={() => setEmojiPickerMessage(msg)}
                                           title={t('channels.emoji_button_title')}
+                                          aria-label={t('channels.emoji_button_title')}
                                         >
                                           😄
                                         </button>
@@ -769,6 +786,7 @@ export default function ChannelsTab({
                                         className="delete-button"
                                         onClick={() => handleDeleteMessage(msg)}
                                         title={t('channels.delete_button_title')}
+                                        aria-label={t('channels.delete_button_title')}
                                       >
                                         🗑️
                                       </button>
@@ -835,6 +853,7 @@ export default function ChannelsTab({
                             className="reply-indicator-close"
                             onClick={() => setReplyingTo(null)}
                             title={t('channels.cancel_reply_title')}
+                            aria-label={t('channels.cancel_reply_title')}
                           >
                             ×
                           </button>
@@ -868,6 +887,22 @@ export default function ChannelsTab({
                               {byteCountDisplay.text}
                             </div>
                           </div>
+                          <button
+                            onClick={() => { onSendBell?.(selectedChannel, newMessage); setNewMessage(''); }}
+                            className="send-btn channel-action-btn"
+                            title="Send alert bell"
+                            aria-label="Send alert bell"
+                          >
+                            🔔
+                          </button>
+                          <button
+                            onClick={() => onSendPosition?.(selectedChannel)}
+                            className="send-btn channel-action-btn"
+                            title="Send position"
+                            aria-label="Send position"
+                          >
+                            📍
+                          </button>
                           <button
                             onClick={() => handleSendMessage(selectedChannel)}
                             disabled={!newMessage.trim()}
@@ -909,7 +944,7 @@ export default function ChannelsTab({
               <div className="modal-content channel-info-modal" onClick={e => e.stopPropagation()}>
                 <div className="modal-header">
                   <h2>{t('channels.info_modal_title')}</h2>
-                  <button className="modal-close" onClick={handleCloseModal}>
+                  <button className="modal-close" onClick={handleCloseModal} aria-label={t('common.close')}>
                     ×
                   </button>
                 </div>
@@ -1067,7 +1102,7 @@ export default function ChannelsTab({
           <div className="modal-content channel-info-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <h2>{t('channels.virtual_channel_info_title', 'Virtual Channel Info')}</h2>
-              <button className="modal-close" onClick={() => setVirtualChannelInfoModal(null)}>
+              <button className="modal-close" onClick={() => setVirtualChannelInfoModal(null)} aria-label={t('common.close')}>
                 ×
               </button>
             </div>

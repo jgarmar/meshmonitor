@@ -3,6 +3,7 @@ import { type TemperatureUnit } from '../utils/temperature';
 import { type SortField, type SortDirection } from '../types/ui';
 import { type SortOption as DashboardSortOption } from '../components/Dashboard/types';
 import { logger } from '../utils/logger';
+import { OPTIONAL_THEME_COLORS } from '../utils/themeValidation';
 import { useCsrf } from './CsrfContext';
 import { DEFAULT_TILESET_ID, type TilesetId, type CustomTileset } from '../config/tilesets';
 import { type OverlayScheme, getSchemeForTileset, getOverlayColors, type OverlayColors } from '../config/overlayColors';
@@ -14,6 +15,7 @@ export type PositionHistoryLineStyle = 'linear' | 'spline';
 export type TimeFormat = '12' | '24';
 export type DateFormat = 'MM/DD/YYYY' | 'DD/MM/YYYY' | 'YYYY-MM-DD';
 export type MapPinStyle = 'meshmonitor' | 'official';
+export type IconStyle = 'lucide' | 'emoji';
 export type NodeHopsCalculation = 'nodeinfo' | 'traceroute' | 'messages';
 
 // Built-in theme types
@@ -60,6 +62,11 @@ interface SettingsContextType {
   overlayScheme: OverlayScheme;
   overlayColors: OverlayColors;
   mapPinStyle: MapPinStyle;
+  iconStyle: IconStyle;
+  neighborInfoMinZoom: number;
+  defaultMapCenterLat: number | null;
+  defaultMapCenterLon: number | null;
+  defaultMapCenterZoom: number | null;
   theme: Theme;
   language: string;
   customThemes: CustomTheme[];
@@ -96,6 +103,11 @@ interface SettingsContextType {
   setDateFormat: (format: DateFormat) => void;
   setMapTileset: (tilesetId: TilesetId) => void;
   setMapPinStyle: (style: MapPinStyle) => void;
+  setIconStyle: (style: IconStyle) => void;
+  setNeighborInfoMinZoom: (zoom: number) => void;
+  setDefaultMapCenterLat: (lat: number | null) => void;
+  setDefaultMapCenterLon: (lon: number | null) => void;
+  setDefaultMapCenterZoom: (zoom: number | null) => void;
   setTheme: (theme: Theme) => void;
   setLanguage: (language: string) => void;
   loadCustomThemes: () => Promise<void>;
@@ -218,6 +230,29 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
   const [mapPinStyle, setMapPinStyleState] = useState<MapPinStyle>(() => {
     const saved = localStorage.getItem('mapPinStyle');
     return (saved === 'official' ? 'official' : 'meshmonitor') as MapPinStyle;
+  });
+
+  const [iconStyle, setIconStyleState] = useState<IconStyle>(() => {
+    const saved = localStorage.getItem('iconStyle');
+    return (saved === 'emoji' ? 'emoji' : 'lucide') as IconStyle;
+  });
+
+  const [neighborInfoMinZoom, setNeighborInfoMinZoomState] = useState<number>(() => {
+    const saved = localStorage.getItem('neighborInfoMinZoom');
+    return saved ? parseInt(saved, 10) : 12;
+  });
+
+  const [defaultMapCenterLat, setDefaultMapCenterLatState] = useState<number | null>(() => {
+    const saved = localStorage.getItem('defaultMapCenterLat');
+    return saved ? parseFloat(saved) : null;
+  });
+  const [defaultMapCenterLon, setDefaultMapCenterLonState] = useState<number | null>(() => {
+    const saved = localStorage.getItem('defaultMapCenterLon');
+    return saved ? parseFloat(saved) : null;
+  });
+  const [defaultMapCenterZoom, setDefaultMapCenterZoomState] = useState<number | null>(() => {
+    const saved = localStorage.getItem('defaultMapCenterZoom');
+    return saved ? parseInt(saved, 10) : null;
   });
 
   const [theme, setThemeState] = useState<Theme>(() => {
@@ -426,6 +461,41 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     localStorage.setItem('mapPinStyle', style);
   };
 
+  const setIconStyle = (style: IconStyle) => {
+    setIconStyleState(style);
+    localStorage.setItem('iconStyle', style);
+  };
+
+  const setNeighborInfoMinZoom = (zoom: number) => {
+    setNeighborInfoMinZoomState(zoom);
+    localStorage.setItem('neighborInfoMinZoom', String(zoom));
+  };
+
+  const setDefaultMapCenterLat = (lat: number | null) => {
+    setDefaultMapCenterLatState(lat);
+    if (lat !== null) {
+      localStorage.setItem('defaultMapCenterLat', String(lat));
+    } else {
+      localStorage.removeItem('defaultMapCenterLat');
+    }
+  };
+  const setDefaultMapCenterLon = (lon: number | null) => {
+    setDefaultMapCenterLonState(lon);
+    if (lon !== null) {
+      localStorage.setItem('defaultMapCenterLon', String(lon));
+    } else {
+      localStorage.removeItem('defaultMapCenterLon');
+    }
+  };
+  const setDefaultMapCenterZoom = (zoom: number | null) => {
+    setDefaultMapCenterZoomState(zoom);
+    if (zoom !== null) {
+      localStorage.setItem('defaultMapCenterZoom', String(zoom));
+    } else {
+      localStorage.removeItem('defaultMapCenterZoom');
+    }
+  };
+
   /**
    * Load custom themes from the API
    */
@@ -479,6 +549,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
       const root = document.documentElement;
       logger.debug(`🎯 Applying ${Object.keys(definition).length} CSS variables to root element`);
 
+      // Clear optional chat bubble vars so stale values from a previous custom theme don't persist
+      for (const optColor of OPTIONAL_THEME_COLORS) {
+        root.style.removeProperty(`--ctp-${optColor}`);
+      }
+
       // Apply each color variable to the root element with ctp- prefix
       Object.entries(definition).forEach(([key, value]) => {
         const cssVarName = `--ctp-${key}`;
@@ -520,6 +595,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     if (isBuiltIn) {
       // Built-in theme: use data-theme attribute
       document.documentElement.setAttribute('data-theme', newTheme);
+      // Remove optional chat bubble vars from any previous custom theme
+      for (const optColor of OPTIONAL_THEME_COLORS) {
+        document.documentElement.style.removeProperty(`--ctp-${optColor}`);
+      }
       logger.debug(`✅ Applied built-in theme: ${newTheme}`);
     } else {
       // Custom theme: apply CSS variables dynamically
@@ -852,6 +931,50 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
             localStorage.setItem('mapPinStyle', settings.mapPinStyle);
           }
 
+          if (settings.iconStyle) {
+            setIconStyleState(settings.iconStyle as IconStyle);
+            localStorage.setItem('iconStyle', settings.iconStyle);
+          }
+
+          if (settings.neighborInfoMinZoom !== undefined) {
+            const zoom = parseInt(settings.neighborInfoMinZoom, 10);
+            if (!isNaN(zoom)) {
+              setNeighborInfoMinZoomState(zoom);
+              localStorage.setItem('neighborInfoMinZoom', String(zoom));
+            }
+          }
+
+          if (settings.defaultMapCenterLat !== undefined) {
+            const lat = parseFloat(settings.defaultMapCenterLat);
+            if (!isNaN(lat) && lat >= -90 && lat <= 90) {
+              setDefaultMapCenterLatState(lat);
+              localStorage.setItem('defaultMapCenterLat', String(lat));
+            } else {
+              setDefaultMapCenterLatState(null);
+              localStorage.removeItem('defaultMapCenterLat');
+            }
+          }
+          if (settings.defaultMapCenterLon !== undefined) {
+            const lon = parseFloat(settings.defaultMapCenterLon);
+            if (!isNaN(lon) && lon >= -180 && lon <= 180) {
+              setDefaultMapCenterLonState(lon);
+              localStorage.setItem('defaultMapCenterLon', String(lon));
+            } else {
+              setDefaultMapCenterLonState(null);
+              localStorage.removeItem('defaultMapCenterLon');
+            }
+          }
+          if (settings.defaultMapCenterZoom !== undefined) {
+            const zoom = parseInt(settings.defaultMapCenterZoom, 10);
+            if (!isNaN(zoom) && zoom >= 1 && zoom <= 18) {
+              setDefaultMapCenterZoomState(zoom);
+              localStorage.setItem('defaultMapCenterZoom', String(zoom));
+            } else {
+              setDefaultMapCenterZoomState(null);
+              localStorage.removeItem('defaultMapCenterZoom');
+            }
+          }
+
           if (settings.theme) {
             // Accept any theme (built-in or custom)
             setThemeState(settings.theme as Theme);
@@ -1042,6 +1165,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     overlayScheme,
     overlayColors,
     mapPinStyle,
+    iconStyle,
+    neighborInfoMinZoom,
+    defaultMapCenterLat,
+    defaultMapCenterLon,
+    defaultMapCenterZoom,
     theme,
     language,
     customThemes,
@@ -1078,6 +1206,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
     setDateFormat,
     setMapTileset,
     setMapPinStyle,
+    setIconStyle,
+    setNeighborInfoMinZoom,
+    setDefaultMapCenterLat,
+    setDefaultMapCenterLon,
+    setDefaultMapCenterZoom,
     setTheme,
     setLanguage,
     loadCustomThemes,
@@ -1110,4 +1243,69 @@ export const useSettings = (): SettingsContextType => {
     throw new Error('useSettings must be used within a SettingsProvider');
   }
   return context;
+};
+
+// Domain-specific hooks for cleaner imports and focused APIs
+
+export const useDisplaySettings = () => {
+  const s = useSettings();
+  return {
+    temperatureUnit: s.temperatureUnit, setTemperatureUnit: s.setTemperatureUnit,
+    distanceUnit: s.distanceUnit, setDistanceUnit: s.setDistanceUnit,
+    timeFormat: s.timeFormat, setTimeFormat: s.setTimeFormat,
+    dateFormat: s.dateFormat, setDateFormat: s.setDateFormat,
+    language: s.language, setLanguage: s.setLanguage,
+    theme: s.theme, setTheme: s.setTheme,
+    customThemes: s.customThemes, isLoadingThemes: s.isLoadingThemes, loadCustomThemes: s.loadCustomThemes,
+  };
+};
+
+export const useMapSettings = () => {
+  const s = useSettings();
+  return {
+    mapTileset: s.mapTileset, setMapTileset: s.setMapTileset,
+    mapPinStyle: s.mapPinStyle, setMapPinStyle: s.setMapPinStyle,
+    iconStyle: s.iconStyle, setIconStyle: s.setIconStyle,
+    neighborInfoMinZoom: s.neighborInfoMinZoom, setNeighborInfoMinZoom: s.setNeighborInfoMinZoom,
+    overlayScheme: s.overlayScheme, overlayColors: s.overlayColors,
+    customTilesets: s.customTilesets,
+    addCustomTileset: s.addCustomTileset, updateCustomTileset: s.updateCustomTileset, deleteCustomTileset: s.deleteCustomTileset,
+    positionHistoryLineStyle: s.positionHistoryLineStyle, setPositionHistoryLineStyle: s.setPositionHistoryLineStyle,
+    temporaryTileset: s.temporaryTileset, setTemporaryTileset: s.setTemporaryTileset,
+  };
+};
+
+export const useNodeSettings = () => {
+  const s = useSettings();
+  return {
+    maxNodeAgeHours: s.maxNodeAgeHours, setMaxNodeAgeHours: s.setMaxNodeAgeHours,
+    inactiveNodeThresholdHours: s.inactiveNodeThresholdHours, setInactiveNodeThresholdHours: s.setInactiveNodeThresholdHours,
+    inactiveNodeCheckIntervalMinutes: s.inactiveNodeCheckIntervalMinutes, setInactiveNodeCheckIntervalMinutes: s.setInactiveNodeCheckIntervalMinutes,
+    inactiveNodeCooldownHours: s.inactiveNodeCooldownHours, setInactiveNodeCooldownHours: s.setInactiveNodeCooldownHours,
+    preferredSortField: s.preferredSortField, setPreferredSortField: s.setPreferredSortField,
+    preferredSortDirection: s.preferredSortDirection, setPreferredSortDirection: s.setPreferredSortDirection,
+    nodeDimmingEnabled: s.nodeDimmingEnabled, setNodeDimmingEnabled: s.setNodeDimmingEnabled,
+    nodeDimmingStartHours: s.nodeDimmingStartHours, setNodeDimmingStartHours: s.setNodeDimmingStartHours,
+    nodeDimmingMinOpacity: s.nodeDimmingMinOpacity, setNodeDimmingMinOpacity: s.setNodeDimmingMinOpacity,
+    nodeHopsCalculation: s.nodeHopsCalculation, setNodeHopsCalculation: s.setNodeHopsCalculation,
+  };
+};
+
+export const useTelemetrySettings = () => {
+  const s = useSettings();
+  return {
+    telemetryVisualizationHours: s.telemetryVisualizationHours, setTelemetryVisualizationHours: s.setTelemetryVisualizationHours,
+    favoriteTelemetryStorageDays: s.favoriteTelemetryStorageDays, setFavoriteTelemetryStorageDays: s.setFavoriteTelemetryStorageDays,
+  };
+};
+
+export const useSolarSettings = () => {
+  const s = useSettings();
+  return {
+    solarMonitoringEnabled: s.solarMonitoringEnabled, setSolarMonitoringEnabled: s.setSolarMonitoringEnabled,
+    solarMonitoringLatitude: s.solarMonitoringLatitude, setSolarMonitoringLatitude: s.setSolarMonitoringLatitude,
+    solarMonitoringLongitude: s.solarMonitoringLongitude, setSolarMonitoringLongitude: s.setSolarMonitoringLongitude,
+    solarMonitoringAzimuth: s.solarMonitoringAzimuth, setSolarMonitoringAzimuth: s.setSolarMonitoringAzimuth,
+    solarMonitoringDeclination: s.solarMonitoringDeclination, setSolarMonitoringDeclination: s.setSolarMonitoringDeclination,
+  };
 };

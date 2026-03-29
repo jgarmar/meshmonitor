@@ -4,11 +4,13 @@
  * Provides common functionality for all repository implementations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
+import { sql } from 'drizzle-orm';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { MySql2Database } from 'drizzle-orm/mysql2';
 import * as schema from '../schema/index.js';
 import { DatabaseType } from '../types.js';
+import { buildActiveSchema, ActiveSchema } from '../activeSchema.js';
 
 // Specific database types for type narrowing
 export type SQLiteDrizzle = BetterSQLite3Database<typeof schema>;
@@ -24,13 +26,30 @@ export type DrizzleDatabase = SQLiteDrizzle | PostgresDrizzle | MySQLDrizzle;
 export abstract class BaseRepository {
   protected readonly dbType: DatabaseType;
 
-  // Store the specific typed databases
+  /**
+   * Unified database accessor — use with `this.tables` for dialect-agnostic queries:
+   *   this.db.select().from(this.tables.nodes).where(...)
+   *
+   * For raw SQL or dialect-specific features, use the typed accessors instead:
+   *   this.getSqliteDb(), this.getPostgresDb(), this.getMysqlDb()
+   */
+  protected readonly db: any; // eslint-disable-line @typescript-eslint/no-explicit-any -- Union type can't resolve method overloads; runtime behavior is identical across dialects
+
+  /**
+   * Runtime table map resolving the active dialect's Drizzle table objects.
+   * Keys match the export name prefix (e.g., `nodes`, `packetLog`, `neighborInfo`).
+   */
+  protected readonly tables: ActiveSchema;
+
+  // Store the specific typed databases (kept for raw SQL escape hatches)
   protected readonly sqliteDb: SQLiteDrizzle | null;
   protected readonly postgresDb: PostgresDrizzle | null;
   protected readonly mysqlDb: MySQLDrizzle | null;
 
   constructor(db: DrizzleDatabase, dbType: DatabaseType) {
     this.dbType = dbType;
+    this.db = db;
+    this.tables = buildActiveSchema(dbType);
 
     // Type narrow at construction time
     if (dbType === 'sqlite') {
@@ -97,6 +116,104 @@ export abstract class BaseRepository {
       throw new Error('Cannot access MySQL database when using SQLite or PostgreSQL');
     }
     return this.mysqlDb;
+  }
+
+  /**
+   * Quote a column name for use in raw SQL.
+   * PostgreSQL requires double-quoted "camelCase" identifiers; SQLite/MySQL do not.
+   * Returns a raw SQL fragment that can be interpolated into sql`` templates.
+   */
+  protected col(name: string) {
+    return this.isPostgres() ? sql.raw(`"${name}"`) : sql.raw(name);
+  }
+
+  /**
+   * Execute a raw SQL query that returns rows (SELECT) across all dialects.
+   * SQLite's Drizzle driver doesn't have .execute() — uses .all() instead.
+   */
+  protected async executeQuery(query: any): Promise<any[]> {
+    if (this.isSQLite()) {
+      return this.db.all(query);
+    }
+    const result = await this.db.execute(query);
+    // MySQL returns [rows, fields]; PostgreSQL returns { rows }
+    if (this.isMySQL()) {
+      return (result as any)[0];
+    }
+    return result.rows ?? result;
+  }
+
+  /**
+   * Execute a raw SQL mutation (INSERT/UPDATE/DELETE) across all dialects.
+   * SQLite's Drizzle driver doesn't have .execute() — uses .run() instead.
+   * Returns the raw driver result for callers that need affected-row counts.
+   */
+  protected async executeRun(query: any): Promise<any> {
+    if (this.isSQLite()) {
+      return this.db.run(query);
+    }
+    return this.db.execute(query);
+  }
+
+  /**
+   * Extract affected row count from a mutation result.
+   * Normalizes across SQLite (.changes), PostgreSQL (.rowCount), and MySQL ([0].affectedRows).
+   */
+  protected getAffectedRows(result: any): number {
+    if (this.isSQLite()) {
+      return Number(result?.changes ?? 0);
+    }
+    if (this.isMySQL()) {
+      // MySQL execute() returns [ResultSetHeader, FieldPacket[]]
+      return Number((result as any)?.[0]?.affectedRows ?? 0);
+    }
+    // PostgreSQL
+    return Number((result as any)?.rowCount ?? 0);
+  }
+
+  /**
+   * Insert with upsert (ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE).
+   * Normalizes across SQLite/PostgreSQL (onConflictDoUpdate) and MySQL (onDuplicateKeyUpdate).
+   *
+   * @param table - Drizzle table from this.tables
+   * @param values - Row values to insert
+   * @param target - Conflict target column (for SQLite/PG onConflictDoUpdate)
+   * @param updateSet - Columns to update on conflict
+   */
+  protected async upsert(table: any, values: any, target: any, updateSet: any): Promise<any> {
+    if (this.isMySQL()) {
+      return this.getMysqlDb()
+        .insert(table)
+        .values(values)
+        .onDuplicateKeyUpdate({ set: updateSet });
+    }
+    return (this.db as any)
+      .insert(table)
+      .values(values)
+      .onConflictDoUpdate({ target, set: updateSet });
+  }
+
+  /**
+   * Insert and ignore duplicates (ON CONFLICT DO NOTHING).
+   * Normalizes across SQLite/PostgreSQL (onConflictDoNothing) and MySQL (try/catch).
+   *
+   * @param table - Drizzle table from this.tables
+   * @param values - Row values to insert
+   * @returns The raw insert result
+   */
+  protected async insertIgnore(table: any, values: any): Promise<any> {
+    if (this.isMySQL()) {
+      // MySQL lacks onConflictDoNothing — use try/catch to swallow duplicate key errors
+      try {
+        return await this.db.insert(table).values(values);
+      } catch {
+        return null;
+      }
+    }
+    return (this.db as any)
+      .insert(table)
+      .values(values)
+      .onConflictDoNothing();
   }
 
   /**

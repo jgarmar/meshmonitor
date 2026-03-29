@@ -4,8 +4,7 @@
  * Handles all channel-related database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, and, gt, isNull, or, lt } from 'drizzle-orm';
-import { channelsSqlite, channelsPostgres, channelsMysql } from '../schema/channels.js';
+import { eq, and, gt, isNull, or, lt, count } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType, DbChannel } from '../types.js';
 import { logger } from '../../utils/logger.js';
@@ -35,108 +34,42 @@ export class ChannelsRepository extends BaseRepository {
    * Get a channel by ID
    */
   async getChannelById(id: number): Promise<DbChannel | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(channelsSqlite)
-        .where(eq(channelsSqlite.id, id))
-        .limit(1);
+    const { channels } = this.tables;
+    const result = await this.db
+      .select()
+      .from(channels)
+      .where(eq(channels.id, id))
+      .limit(1);
 
-      if (result.length === 0) return null;
+    if (result.length === 0) return null;
 
-      const channel = result[0];
-      if (id === 0) {
-        logger.info(`getChannelById(0) - RAW from DB: ${channel ? `name="${channel.name}" (length: ${channel.name?.length || 0})` : 'null'}`);
-      }
-      return this.normalizeBigInts(channel) as DbChannel;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(channelsMysql)
-        .where(eq(channelsMysql.id, id))
-        .limit(1);
-
-      if (result.length === 0) return null;
-
-      const channel = result[0];
-      if (id === 0) {
-        logger.info(`getChannelById(0) - RAW from DB: ${channel ? `name="${channel.name}" (length: ${channel.name?.length || 0})` : 'null'}`);
-      }
-      return channel as DbChannel;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(channelsPostgres)
-        .where(eq(channelsPostgres.id, id))
-        .limit(1);
-
-      if (result.length === 0) return null;
-
-      const channel = result[0];
-      if (id === 0) {
-        logger.info(`getChannelById(0) - RAW from DB: ${channel ? `name="${channel.name}" (length: ${channel.name?.length || 0})` : 'null'}`);
-      }
-      return channel as DbChannel;
+    const channel = result[0];
+    if (id === 0) {
+      logger.info(`getChannelById(0) - RAW from DB: ${channel ? `name="${channel.name}" (length: ${channel.name?.length || 0})` : 'null'}`);
     }
+    return this.normalizeBigInts(channel) as DbChannel;
   }
 
   /**
    * Get all channels ordered by ID
    */
   async getAllChannels(): Promise<DbChannel[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const channels = await db
-        .select()
-        .from(channelsSqlite)
-        .orderBy(channelsSqlite.id);
+    const { channels } = this.tables;
+    const result = await this.db
+      .select()
+      .from(channels)
+      .orderBy(channels.id);
 
-      return channels.map(c => this.normalizeBigInts(c) as DbChannel);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const channels = await db
-        .select()
-        .from(channelsMysql)
-        .orderBy(channelsMysql.id);
-
-      return channels as DbChannel[];
-    } else {
-      const db = this.getPostgresDb();
-      const channels = await db
-        .select()
-        .from(channelsPostgres)
-        .orderBy(channelsPostgres.id);
-
-      return channels as DbChannel[];
-    }
+    return this.normalizeBigInts(result) as DbChannel[];
   }
 
   /**
    * Get the total number of channels
    */
   async getChannelCount(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(channelsSqlite);
-      return result.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(channelsMysql);
-      return result.length;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(channelsPostgres);
-      return result.length;
-    }
+    const { channels } = this.tables;
+    const result = await this.db.select({ count: count() }).from(channels);
+    return Number(result[0].count);
   }
 
   /**
@@ -148,6 +81,7 @@ export class ChannelsRepository extends BaseRepository {
   async upsertChannel(channelData: ChannelInput): Promise<void> {
     const now = this.now();
     let data = { ...channelData };
+    const { channels } = this.tables;
 
     // Enforce role rules
     if (data.id === 0 && data.role === 0) {
@@ -174,95 +108,35 @@ export class ChannelsRepository extends BaseRepository {
       const effectiveName = data.name || existingChannel.name;
       logger.info(`Updating channel ${existingChannel.id}: name "${existingChannel.name}" -> "${effectiveName}" (incoming: "${data.name}")`);
 
-      if (this.isSQLite()) {
-        const db = this.getSqliteDb();
-        await db
-          .update(channelsSqlite)
-          .set({
-            name: effectiveName,
-            psk: data.psk ?? existingChannel.psk,
-            role: data.role ?? existingChannel.role,
-            uplinkEnabled: data.uplinkEnabled ?? existingChannel.uplinkEnabled,
-            downlinkEnabled: data.downlinkEnabled ?? existingChannel.downlinkEnabled,
-            positionPrecision: data.positionPrecision ?? existingChannel.positionPrecision,
-            updatedAt: now,
-          })
-          .where(eq(channelsSqlite.id, existingChannel.id));
-      } else if (this.isMySQL()) {
-        const db = this.getMysqlDb();
-        await db
-          .update(channelsMysql)
-          .set({
-            name: effectiveName,
-            psk: data.psk ?? existingChannel.psk,
-            role: data.role ?? existingChannel.role,
-            uplinkEnabled: data.uplinkEnabled ?? existingChannel.uplinkEnabled,
-            downlinkEnabled: data.downlinkEnabled ?? existingChannel.downlinkEnabled,
-            positionPrecision: data.positionPrecision ?? existingChannel.positionPrecision,
-            updatedAt: now,
-          })
-          .where(eq(channelsMysql.id, existingChannel.id));
-      } else {
-        const db = this.getPostgresDb();
-        await db
-          .update(channelsPostgres)
-          .set({
-            name: effectiveName,
-            psk: data.psk ?? existingChannel.psk,
-            role: data.role ?? existingChannel.role,
-            uplinkEnabled: data.uplinkEnabled ?? existingChannel.uplinkEnabled,
-            downlinkEnabled: data.downlinkEnabled ?? existingChannel.downlinkEnabled,
-            positionPrecision: data.positionPrecision ?? existingChannel.positionPrecision,
-            updatedAt: now,
-          })
-          .where(eq(channelsPostgres.id, existingChannel.id));
-      }
+      await this.db
+        .update(channels)
+        .set({
+          name: effectiveName,
+          psk: (data.psk !== undefined && data.psk !== '') ? data.psk : existingChannel.psk,
+          role: data.role ?? existingChannel.role,
+          uplinkEnabled: data.uplinkEnabled ?? existingChannel.uplinkEnabled,
+          downlinkEnabled: data.downlinkEnabled ?? existingChannel.downlinkEnabled,
+          positionPrecision: data.positionPrecision ?? existingChannel.positionPrecision,
+          updatedAt: now,
+        })
+        .where(eq(channels.id, existingChannel.id));
 
       logger.info(`Updated channel ${existingChannel.id}`);
     } else {
       // Create new channel
       logger.debug(`Creating new channel with ID: ${data.id}`);
 
-      if (this.isSQLite()) {
-        const db = this.getSqliteDb();
-        await db.insert(channelsSqlite).values({
-          id: data.id,
-          name: data.name,
-          psk: data.psk ?? null,
-          role: data.role ?? null,
-          uplinkEnabled: data.uplinkEnabled ?? true,
-          downlinkEnabled: data.downlinkEnabled ?? true,
-          positionPrecision: data.positionPrecision ?? null,
-          createdAt: now,
-          updatedAt: now,
-        });
-      } else if (this.isMySQL()) {
-        const db = this.getMysqlDb();
-        await db.insert(channelsMysql).values({
-          id: data.id,
-          name: data.name,
-          psk: data.psk ?? null,
-          role: data.role ?? null,
-          uplinkEnabled: data.uplinkEnabled ?? true,
-          downlinkEnabled: data.downlinkEnabled ?? true,
-          positionPrecision: data.positionPrecision ?? null,
-          createdAt: now,
-          updatedAt: now,
-        });
-      } else {
-        const db = this.getPostgresDb();
-        await db.insert(channelsPostgres).values({
-          id: data.id,
-          name: data.name,
-          psk: data.psk ?? null,
-          role: data.role ?? null,
-          uplinkEnabled: data.uplinkEnabled ?? true,
-          downlinkEnabled: data.downlinkEnabled ?? true,
-          positionPrecision: data.positionPrecision ?? null,
-          createdAt: now,
-          updatedAt: now,
-        });
-      }
+      await this.db.insert(channels).values({
+        id: data.id,
+        name: data.name,
+        psk: data.psk ?? null,
+        role: data.role ?? null,
+        uplinkEnabled: data.uplinkEnabled ?? true,
+        downlinkEnabled: data.downlinkEnabled ?? true,
+        positionPrecision: data.positionPrecision ?? null,
+        createdAt: now,
+        updatedAt: now,
+      });
 
       logger.debug(`Created channel: ${data.name} (ID: ${data.id})`);
     }
@@ -272,16 +146,8 @@ export class ChannelsRepository extends BaseRepository {
    * Delete a channel by ID
    */
   async deleteChannel(id: number): Promise<void> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db.delete(channelsSqlite).where(eq(channelsSqlite.id, id));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db.delete(channelsMysql).where(eq(channelsMysql.id, id));
-    } else {
-      const db = this.getPostgresDb();
-      await db.delete(channelsPostgres).where(eq(channelsPostgres.id, id));
-    }
+    const { channels } = this.tables;
+    await this.db.delete(channels).where(eq(channels.id, id));
   }
 
   /**
@@ -289,46 +155,15 @@ export class ChannelsRepository extends BaseRepository {
    * Meshtastic supports channels 0-7 (8 total channels)
    */
   async cleanupInvalidChannels(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: channelsSqlite.id })
-        .from(channelsSqlite)
-        .where(or(lt(channelsSqlite.id, 0), gt(channelsSqlite.id, 7)));
-
-      for (const channel of toDelete) {
-        await db.delete(channelsSqlite).where(eq(channelsSqlite.id, channel.id));
-      }
-
-      logger.debug(`Cleaned up ${toDelete.length} invalid channels (outside 0-7 range)`);
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: channelsMysql.id })
-        .from(channelsMysql)
-        .where(or(lt(channelsMysql.id, 0), gt(channelsMysql.id, 7)));
-
-      for (const channel of toDelete) {
-        await db.delete(channelsMysql).where(eq(channelsMysql.id, channel.id));
-      }
-
-      logger.debug(`Cleaned up ${toDelete.length} invalid channels (outside 0-7 range)`);
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: channelsPostgres.id })
-        .from(channelsPostgres)
-        .where(or(lt(channelsPostgres.id, 0), gt(channelsPostgres.id, 7)));
-
-      for (const channel of toDelete) {
-        await db.delete(channelsPostgres).where(eq(channelsPostgres.id, channel.id));
-      }
-
-      logger.debug(`Cleaned up ${toDelete.length} invalid channels (outside 0-7 range)`);
-      return toDelete.length;
+    const { channels } = this.tables;
+    const whereClause = or(lt(channels.id, 0), gt(channels.id, 7));
+    const result = await this.db.select({ count: count() }).from(channels).where(whereClause);
+    const deleteCount = Number(result[0].count);
+    if (deleteCount > 0) {
+      await this.db.delete(channels).where(whereClause);
     }
+    logger.debug(`Cleaned up ${deleteCount} invalid channels (outside 0-7 range)`);
+    return deleteCount;
   }
 
   /**
@@ -337,63 +172,18 @@ export class ChannelsRepository extends BaseRepository {
    * Remove higher ID channels that have no PSK (not configured)
    */
   async cleanupEmptyChannels(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: channelsSqlite.id })
-        .from(channelsSqlite)
-        .where(
-          and(
-            gt(channelsSqlite.id, 1),
-            isNull(channelsSqlite.psk),
-            isNull(channelsSqlite.role)
-          )
-        );
-
-      for (const channel of toDelete) {
-        await db.delete(channelsSqlite).where(eq(channelsSqlite.id, channel.id));
-      }
-
-      logger.debug(`Cleaned up ${toDelete.length} empty channels (ID > 1, no PSK/role)`);
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: channelsMysql.id })
-        .from(channelsMysql)
-        .where(
-          and(
-            gt(channelsMysql.id, 1),
-            isNull(channelsMysql.psk),
-            isNull(channelsMysql.role)
-          )
-        );
-
-      for (const channel of toDelete) {
-        await db.delete(channelsMysql).where(eq(channelsMysql.id, channel.id));
-      }
-
-      logger.debug(`Cleaned up ${toDelete.length} empty channels (ID > 1, no PSK/role)`);
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: channelsPostgres.id })
-        .from(channelsPostgres)
-        .where(
-          and(
-            gt(channelsPostgres.id, 1),
-            isNull(channelsPostgres.psk),
-            isNull(channelsPostgres.role)
-          )
-        );
-
-      for (const channel of toDelete) {
-        await db.delete(channelsPostgres).where(eq(channelsPostgres.id, channel.id));
-      }
-
-      logger.debug(`Cleaned up ${toDelete.length} empty channels (ID > 1, no PSK/role)`);
-      return toDelete.length;
+    const { channels } = this.tables;
+    const whereClause = and(
+      gt(channels.id, 1),
+      isNull(channels.psk),
+      isNull(channels.role)
+    );
+    const result = await this.db.select({ count: count() }).from(channels).where(whereClause);
+    const deleteCount = Number(result[0].count);
+    if (deleteCount > 0) {
+      await this.db.delete(channels).where(whereClause);
     }
+    logger.debug(`Cleaned up ${deleteCount} empty channels (ID > 1, no PSK/role)`);
+    return deleteCount;
   }
 }

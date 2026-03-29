@@ -53,6 +53,7 @@ export interface DbNode {
   firmwareVersion?: string | null;
   channel?: number | null;
   isFavorite?: boolean | null;
+  favoriteLocked?: boolean | null;
   isIgnored?: boolean | null;
   mobile?: number | null;
   rebootCount?: number | null;
@@ -62,6 +63,7 @@ export interface DbNode {
   keyIsLowEntropy?: boolean | null;
   duplicateKeyDetected?: boolean | null;
   keyMismatchDetected?: boolean | null;
+  lastMeshReceivedKey?: string | null;
   keySecurityIssueDetails?: string | null;
   welcomedAt?: number | null;
   positionChannel?: number | null;
@@ -74,6 +76,15 @@ export interface DbNode {
   longitudeOverride?: number | null;
   altitudeOverride?: number | null;
   positionOverrideIsPrivate?: boolean | null;
+  // Spam detection
+  isExcessivePackets?: boolean | null;
+  packetRatePerHour?: number | null;
+  packetRateLastChecked?: number | null;
+  // Time offset detection
+  isTimeOffsetIssue?: boolean | null;
+  timeOffsetSeconds?: number | null;
+  // Time sync
+  lastTimeSync?: number | null;
   // Remote admin discovery
   hasRemoteAdmin?: boolean | null;
   lastRemoteAdminCheck?: number | null;
@@ -239,6 +250,34 @@ export interface DbPacketLog {
   created_at?: number | null;
   decrypted_by?: 'node' | 'server' | null;
   decrypted_channel_id?: number | null;
+  transport_mechanism?: number | null;
+}
+
+/**
+ * Packet count grouped by node
+ */
+export interface DbPacketCountByNode {
+  from_node: number;
+  from_node_id: string | null;
+  from_node_longName: string | null;
+  count: number;
+}
+
+/**
+ * Distinct relay node with matching node info
+ */
+export interface DbDistinctRelayNode {
+  relay_node: number;
+  matching_nodes: Array<{ longName: string | null; shortName: string | null }>;
+}
+
+/**
+ * Packet count grouped by portnum
+ */
+export interface DbPacketCountByPortnum {
+  portnum: number;
+  portnum_name: string;
+  count: number;
 }
 
 /**

@@ -265,7 +265,7 @@ router.delete('/:id', async (req, res) => {
       }
     }
 
-    const deleted = await databaseService.deleteMessageAsync(messageId);
+    const deleted = await databaseService.messages.deleteMessage(messageId);
 
     if (!deleted) {
       return res.status(404).json({
@@ -323,7 +323,7 @@ router.delete('/channels/:channelId', requireChannelsWrite, async (req, res) => 
       });
     }
 
-    const deletedCount = await databaseService.purgeChannelMessagesAsync(channelId);
+    const deletedCount = await databaseService.messages.purgeChannelMessages(channelId);
 
     logger.info(`🗑️ User ${user?.username || 'anonymous'} purged ${deletedCount} messages from channel ${channelId}`);
 
@@ -375,7 +375,7 @@ router.delete('/direct-messages/:nodeNum', requireMessagesWrite, async (req, res
       });
     }
 
-    const deletedCount = await databaseService.purgeDirectMessagesAsync(nodeNum);
+    const deletedCount = await databaseService.messages.purgeDirectMessages(nodeNum);
 
     logger.info(`🗑️ User ${user?.username || 'anonymous'} purged ${deletedCount} direct messages with node ${nodeNum}`);
 
@@ -427,7 +427,7 @@ router.delete('/nodes/:nodeNum/traceroutes', requireMessagesWrite, async (req, r
       });
     }
 
-    const deletedCount = await databaseService.purgeNodeTraceroutesAsync(nodeNum);
+    const deletedCount = await databaseService.traceroutes.deleteTraceroutesForNode(nodeNum);
 
     logger.info(`🗑️ User ${user?.username || 'anonymous'} purged ${deletedCount} traceroutes for node ${nodeNum}`);
 
@@ -436,7 +436,7 @@ router.delete('/nodes/:nodeNum/traceroutes', requireMessagesWrite, async (req, r
       await databaseService.auditLogAsync(
         user.id,
         'node_traceroutes_purged',
-        'traceroutes',
+        'traceroute',
         `Purged ${deletedCount} traceroutes for node ${nodeNum}`,
         req.ip || ''
       );
@@ -479,7 +479,7 @@ router.delete('/nodes/:nodeNum/telemetry', requireMessagesWrite, async (req, res
       });
     }
 
-    const deletedCount = await databaseService.purgeNodeTelemetryAsync(nodeNum);
+    const deletedCount = await databaseService.telemetry.purgeNodeTelemetry(nodeNum);
 
     logger.info(`🗑️ User ${user?.username || 'anonymous'} purged ${deletedCount} telemetry records for node ${nodeNum}`);
 
@@ -516,6 +516,57 @@ router.delete('/nodes/:nodeNum/telemetry', requireMessagesWrite, async (req, res
 });
 
 /**
+ * DELETE /api/nodes/:nodeNum/position-history
+ * Purge position history for a specific node
+ */
+router.delete('/nodes/:nodeNum/position-history', requireMessagesWrite, async (req, res) => {
+  try {
+    const nodeNum = parseInt(req.params.nodeNum, 10);
+    const user = (req as any).user;
+
+    if (isNaN(nodeNum)) {
+      return res.status(400).json({
+        error: 'Bad request',
+        message: 'Invalid node number'
+      });
+    }
+
+    const deletedCount = await databaseService.telemetry.purgePositionHistory(nodeNum);
+
+    logger.info(`🗑️ User ${user?.username || 'anonymous'} purged ${deletedCount} position history records for node ${nodeNum}`);
+
+    // Log to audit log (async for multi-database support)
+    if (user?.id) {
+      await databaseService.auditLogAsync(
+        user.id,
+        'node_position_history_purged',
+        'telemetry',
+        `Purged ${deletedCount} position history records for node ${nodeNum}`,
+        req.ip || ''
+      );
+    }
+
+    res.json({
+      message: 'Node position history purged successfully',
+      nodeNum,
+      deletedCount
+    });
+  } catch (error: any) {
+    logger.error('❌ Error purging node position history:', error);
+
+    if (error?.message?.includes('FOREIGN KEY constraint failed')) {
+      logger.error('Foreign key constraint violation during position history purge');
+      return res.status(500).json({
+        error: 'Database constraint error',
+        message: 'Unable to purge position history due to database constraints. Please contact support.'
+      });
+    }
+
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
  * DELETE /api/nodes/:nodeNum
  * Delete a node and all associated data from the local database
  */
@@ -532,7 +583,7 @@ router.delete('/nodes/:nodeNum', requireMessagesWrite, async (req, res) => {
     }
 
     // Get node name for logging (async for multi-database support)
-    const nodes = await databaseService.getAllNodesAsync();
+    const nodes = await databaseService.nodes.getAllNodes();
     const node = nodes.find((n: any) => Number(n.nodeNum) === nodeNum);
     const nodeName = node?.shortName || node?.longName || `Node ${nodeNum}`;
 
@@ -617,7 +668,7 @@ router.post('/nodes/:nodeNum/purge-from-device', requireMessagesWrite, async (re
     }
 
     // Get node name for logging (async for multi-database support)
-    const nodes = await databaseService.getAllNodesAsync();
+    const nodes = await databaseService.nodes.getAllNodes();
     const node = nodes.find((n: any) => Number(n.nodeNum) === nodeNum);
     const nodeName = node?.shortName || node?.longName || `Node ${nodeNum}`;
 

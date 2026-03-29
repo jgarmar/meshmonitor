@@ -1,17 +1,17 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import '../styles/nodes.css';
 import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, Circle, Rectangle, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import type { Marker as LeafletMarker } from 'leaflet';
 import { DeviceInfo } from '../types/device';
 import { TabType } from '../types/ui';
-import { ResourceType } from '../types/permission';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
-import { getPositionHistoryColor, generateHeadingAwarePath, generatePositionHistoryArrows } from '../utils/mapHelpers.tsx';
+import { getPositionHistoryColor, generateHeadingAwarePath, generatePositionHistoryArrows, createArrowIcon } from '../utils/mapHelpers.tsx';
 import { getEffectivePosition, getRoleName, hasValidEffectivePosition, isNodeComplete, parseNodeId } from '../utils/nodeHelpers';
-import PositionHistoryLegend from './PositionHistoryLegend';
+import MapLegend from './MapLegend';
 import { formatTime, formatDateTime } from '../utils/datetime';
-import { getDistanceToNode } from '../utils/distance';
+import { getDistanceToNode, calculateDistance, formatDistance } from '../utils/distance';
 import { getTilesetById } from '../config/tilesets';
 import { getEffectiveHops } from '../utils/nodeHops';
 import { useMapContext } from '../contexts/MapContext';
@@ -20,10 +20,10 @@ import { useUI } from '../contexts/UIContext';
 import { useSettings } from '../contexts/SettingsContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useResizable } from '../hooks/useResizable';
-import MapLegend from './MapLegend';
 import ZoomHandler from './ZoomHandler';
 import MapResizeHandler from './MapResizeHandler';
 import MapPositionHandler from './MapPositionHandler';
+import PolarGridOverlay from './PolarGridOverlay.js';
 import { SpiderfierController, SpiderfierControllerRef } from './SpiderfierController';
 import { TilesetSelector } from './TilesetSelector';
 import { MapCenterController } from './MapCenterController';
@@ -32,6 +32,9 @@ import { getPacketStats } from '../services/packetApi';
 
 import { VectorTileLayer } from './VectorTileLayer';
 import { MapNodePopupContent } from './MapNodePopupContent';
+import { useCsrfFetch } from '../hooks/useCsrfFetch';
+import api from '../services/api';
+import { mapContactsToNodes } from '../utils/meshcoreHelpers';
 
 /**
  * Spiderfier initialization constants
@@ -55,6 +58,7 @@ interface NodesTabProps {
   shouldShowData: () => boolean;
   centerMapOnNode: (node: DeviceInfo) => void;
   toggleFavorite: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
+  toggleFavoriteLock?: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
   setActiveTab: React.Dispatch<React.SetStateAction<TabType>>;
   setSelectedDMNode: (nodeId: string) => void;
   markerRefs: React.MutableRefObject<Map<string, LeafletMarker>>;
@@ -147,6 +151,40 @@ const SelectedTracerouteLayer = React.memo<{ traceroute: React.ReactNode; enable
 );
 
 /**
+ * Controller that applies the configured default map center once server settings load.
+ * Only acts when there was no saved localStorage position at mount time (new session / anonymous).
+ * The configured default takes priority over auto-calculated node positions.
+ */
+const DefaultCenterController: React.FC<{
+  lat: number | null;
+  lon: number | null;
+  zoom: number | null;
+}> = ({ lat, lon, zoom }) => {
+  const map = useMap();
+  const applied = useRef(false);
+  // Capture whether localStorage had a saved map position at mount time.
+  // MapPositionHandler updates mapCenter immediately on mount, so we can't
+  // rely on the current mapCenter value — check localStorage directly.
+  const hadSavedPosition = useRef(localStorage.getItem('mapCenter') !== null);
+
+  useEffect(() => {
+    console.log('[DefaultCenterController] effect fired', {
+      applied: applied.current,
+      hadSaved: hadSavedPosition.current,
+      lat, lon, zoom,
+    });
+    if (applied.current || hadSavedPosition.current) return;
+    if (lat !== null && lon !== null && zoom !== null) {
+      console.log('[DefaultCenterController] applying configured default', lat, lon, zoom);
+      applied.current = true;
+      map.setView([lat, lon], zoom, { animate: false });
+    }
+  }, [map, lat, lon, zoom]);
+
+  return null;
+};
+
+/**
  * Controller component that zooms the map to fit the traceroute bounds
  * Must be placed inside MapContainer to access the map instance
  */
@@ -187,6 +225,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   shouldShowData,
   centerMapOnNode,
   toggleFavorite,
+  toggleFavoriteLock,
   setActiveTab,
   setSelectedDMNode,
   markerRefs,
@@ -215,12 +254,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     showMeshCoreNodes,
     setShowMeshCoreNodes,
     meshCoreNodes,
+    setMeshCoreNodes,
     showAnimations,
     setShowAnimations,
     showEstimatedPositions,
     setShowEstimatedPositions,
     showAccuracyRegions,
     setShowAccuracyRegions,
+    showPolarGrid,
+    setShowPolarGrid,
     animatedNodes,
     triggerNodeAnimation,
     mapCenterTarget,
@@ -239,6 +281,22 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   const { currentNodeId } = useDeviceConfig();
   const { nodes } = useNodes();
+
+  // Compute own node position for polar grid overlay (needs to be at component scope)
+  const ownHomeNode = nodes.find(n => n.user?.id === currentNodeId);
+  const ownNodePosition = ownHomeNode?.position?.latitude && ownHomeNode?.position?.longitude
+    ? { lat: ownHomeNode.position.latitude, lng: ownHomeNode.position.longitude }
+    : null;
+
+  // Debounce ref for hover mouseout to prevent flicker from tooltip interaction
+  const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clean up hover timeout on unmount to prevent firing against stale DOM
+  useEffect(() => {
+    return () => {
+      if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+    };
+  }, []);
 
   const {
     nodesWithTelemetry,
@@ -278,28 +336,165 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     nodeDimmingMinOpacity,
     maxNodeAgeHours,
     nodeHopsCalculation,
+    neighborInfoMinZoom,
     overlayColors,
+    defaultMapCenterLat,
+    defaultMapCenterLon,
+    defaultMapCenterZoom,
   } = useSettings();
 
   const { hasPermission, authStatus } = useAuth();
+  const csrfFetch = useCsrfFetch();
 
   // Parse current node ID to get node number for effective hops calculation
   const currentNodeNum = currentNodeId ? parseNodeId(currentNodeId) : null;
+
+  // Memoize filtered position history to avoid recomputation on every render
+  const filteredPositionHistory = useMemo(() => {
+    if (!showMotion || positionHistory.length < 2) return [];
+    if (positionHistoryHours != null) {
+      return positionHistory.filter(p => p.timestamp >= Date.now() - (positionHistoryHours * 60 * 60 * 1000));
+    }
+    return positionHistory;
+  }, [showMotion, positionHistory, positionHistoryHours]);
+
+  // Memoize position history legend data for MapLegend
+  const positionHistoryLegendData = useMemo(() => {
+    if (filteredPositionHistory.length < 2) return undefined;
+    return {
+      oldestTime: filteredPositionHistory[0].timestamp,
+      newestTime: filteredPositionHistory[filteredPositionHistory.length - 1].timestamp,
+      timeFormat,
+      dateFormat,
+    };
+  }, [filteredPositionHistory, timeFormat, dateFormat]);
+
+  // Memoize position history polyline elements
+  const positionHistoryElements = useMemo(() => {
+    if (filteredPositionHistory.length < 2) return null;
+
+    const elements: React.ReactElement[] = [];
+    const segmentCount = filteredPositionHistory.length - 1;
+    const segmentColors: string[] = [];
+
+    for (let i = 0; i < segmentCount; i++) {
+      const startPos = filteredPositionHistory[i];
+      const endPos = filteredPositionHistory[i + 1];
+      const color = getPositionHistoryColor(i, segmentCount, overlayColors.positionHistoryOld, overlayColors.positionHistoryNew);
+      segmentColors.push(color);
+
+      const segmentPath = positionHistoryLineStyle === 'spline' && startPos.groundTrack !== undefined
+        ? generateHeadingAwarePath(
+            [startPos.latitude, startPos.longitude],
+            [endPos.latitude, endPos.longitude],
+            startPos.groundTrack,
+            startPos.groundSpeed,
+            10
+          )
+        : [[startPos.latitude, startPos.longitude] as [number, number], [endPos.latitude, endPos.longitude] as [number, number]];
+
+      elements.push(
+        <Polyline
+          key={`position-history-segment-${i}`}
+          positions={segmentPath}
+          color={color}
+          weight={3}
+          opacity={0.8}
+        >
+          <Popup>
+            <div className="route-popup">
+              <h4>Position Segment {i + 1}</h4>
+              <div className="route-usage">
+                <strong>From:</strong> {formatDateTime(new Date(startPos.timestamp), timeFormat, dateFormat)}
+              </div>
+              <div className="route-usage">
+                <strong>To:</strong> {formatDateTime(new Date(endPos.timestamp), timeFormat, dateFormat)}
+              </div>
+              {startPos.groundSpeed !== undefined && (() => {
+                const converted = startPos.groundSpeed * 3.6;
+                const speedKmh = converted > 200 ? startPos.groundSpeed : converted;
+                const speed = distanceUnit === 'mi' ? speedKmh * 0.621371 : speedKmh;
+                const unit = distanceUnit === 'mi' ? 'mph' : 'km/h';
+                return (
+                  <div className="route-usage">
+                    <strong>Speed:</strong> {speed.toFixed(1)} {unit}
+                  </div>
+                );
+              })()}
+              {startPos.groundTrack !== undefined && (() => {
+                let heading = startPos.groundTrack;
+                if (heading > 360) heading = heading / 1000;
+                return (
+                  <div className="route-usage">
+                    <strong>Heading:</strong> {heading.toFixed(0)}°
+                  </div>
+                );
+              })()}
+            </div>
+          </Popup>
+        </Polyline>
+      );
+    }
+
+    const historyArrows = generatePositionHistoryArrows(
+      filteredPositionHistory,
+      segmentColors,
+      30,
+      distanceUnit
+    );
+    elements.push(...historyArrows);
+
+    return elements;
+  }, [filteredPositionHistory, overlayColors.positionHistoryOld, overlayColors.positionHistoryNew, positionHistoryLineStyle, timeFormat, dateFormat, distanceUnit]);
 
   // Detect touch device to disable hover tooltips on mobile
   const [isTouchDevice, setIsTouchDevice] = useState(false);
 
   useEffect(() => {
-    // Check if the device supports touch
+    // Check if the PRIMARY input is touch-only (no mouse/trackpad available)
+    // This correctly handles laptops with touchscreens that also have a trackpad
     const checkTouch = () => {
-      return (
-        'ontouchstart' in window ||
-        navigator.maxTouchPoints > 0 ||
-        (navigator as any).msMaxTouchPoints > 0
-      );
+      // pointer: coarse = touch/stylus is primary input
+      // pointer: fine = mouse/trackpad is available
+      // A laptop with both touchscreen and trackpad has pointer: fine → not touch-only
+      if (window.matchMedia) {
+        const hasCoarsePointer = window.matchMedia('(pointer: coarse)').matches;
+        const hasFinePointer = window.matchMedia('(pointer: fine)').matches;
+        return hasCoarsePointer && !hasFinePointer;
+      }
+      // Fallback for browsers without matchMedia
+      return navigator.maxTouchPoints > 0;
     };
     setIsTouchDevice(checkTouch());
   }, []);
+
+  // Poll MeshCore contacts for map display when MeshCore is enabled
+  // Refreshes every 10 seconds to keep map and node list in sync with device
+  useEffect(() => {
+    if (!authStatus?.meshcoreEnabled) return;
+    let cancelled = false;
+
+    const fetchMeshCoreContacts = async () => {
+      try {
+        const baseUrl = await api.getBaseUrl();
+        const response = await csrfFetch(`${baseUrl}/api/meshcore/contacts`);
+        const data = await response.json();
+        if (!cancelled && data.success && Array.isArray(data.data)) {
+          setMeshCoreNodes(mapContactsToNodes(data.data));
+        }
+      } catch {
+        // MeshCore not connected or unavailable — no action needed
+      }
+    };
+
+    fetchMeshCoreContacts();
+    const interval = setInterval(fetchMeshCoreContacts, 10000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [authStatus?.meshcoreEnabled, setMeshCoreNodes, csrfFetch]);
 
   // Ref for spiderfier controller to manage overlapping markers
   const spiderfierRef = useRef<SpiderfierControllerRef>(null);
@@ -443,16 +638,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     };
   }, [mapControlsPosition]);
 
-  // Check if user has permission to view packet monitor - needs at least one channel and messages permission
-  const hasAnyChannelPermission = () => {
-    for (let i = 0; i < 8; i++) {
-      if (hasPermission(`channel_${i}` as ResourceType, 'read')) {
-        return true;
-      }
-    }
-    return false;
-  };
-  const canViewPacketMonitor = hasAnyChannelPermission() && hasPermission('messages', 'read');
+  // Check if user has permission to view packet monitor
+  const canViewPacketMonitor = hasPermission('packetmonitor', 'read');
 
   // Fetch packet logging enabled status from server
   useEffect(() => {
@@ -530,6 +717,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const handleFavoriteClick = useCallback((node: DeviceInfo) => {
     return (e: React.MouseEvent) => toggleFavorite(node, e);
   }, [toggleFavorite]);
+
+  const handleLockClick = useCallback((node: DeviceInfo) => {
+    return (e: React.MouseEvent) => {
+      if (toggleFavoriteLock) toggleFavoriteLock(node, e);
+    };
+  }, [toggleFavoriteLock]);
 
   const handleDMClick = useCallback((node: DeviceInfo) => {
     return (e: React.MouseEvent) => {
@@ -908,40 +1101,55 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Calculate center point of all nodes for initial map view
   // Use saved map center from localStorage if available, otherwise calculate from nodes
-  const getMapCenter = (): [number, number] => {
-    // Use saved map center from previous session if available
+  const getMapCenter = (): { center: [number, number]; zoom: number } => {
+    // 1. Saved localStorage position (logged-in user's last session)
     if (mapCenter) {
-      return mapCenter;
+      return { center: mapCenter, zoom: mapZoom };
     }
 
-    // If no nodes with positions, use default location
-    if (nodesWithPosition.length === 0) {
-      return [25.7617, -80.1918]; // Default to Miami area
+    // 2. Configured default center (from server settings)
+    if (
+      defaultMapCenterLat !== null &&
+      defaultMapCenterLon !== null &&
+      defaultMapCenterZoom !== null
+    ) {
+      return {
+        center: [defaultMapCenterLat, defaultMapCenterLon],
+        zoom: defaultMapCenterZoom,
+      };
     }
 
-    // Prioritize the locally connected node's position for first-time visitors
-    // Uses effective position to respect position overrides (Issue #1526)
-    if (currentNodeId) {
-      const localNode = nodesWithPosition.find(node => node.user?.id === currentNodeId);
-      if (localNode) {
-        const effectivePos = getEffectivePosition(localNode);
-        if (effectivePos.latitude != null && effectivePos.longitude != null) {
-          return [effectivePos.latitude, effectivePos.longitude];
+    // 3. Calculated from visible nodes
+    if (nodesWithPosition.length > 0) {
+      // Prioritize the locally connected node's position for first-time visitors
+      // Uses effective position to respect position overrides (Issue #1526)
+      if (currentNodeId) {
+        const localNode = nodesWithPosition.find(node => node.user?.id === currentNodeId);
+        if (localNode) {
+          const effectivePos = getEffectivePosition(localNode);
+          if (effectivePos.latitude != null && effectivePos.longitude != null) {
+            return { center: [effectivePos.latitude, effectivePos.longitude], zoom: mapZoom };
+          }
         }
       }
+
+      // Fall back to average position of all nodes (using effective positions)
+      const avgLat = nodesWithPosition.reduce((sum, node) => {
+        const pos = getEffectivePosition(node);
+        return sum + (pos.latitude ?? 0);
+      }, 0) / nodesWithPosition.length;
+      const avgLng = nodesWithPosition.reduce((sum, node) => {
+        const pos = getEffectivePosition(node);
+        return sum + (pos.longitude ?? 0);
+      }, 0) / nodesWithPosition.length;
+      return { center: [avgLat, avgLng], zoom: mapZoom };
     }
 
-    // Fall back to average position of all nodes (using effective positions)
-    const avgLat = nodesWithPosition.reduce((sum, node) => {
-      const pos = getEffectivePosition(node);
-      return sum + (pos.latitude ?? 0);
-    }, 0) / nodesWithPosition.length;
-    const avgLng = nodesWithPosition.reduce((sum, node) => {
-      const pos = getEffectivePosition(node);
-      return sum + (pos.longitude ?? 0);
-    }, 0) / nodesWithPosition.length;
-    return [avgLat, avgLng];
+    // 4. World view (absolute last resort)
+    return { center: [20, 0], zoom: 2 };
   };
+
+  const mapDefaults = getMapCenter();
 
   return (
     <div className="nodes-split-view nodes-anchored-view">
@@ -1123,13 +1331,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       </div>
                       <div className="node-actions">
                         <div className="node-short" style={{ color: 'var(--ctp-mauve)' }}>
-                          {mcNode.publicKey.substring(0, 4)}...
+                          {mcNode.publicKey ? mcNode.publicKey.substring(0, 4) : '????'}...
                         </div>
                       </div>
                     </div>
                     <div className="node-details">
                       <div className="node-stats">
-                        {mcNode.snr !== undefined && (
+                        {mcNode.snr != null && typeof mcNode.snr === 'number' && (
                           <span className="stat" title="SNR">
                             📶 {mcNode.snr.toFixed(1)}dB
                           </span>
@@ -1213,13 +1421,28 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 >
                   <div className="node-header">
                     <div className="node-name">
-                      <button
-                        className="favorite-star"
-                        title={node.isFavorite ? t('nodes.remove_favorite') : t('nodes.add_favorite')}
-                        onClick={handleFavoriteClick(node)}
-                      >
-                        {node.isFavorite ? '⭐' : '☆'}
-                      </button>
+                      <span className="favorite-wrapper">
+                        <button
+                          className={`favorite-star${node.isFavorite && !node.favoriteLocked ? ' favorite-auto' : ''}`}
+                          title={node.isFavorite
+                            ? (node.favoriteLocked
+                              ? t('nodes.remove_favorite')
+                              : t('nodes.remove_favorite_auto', 'Remove auto-favorite'))
+                            : t('nodes.add_favorite')}
+                          onClick={handleFavoriteClick(node)}
+                        >
+                          {node.isFavorite ? '⭐' : '☆'}
+                        </button>
+                        {node.isFavorite && node.favoriteLocked && toggleFavoriteLock && (
+                          <button
+                            className="favorite-lock"
+                            title={t('nodes.unlock_favorite', 'Unlock — let automation manage this favorite')}
+                            onClick={handleLockClick(node)}
+                          >
+                            🔒
+                          </button>
+                        )}
+                      </span>
                       <div className="node-name-text">
                         <div className="node-longname">
                           {node.user?.longName || `Node ${node.nodeNum}`}
@@ -1294,6 +1517,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                           {node.deviceMetrics.batteryLevel === 101 ? '🔌' : `🔋 ${node.deviceMetrics.batteryLevel}%`}
                         </span>
                       )}
+                      {node.deviceMetrics?.voltage !== undefined && node.deviceMetrics.voltage !== null && (
+                        <span className="stat" title={t('nodes.voltage')}>
+                          ⚡ {node.deviceMetrics.voltage.toFixed(2)}V
+                        </span>
+                      )}
                       {(node.hopsAway != null || node.lastMessageHops != null) && (() => {
                         const effectiveHops = getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
                         return effectiveHops < 999 ? (
@@ -1356,8 +1584,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         className={`map-container ${showPacketMonitor && canViewPacketMonitor ? 'with-packet-monitor' : ''}`}
         style={showPacketMonitor && canViewPacketMonitor ? { height: `calc(100% - ${packetMonitorHeight}px)` } : undefined}
       >
-        {(shouldShowData() || meshCoreNodes.length > 0) ? (
-          <>
+        {(shouldShowData() || meshCoreNodes.length > 0) && (
             <div
               ref={mapControlsRef}
               className={`map-controls ${isMapControlsCollapsed ? 'collapsed' : ''}`}
@@ -1371,26 +1598,34 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 }
               )}
             >
-              <button
-                className="map-controls-collapse-btn"
-                onClick={handleCollapseMapControls}
-                title={isMapControlsCollapsed ? 'Expand controls' : 'Collapse controls'}
-                onMouseDown={(e) => e.stopPropagation()}
-              >
-                {isMapControlsCollapsed ? '▼' : '▲'}
-              </button>
               <div
-                className="map-controls-header"
+                className="map-controls-drag-handle"
                 style={{
-                  cursor: (isMapControlsCollapsed || isTouchDevice) ? 'default' : (isDraggingMapControls ? 'grabbing' : 'grab'),
+                  cursor: (isTouchDevice) ? 'default' : (isDraggingMapControls ? 'grabbing' : 'grab'),
                 }}
                 onMouseDown={handleMapControlsDragStart}
               >
-                {!isMapControlsCollapsed && (
-                  <div className="map-controls-title">
-                    Features
-                  </div>
-                )}
+                <span className="drag-handle-icon">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </span>
+              </div>
+              <div className="map-controls-body">
+              <div
+                className="map-controls-header"
+              >
+                <div className="map-controls-title">
+                  Features
+                </div>
+                <button
+                  className="map-controls-collapse-btn"
+                  onClick={handleCollapseMapControls}
+                  title={isMapControlsCollapsed ? 'Expand controls' : 'Collapse controls'}
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  {isMapControlsCollapsed ? '▼' : '▲'}
+                </button>
               </div>
               {!isMapControlsCollapsed && (
                 <>
@@ -1400,7 +1635,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showPaths}
                       onChange={(e) => setShowPaths(e.target.checked)}
                     />
-                    <span>Show Route Segments</span>
+                    <span>{t('map.showRouteSegments')}</span>
                   </label>
                   <label className="map-control-item">
                     <input
@@ -1408,7 +1643,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showNeighborInfo}
                       onChange={(e) => setShowNeighborInfo(e.target.checked)}
                     />
-                    <span>Show Neighbor Info</span>
+                    <span>{t('map.showNeighborInfo')}</span>
                   </label>
                   <label className="map-control-item">
                     <input
@@ -1416,7 +1651,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showRoute}
                       onChange={(e) => setShowRoute(e.target.checked)}
                     />
-                    <span>Show Traceroute</span>
+                    <span>{t('map.showTraceroute')}</span>
                   </label>
                   {tracerouteNodeNums && (
                     <button
@@ -1433,7 +1668,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showMqttNodes}
                       onChange={(e) => setShowMqttNodes(e.target.checked)}
                     />
-                    <span>Show MQTT</span>
+                    <span>{t('map.showMqtt')}</span>
                   </label>
                   {authStatus?.meshcoreEnabled && (
                   <label className="map-control-item">
@@ -1442,7 +1677,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showMeshCoreNodes}
                       onChange={(e) => setShowMeshCoreNodes(e.target.checked)}
                     />
-                    <span>Show MeshCore</span>
+                    <span>{t('map.showMeshCore')}</span>
                   </label>
                   )}
                   <label className="map-control-item">
@@ -1451,7 +1686,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showMotion}
                       onChange={(e) => setShowMotion(e.target.checked)}
                     />
-                    <span>Show Position History</span>
+                    <span>{t('map.showPositionHistory')}</span>
                   </label>
                   {showMotion && positionHistory.length > 1 && (() => {
                     // Calculate max hours from oldest position in history
@@ -1500,7 +1735,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showAnimations}
                       onChange={(e) => setShowAnimations(e.target.checked)}
                     />
-                    <span>Show Animations</span>
+                    <span>{t('map.showAnimations')}</span>
                   </label>
                   <label className="map-control-item">
                     <input
@@ -1508,7 +1743,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showEstimatedPositions}
                       onChange={(e) => setShowEstimatedPositions(e.target.checked)}
                     />
-                    <span>Show Estimated Positions</span>
+                    <span>{t('map.showEstimatedPositions')}</span>
                   </label>
                   <label className="map-control-item">
                     <input
@@ -1516,7 +1751,18 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       checked={showAccuracyRegions}
                       onChange={(e) => setShowAccuracyRegions(e.target.checked)}
                     />
-                    <span>Show Accuracy Regions</span>
+                    <span>{t('map.showAccuracyRegions')}</span>
+                  </label>
+                  <label className="map-control-item">
+                    <input
+                      type="checkbox"
+                      checked={showPolarGrid}
+                      onChange={(e) => setShowPolarGrid(e.target.checked)}
+                      disabled={!ownNodePosition}
+                    />
+                    <span title={!ownNodePosition ? t('map.polarGridDisabledTooltip') : undefined}>
+                      {t('map.showPolarGrid')}
+                    </span>
                   </label>
                   {canViewPacketMonitor && packetLogEnabled && (
                     <label className="map-control-item packet-monitor-toggle">
@@ -1530,10 +1776,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   )}
                 </>
               )}
+              </div>
             </div>
+        )}
             <MapContainer
-              center={getMapCenter()}
-              zoom={mapZoom}
+              center={mapDefaults.center}
+              zoom={mapDefaults.zoom}
               style={{ height: '100%', width: '100%' }}
             >
               <MapCenterController
@@ -1556,9 +1804,16 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               )}
               <ZoomHandler onZoomChange={setMapZoom} />
               <MapPositionHandler />
+              <DefaultCenterController
+                lat={defaultMapCenterLat}
+                lon={defaultMapCenterLon}
+                zoom={defaultMapCenterZoom}
+              />
               <MapResizeHandler trigger={`${showPacketMonitor}-${isNodeListCollapsed}`} />
               <SpiderfierController ref={spiderfierRef} zoomLevel={mapZoom} />
-              <MapLegend />
+              <MapLegend
+                positionHistory={positionHistoryLegendData}
+              />
               {nodesWithPosition
                 .filter(node => {
                   // Apply standard filters
@@ -1592,9 +1847,41 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 opacity={markerOpacity}
                 zIndexOffset={shouldAnimate ? 10000 : 0}
                 ref={(ref) => handleMarkerRef(ref, node.user?.id)}
+                eventHandlers={!isTouchDevice ? {
+                  mouseover: (e: any) => {
+                    if (hoverTimeoutRef.current) {
+                      clearTimeout(hoverTimeoutRef.current);
+                      hoverTimeoutRef.current = null;
+                    }
+                    // Selectively dim polylines not connected to this node
+                    const container = e.target._map?.getContainer();
+                    if (!container) return;
+                    const nodeClass = `node-${node.nodeNum}`;
+                    const paths = container.querySelectorAll('.leaflet-overlay-pane svg path.route-segment, .leaflet-overlay-pane svg path.neighbor-line');
+                    paths.forEach((path: Element) => {
+                      if (path.classList.contains(nodeClass)) {
+                        (path as HTMLElement).style.opacity = '';
+                      } else {
+                        (path as HTMLElement).style.opacity = '0.25';
+                      }
+                    });
+                  },
+                  mouseout: (e: any) => {
+                    if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+                    hoverTimeoutRef.current = setTimeout(() => {
+                      const container = e.target._map?.getContainer();
+                      if (!container) return;
+                      const paths = container.querySelectorAll('.leaflet-overlay-pane svg path.route-segment, .leaflet-overlay-pane svg path.neighbor-line');
+                      paths.forEach((path: Element) => {
+                        (path as HTMLElement).style.opacity = '';
+                      });
+                      hoverTimeoutRef.current = null;
+                    }, 150);
+                  },
+                } : undefined}
               >
                 {!isTouchDevice && (
-                  <Tooltip direction="top" offset={[0, -20]} opacity={0.9} interactive>
+                  <Tooltip direction="top" offset={[0, -20]} opacity={0.9}>
                     <div style={{ textAlign: 'center' }}>
                       <div style={{ fontWeight: 'bold' }}>
                         {node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}
@@ -1642,7 +1929,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
               {/* MeshCore nodes */}
               {showMeshCoreNodes && meshCoreNodes
-                .filter(node => node.latitude && node.longitude)
+                .filter(node => typeof node.latitude === 'number' && isFinite(node.latitude)
+                  && typeof node.longitude === 'number' && isFinite(node.longitude))
                 .map(node => {
                   const position: [number, number] = [node.latitude, node.longitude];
                   // Use MeshCore theme color (Catppuccin mauve) for MeshCore nodes
@@ -1685,6 +1973,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       key={`meshcore-${node.publicKey}`}
                       position={position}
                       icon={meshCoreIcon}
+                      ref={(ref) => handleMarkerRef(ref, `mc-${node.publicKey}`)}
                     >
                       <Tooltip>
                         <strong>{node.name || 'MeshCore Node'}</strong>
@@ -1700,11 +1989,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                           </h3>
                           <div style={{ fontSize: '12px', color: '#666' }}>
                             <strong>Type:</strong> MeshCore Device<br />
-                            <strong>Public Key:</strong> {node.publicKey.substring(0, 16)}...<br />
-                            {node.latitude && <><strong>Latitude:</strong> {node.latitude.toFixed(6)}<br /></>}
-                            {node.longitude && <><strong>Longitude:</strong> {node.longitude.toFixed(6)}<br /></>}
-                            {node.rssi !== undefined && <><strong>RSSI:</strong> {node.rssi} dBm<br /></>}
-                            {node.snr !== undefined && <><strong>SNR:</strong> {node.snr} dB<br /></>}
+                            <strong>Public Key:</strong> {node.publicKey ? node.publicKey.substring(0, 16) : '????'}...<br />
+                            {typeof node.latitude === 'number' && <><strong>Latitude:</strong> {node.latitude.toFixed(6)}<br /></>}
+                            {typeof node.longitude === 'number' && <><strong>Longitude:</strong> {node.longitude.toFixed(6)}<br /></>}
+                            {typeof node.rssi === 'number' && <><strong>RSSI:</strong> {node.rssi} dBm<br /></>}
+                            {typeof node.snr === 'number' && <><strong>SNR:</strong> {node.snr} dB<br /></>}
                             {node.lastSeen && <><strong>Last Seen:</strong> {new Date(node.lastSeen).toLocaleString()}<br /></>}
                           </div>
                         </div>
@@ -1809,6 +2098,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   );
                 })}
 
+              {showPolarGrid && ownNodePosition && (
+                <PolarGridOverlay center={ownNodePosition} />
+              )}
+
               {/* Draw traceroute paths (independent layer) */}
               <TraceroutePathsLayer paths={traceroutePathsElements} enabled={showPaths} />
 
@@ -1837,32 +2130,99 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   [ni.neighborLatitude, ni.neighborLongitude]
                 ];
 
+                // Zoom-adaptive: hide neighbor lines at low zoom
+                if (mapZoom < neighborInfoMinZoom) return null;
+
+                const isBidirectional = ni.bidirectional === true;
+
+                // SNR encoded in weight + opacity (color is uniform amber from overlayColors.neighborLine)
+                let lineWeight: number;
+                let lineOpacity: number;
+                if (ni.snr != null) {
+                  if (ni.snr > 10) { lineWeight = 4; lineOpacity = 0.85; }
+                  else if (ni.snr >= 0) { lineWeight = 3; lineOpacity = 0.6; }
+                  else { lineWeight = 2; lineOpacity = 0.4; }
+                } else { lineWeight = 2; lineOpacity = 0.3; }
+
+                // Calculate distance between nodes (coordinates guaranteed non-null by early return above)
+                const distKm = calculateDistance(ni.nodeLatitude!, ni.nodeLongitude!, ni.neighborLatitude!, ni.neighborLongitude!);
+                const distStr = formatDistance(distKm, distanceUnit);
+
+                // Data age (clamped to 0 to handle clock skew)
+                const ageMs = Math.max(0, Date.now() - ni.timestamp);
+                const ageMin = Math.floor(ageMs / 60000);
+                const ageStr = ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin / 60)}h ago`;
+
+                // SNR text color for popup
+                const snrTextColor = ni.snr != null
+                  ? ni.snr > 10 ? overlayColors.snrColors.good : ni.snr >= 0 ? overlayColors.snrColors.medium : overlayColors.snrColors.poor
+                  : undefined;
+
+                // Calculate bearing for unidirectional arrow (degrees from north)
+                // Arrow points FROM neighbor TO node (neighbor→node = "I heard this neighbor")
+                // Scale longitude difference by cos(lat) to correct for latitude
+                const latMid = (ni.nodeLatitude! + ni.neighborLatitude!) / 2;
+                const bearing = !isBidirectional
+                  ? Math.atan2(
+                      (ni.nodeLongitude! - ni.neighborLongitude!) * Math.cos(latMid * Math.PI / 180),
+                      ni.nodeLatitude! - ni.neighborLatitude!
+                    ) * (180 / Math.PI)
+                  : 0;
+
                 return (
-                  <Polyline
-                    key={`neighbor-${idx}`}
-                    positions={positions}
-                    color={overlayColors.neighborLine}
-                    weight={4}
-                    opacity={0.7}
-                    dashArray="5, 5"
-                  >
-                    <Popup>
-                      <div className="route-popup">
-                        <h4>Neighbor Connection</h4>
-                        <div className="route-endpoints">
-                          <strong>{ni.nodeName}</strong> ↔ <strong>{ni.neighborName}</strong>
-                        </div>
-                        {ni.snr !== null && ni.snr !== undefined && (
-                          <div className="route-usage">
-                            SNR: <strong>{ni.snr.toFixed(1)} dB</strong>
+                  <React.Fragment key={`neighbor-${idx}`}>
+                    <Polyline
+                      positions={positions}
+                      color={overlayColors.neighborLine}
+                      weight={lineWeight}
+                      opacity={lineOpacity}
+                      dashArray={isBidirectional ? undefined : '5, 5'}
+                      className={`neighbor-line node-${ni.nodeNum} node-${ni.neighborNodeNum}`}
+                    >
+                      <Popup>
+                        <div className="route-popup">
+                          <h4>{t('direct_links.neighbor_connection', 'Neighbor Connection')}</h4>
+                          <div className="route-endpoints">
+                            <strong>{ni.neighborName}</strong> {isBidirectional ? '↔' : '→'} <strong>{ni.nodeName}</strong>
                           </div>
-                        )}
-                        <div className="route-usage">
-                          Last seen: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong>
+                          {isBidirectional && (
+                            <div className="route-usage" style={{ color: 'var(--ctp-green)' }}>
+                              ↔ {t('direct_links.bidirectional', 'Bidirectional')}
+                            </div>
+                          )}
+                          {ni.snr !== null && ni.snr !== undefined && (
+                            <div className="route-usage">
+                              SNR: <strong style={{ color: snrTextColor }}>{ni.snr.toFixed(1)} dB</strong>
+                            </div>
+                          )}
+                          {distStr && (
+                            <div className="route-usage">
+                              {t('direct_links.distance', 'Distance')}: <strong>{distStr}</strong>
+                            </div>
+                          )}
+                          <div className="route-usage">
+                            {t('direct_links.last_seen', 'Last seen')}: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong> ({ageStr})
+                          </div>
                         </div>
-                      </div>
-                    </Popup>
-                  </Polyline>
+                      </Popup>
+                    </Polyline>
+                    {/* Direction arrows along unidirectional lines at 25%, 50%, 75% for visibility at any zoom */}
+                    {!isBidirectional && ni.nodeLatitude && ni.neighborLatitude && (
+                      <>
+                        {[0.25, 0.5, 0.75].map(fraction => (
+                          <Marker
+                            key={`arrow-${fraction}`}
+                            position={[
+                              ni.neighborLatitude! + (ni.nodeLatitude! - ni.neighborLatitude!) * fraction,
+                              ni.neighborLongitude! + (ni.nodeLongitude! - ni.neighborLongitude!) * fraction
+                            ]}
+                            icon={createArrowIcon(bearing, overlayColors.neighborLine)}
+                            interactive={false}
+                          />
+                        ))}
+                      </>
+                    )}
+                  </React.Fragment>
                 );
               })}
 
@@ -1870,119 +2230,16 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               {/* This is handled by traceroutePathsElements passed from parent */}
 
               {/* Draw position history for mobile nodes with color gradient */}
-              {showMotion && positionHistory.length > 1 && (() => {
-                // Filter position history based on slider value
-                const filteredHistory = positionHistoryHours != null
-                  ? positionHistory.filter(p => p.timestamp >= Date.now() - (positionHistoryHours * 60 * 60 * 1000))
-                  : positionHistory;
+              {positionHistoryElements}
 
-                // Need at least 2 positions to draw a line
-                if (filteredHistory.length < 2) return null;
-
-                const elements: React.ReactElement[] = [];
-                const segmentCount = filteredHistory.length - 1;
-                const segmentColors: string[] = [];
-
-                // Draw individual segments with gradient colors
-                for (let i = 0; i < segmentCount; i++) {
-                  const startPos = filteredHistory[i];
-                  const endPos = filteredHistory[i + 1];
-                  const color = getPositionHistoryColor(i, segmentCount, overlayColors.positionHistoryOld, overlayColors.positionHistoryNew);
-                  segmentColors.push(color);
-
-                  // Generate path - use Bezier curve if heading data is available
-                  const segmentPath = positionHistoryLineStyle === 'spline' && startPos.groundTrack !== undefined
-                    ? generateHeadingAwarePath(
-                        [startPos.latitude, startPos.longitude],
-                        [endPos.latitude, endPos.longitude],
-                        startPos.groundTrack,
-                        startPos.groundSpeed,
-                        10
-                      )
-                    : [[startPos.latitude, startPos.longitude] as [number, number], [endPos.latitude, endPos.longitude] as [number, number]];
-
-                  elements.push(
-                    <Polyline
-                      key={`position-history-segment-${i}`}
-                      positions={segmentPath}
-                      color={color}
-                      weight={3}
-                      opacity={0.8}
-                    >
-                      <Popup>
-                        <div className="route-popup">
-                          <h4>Position Segment {i + 1}</h4>
-                          <div className="route-usage">
-                            <strong>From:</strong> {formatDateTime(new Date(startPos.timestamp), timeFormat, dateFormat)}
-                          </div>
-                          <div className="route-usage">
-                            <strong>To:</strong> {formatDateTime(new Date(endPos.timestamp), timeFormat, dateFormat)}
-                          </div>
-                          {startPos.groundSpeed !== undefined && (() => {
-                            const converted = startPos.groundSpeed * 3.6;
-                            // If converted > 200 km/h, assume raw is already in km/h
-                            const speedKmh = converted > 200 ? startPos.groundSpeed : converted;
-                            // Convert to mph if user prefers miles
-                            const speed = distanceUnit === 'mi' ? speedKmh * 0.621371 : speedKmh;
-                            const unit = distanceUnit === 'mi' ? 'mph' : 'km/h';
-                            return (
-                              <div className="route-usage">
-                                <strong>Speed:</strong> {speed.toFixed(1)} {unit}
-                              </div>
-                            );
-                          })()}
-                          {startPos.groundTrack !== undefined && (() => {
-                            // Data is stored in millidegrees - detect and convert
-                            let heading = startPos.groundTrack;
-                            if (heading > 360) heading = heading / 1000;
-                            return (
-                              <div className="route-usage">
-                                <strong>Heading:</strong> {heading.toFixed(0)}°
-                              </div>
-                            );
-                          })()}
-                        </div>
-                      </Popup>
-                    </Polyline>
-                  );
-                }
-
-                // Generate arrow markers with performance limiting (max 30 arrows)
-                // Pass full history items so arrows can show heading and popup info
-                const historyArrows = generatePositionHistoryArrows(
-                  filteredHistory,
-                  segmentColors,
-                  30,
-                  distanceUnit
-                );
-                elements.push(...historyArrows);
-
-                return elements;
-              })()}
-
-              {/* Position History Legend */}
-              {showMotion && positionHistory.length > 1 && (() => {
-                const filteredHistory = positionHistoryHours != null
-                  ? positionHistory.filter(p => p.timestamp >= Date.now() - (positionHistoryHours * 60 * 60 * 1000))
-                  : positionHistory;
-
-                if (filteredHistory.length < 2) return null;
-
-                return (
-                  <PositionHistoryLegend
-                    oldestTime={filteredHistory[0].timestamp}
-                    newestTime={filteredHistory[filteredHistory.length - 1].timestamp}
-                    timeFormat={timeFormat}
-                    dateFormat={dateFormat}
-                  />
-                );
-              })()}
           </MapContainer>
+          {(shouldShowData() || meshCoreNodes.length > 0) && (
           <TilesetSelector
             selectedTilesetId={activeTileset}
             onTilesetChange={setMapTileset}
           />
-          {nodesWithPosition.length === 0 && meshCoreNodes.filter(n => n.latitude && n.longitude).length === 0 && (
+          )}
+          {(shouldShowData() || meshCoreNodes.length > 0) && nodesWithPosition.length === 0 && meshCoreNodes.filter(n => n.latitude && n.longitude).length === 0 && (
             <div className="map-overlay">
               <div className="overlay-content">
                 <h3>📍 No Node Locations</h3>
@@ -1991,15 +2248,14 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               </div>
             </div>
           )}
-          </>
-        ) : (
+          {!(shouldShowData() || meshCoreNodes.length > 0) && (
           <div className="map-placeholder">
             <div className="placeholder-content">
               <h3>Map View</h3>
               <p>Connect to a Meshtastic or MeshCore device to view node locations on the map</p>
             </div>
           </div>
-        )}
+          )}
       </div>
 
       {/* Packet Monitor Panel */}
@@ -2029,21 +2285,21 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 // Memoize NodesTab to prevent re-rendering when App.tsx updates for message status
 // Only re-render when actual node data or map-related props change
 const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
-  // Check if favorite status changed for any node
-  // Build sets of favorite node numbers for comparison
-  const prevFavorites = new Set(
-    prevProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum)
+  // Check if favorite status or lock status changed for any node
+  // Build maps of favorite node numbers with lock state for comparison
+  const prevFavorites = new Map(
+    prevProps.processedNodes.filter(n => n.isFavorite).map(n => [n.nodeNum, !!n.favoriteLocked])
   );
-  const nextFavorites = new Set(
-    nextProps.processedNodes.filter(n => n.isFavorite).map(n => n.nodeNum)
+  const nextFavorites = new Map(
+    nextProps.processedNodes.filter(n => n.isFavorite).map(n => [n.nodeNum, !!n.favoriteLocked])
   );
 
   // If the sets differ in size or content, favorites changed - must re-render
   if (prevFavorites.size !== nextFavorites.size) {
     return false; // Allow re-render
   }
-  for (const nodeNum of prevFavorites) {
-    if (!nextFavorites.has(nodeNum)) {
+  for (const [nodeNum, locked] of prevFavorites) {
+    if (!nextFavorites.has(nodeNum) || nextFavorites.get(nodeNum) !== locked) {
       return false; // Allow re-render
     }
   }
@@ -2093,6 +2349,11 @@ const NodesTab = React.memo(NodesTabComponent, (prevProps, nextProps) => {
 
   // If visibility changed, must re-render
   if (prevPathsVisible !== nextPathsVisible || prevRouteVisible !== nextRouteVisible) {
+    return false; // Allow re-render
+  }
+
+  // If traceroute paths reference changed (hover dimming, SNR recalc), must re-render
+  if (prevProps.traceroutePathsElements !== nextProps.traceroutePathsElements) {
     return false; // Allow re-render
   }
 

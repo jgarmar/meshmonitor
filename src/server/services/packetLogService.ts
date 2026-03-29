@@ -1,4 +1,5 @@
-import databaseService, { DbPacketLog, DbPacketCountByNode, DbPacketCountByPortnum } from '../../services/database.js';
+import databaseService from '../../services/database.js';
+import { DbPacketLog, DbPacketCountByNode, DbPacketCountByPortnum, DbDistinctRelayNode } from '../../db/types.js';
 import { logger } from '../../utils/logger.js';
 
 class PacketLogService {
@@ -26,9 +27,9 @@ class PacketLogService {
   /**
    * Run cleanup of old packet logs
    */
-  runCleanup(): void {
+  async runCleanup(): Promise<void> {
     try {
-      const deletedCount = databaseService.cleanupOldPacketLogs();
+      const deletedCount = await databaseService.cleanupOldPacketLogsAsync();
       if (deletedCount > 0) {
         logger.debug(`🧹 Packet log cleanup: removed ${deletedCount} old packets`);
       }
@@ -40,9 +41,9 @@ class PacketLogService {
   /**
    * Log a mesh packet
    */
-  logPacket(packet: Omit<DbPacketLog, 'id' | 'created_at'>): number {
+  async logPacket(packet: Omit<DbPacketLog, 'id' | 'created_at'>): Promise<number> {
     try {
-      return databaseService.insertPacketLog(packet);
+      return await databaseService.insertPacketLogAsync(packet);
     } catch (error) {
       logger.error('❌ Failed to log packet:', error);
       return 0;
@@ -52,7 +53,7 @@ class PacketLogService {
   /**
    * Get packet logs with optional filters
    */
-  getPackets(options: {
+  async getPackets(options: {
     offset?: number;
     limit?: number;
     portnum?: number;
@@ -61,12 +62,13 @@ class PacketLogService {
     channel?: number;
     encrypted?: boolean;
     since?: number;
-  }): DbPacketLog[] {
-    return databaseService.getPacketLogs(options);
+    relay_node?: number | 'unknown';
+  }): Promise<DbPacketLog[]> {
+    return databaseService.getPacketLogsAsync(options);
   }
 
   /**
-   * Get packet logs with optional filters - async version for PostgreSQL/MySQL
+   * Get packet logs with optional filters - async version for all backends
    */
   async getPacketsAsync(options: {
     offset?: number;
@@ -77,6 +79,7 @@ class PacketLogService {
     channel?: number;
     encrypted?: boolean;
     since?: number;
+    relay_node?: number | 'unknown';
   }): Promise<DbPacketLog[]> {
     return databaseService.getPacketLogsAsync(options);
   }
@@ -84,8 +87,8 @@ class PacketLogService {
   /**
    * Get single packet by ID
    */
-  getPacketById(id: number): DbPacketLog | null {
-    return databaseService.getPacketLogById(id);
+  async getPacketById(id: number): Promise<DbPacketLog | null> {
+    return databaseService.getPacketLogByIdAsync(id);
   }
 
   async getPacketByIdAsync(id: number): Promise<DbPacketLog | null> {
@@ -95,19 +98,20 @@ class PacketLogService {
   /**
    * Get total packet count with optional filters
    */
-  getPacketCount(options?: {
+  async getPacketCount(options?: {
     portnum?: number;
     from_node?: number;
     to_node?: number;
     channel?: number;
     encrypted?: boolean;
     since?: number;
-  }): number {
-    return databaseService.getPacketLogCount(options || {});
+    relay_node?: number | 'unknown';
+  }): Promise<number> {
+    return databaseService.getPacketLogCountAsync(options || {});
   }
 
   /**
-   * Get total packet count with optional filters - async version for PostgreSQL/MySQL
+   * Get total packet count with optional filters - async version for all backends
    */
   async getPacketCountAsync(options?: {
     portnum?: number;
@@ -116,6 +120,7 @@ class PacketLogService {
     channel?: number;
     encrypted?: boolean;
     since?: number;
+    relay_node?: number | 'unknown';
   }): Promise<number> {
     return databaseService.getPacketLogCountAsync(options || {});
   }
@@ -128,7 +133,7 @@ class PacketLogService {
   }
 
   /**
-   * Clear all packet logs - async version for PostgreSQL/MySQL
+   * Clear all packet logs - async version for all backends
    */
   async clearPacketsAsync(): Promise<number> {
     return databaseService.clearPacketLogsAsync();
@@ -137,24 +142,24 @@ class PacketLogService {
   /**
    * Check if packet logging is enabled
    */
-  isEnabled(): boolean {
-    const enabled = databaseService.getSetting('packet_log_enabled');
+  async isEnabled(): Promise<boolean> {
+    const enabled = await databaseService.getSettingAsync('packet_log_enabled');
     return enabled === '1';
   }
 
   /**
    * Get max packet count setting
    */
-  getMaxCount(): number {
-    const maxCountStr = databaseService.getSetting('packet_log_max_count');
+  async getMaxCount(): Promise<number> {
+    const maxCountStr = await databaseService.getSettingAsync('packet_log_max_count');
     return maxCountStr ? parseInt(maxCountStr, 10) : 1000;
   }
 
   /**
    * Get max age in hours setting
    */
-  getMaxAgeHours(): number {
-    const maxAgeStr = databaseService.getSetting('packet_log_max_age_hours');
+  async getMaxAgeHours(): Promise<number> {
+    const maxAgeStr = await databaseService.getSettingAsync('packet_log_max_age_hours');
     return maxAgeStr ? parseInt(maxAgeStr, 10) : 24;
   }
 
@@ -163,6 +168,13 @@ class PacketLogService {
    */
   async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number }): Promise<DbPacketCountByNode[]> {
     return databaseService.getPacketCountsByNodeAsync(options);
+  }
+
+  /**
+   * Get distinct relay nodes for filter dropdowns
+   */
+  async getDistinctRelayNodesAsync(): Promise<DbDistinctRelayNode[]> {
+    return databaseService.getDistinctRelayNodesAsync();
   }
 
   /**

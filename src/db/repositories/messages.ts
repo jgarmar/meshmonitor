@@ -4,10 +4,10 @@
  * Handles all message-related database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, gt, lt, gte, and, or, desc, sql, like, ilike, inArray, isNotNull, ne, SQL } from 'drizzle-orm';
-import { messagesSqlite, messagesPostgres, messagesMysql } from '../schema/messages.js';
+import { eq, gt, lt, gte, and, or, desc, sql, like, ilike, inArray, isNotNull, ne, SQL, count } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType, DbMessage } from '../types.js';
+import { logger } from '../../utils/logger.js';
 
 /**
  * Repository for message operations
@@ -18,9 +18,11 @@ export class MessagesRepository extends BaseRepository {
   }
 
   /**
-   * Insert a new message (ignores duplicates)
+   * Insert a new message (ignores duplicates).
+   * Keeps branching: different upsert syntax and result shapes per dialect.
    */
-  async insertMessage(messageData: DbMessage): Promise<void> {
+  async insertMessage(messageData: DbMessage): Promise<boolean> {
+    const { messages } = this.tables;
     const values = {
       id: messageData.id,
       fromNodeNum: messageData.fromNodeNum,
@@ -50,440 +52,166 @@ export class MessagesRepository extends BaseRepository {
       decryptedBy: messageData.decryptedBy ?? null,
     };
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .insert(messagesSqlite)
-        .values(values)
-        .onConflictDoNothing();
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .insert(messagesMysql)
-        .values(values)
-        .onDuplicateKeyUpdate({ set: { id: messageData.id } }); // MySQL equivalent of onConflictDoNothing
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .insert(messagesPostgres)
-        .values(values)
-        .onConflictDoNothing();
-    }
+    const result = await this.insertIgnore(messages, values);
+    return this.getAffectedRows(result) > 0;
   }
 
   /**
    * Get a message by ID
    */
   async getMessage(id: string): Promise<DbMessage | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.id, id))
-        .limit(1);
+    const { messages } = this.tables;
+    const result = await this.db
+      .select()
+      .from(messages)
+      .where(eq(messages.id, id))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbMessage;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(messagesMysql)
-        .where(eq(messagesMysql.id, id))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbMessage;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.id, id))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbMessage;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbMessage;
   }
 
   /**
    * Get a message by requestId
    */
   async getMessageByRequestId(requestId: number): Promise<DbMessage | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.requestId, requestId))
-        .limit(1);
+    const { messages } = this.tables;
+    const result = await this.db
+      .select()
+      .from(messages)
+      .where(eq(messages.requestId, requestId))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbMessage;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(messagesMysql)
-        .where(eq(messagesMysql.requestId, requestId))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbMessage;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.requestId, requestId))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbMessage;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbMessage;
   }
 
   /**
    * Get messages with pagination, ordered by rxTime/timestamp desc
    */
   async getMessages(limit: number = 100, offset: number = 0): Promise<DbMessage[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const messages = await db
-        .select()
-        .from(messagesSqlite)
-        .orderBy(desc(sql`COALESCE(${messagesSqlite.rxTime}, ${messagesSqlite.timestamp})`))
-        .limit(limit)
-        .offset(offset);
+    const { messages } = this.tables;
+    const result = await this.db
+      .select()
+      .from(messages)
+      .orderBy(desc(sql`COALESCE(${messages.rxTime}, ${messages.timestamp})`))
+      .limit(limit)
+      .offset(offset);
 
-      return messages.map(m => this.normalizeBigInts(m) as DbMessage);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const messages = await db
-        .select()
-        .from(messagesMysql)
-        .orderBy(desc(sql`COALESCE(${messagesMysql.rxTime}, ${messagesMysql.timestamp})`))
-        .limit(limit)
-        .offset(offset);
-
-      return messages as DbMessage[];
-    } else {
-      const db = this.getPostgresDb();
-      const messages = await db
-        .select()
-        .from(messagesPostgres)
-        .orderBy(desc(sql`COALESCE(${messagesPostgres.rxTime}, ${messagesPostgres.timestamp})`))
-        .limit(limit)
-        .offset(offset);
-
-      return messages as DbMessage[];
-    }
+    return this.normalizeBigInts(result) as DbMessage[];
   }
 
   /**
    * Get messages by channel
    */
   async getMessagesByChannel(channel: number, limit: number = 100, offset: number = 0): Promise<DbMessage[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const messages = await db
-        .select()
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.channel, channel))
-        .orderBy(desc(sql`COALESCE(${messagesSqlite.rxTime}, ${messagesSqlite.timestamp})`))
-        .limit(limit)
-        .offset(offset);
+    const { messages } = this.tables;
+    const result = await this.db
+      .select()
+      .from(messages)
+      .where(eq(messages.channel, channel))
+      .orderBy(desc(sql`COALESCE(${messages.rxTime}, ${messages.timestamp})`))
+      .limit(limit)
+      .offset(offset);
 
-      return messages.map(m => this.normalizeBigInts(m) as DbMessage);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const messages = await db
-        .select()
-        .from(messagesMysql)
-        .where(eq(messagesMysql.channel, channel))
-        .orderBy(desc(sql`COALESCE(${messagesMysql.rxTime}, ${messagesMysql.timestamp})`))
-        .limit(limit)
-        .offset(offset);
-
-      return messages as DbMessage[];
-    } else {
-      const db = this.getPostgresDb();
-      const messages = await db
-        .select()
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.channel, channel))
-        .orderBy(desc(sql`COALESCE(${messagesPostgres.rxTime}, ${messagesPostgres.timestamp})`))
-        .limit(limit)
-        .offset(offset);
-
-      return messages as DbMessage[];
-    }
+    return this.normalizeBigInts(result) as DbMessage[];
   }
 
   /**
    * Get direct messages between two nodes
    */
   async getDirectMessages(nodeId1: string, nodeId2: string, limit: number = 100, offset: number = 0): Promise<DbMessage[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const messages = await db
-        .select()
-        .from(messagesSqlite)
-        .where(
-          and(
-            eq(messagesSqlite.portnum, 1),
-            eq(messagesSqlite.channel, -1),
-            or(
-              and(eq(messagesSqlite.fromNodeId, nodeId1), eq(messagesSqlite.toNodeId, nodeId2)),
-              and(eq(messagesSqlite.fromNodeId, nodeId2), eq(messagesSqlite.toNodeId, nodeId1))
-            )
+    const { messages } = this.tables;
+    const result = await this.db
+      .select()
+      .from(messages)
+      .where(
+        and(
+          eq(messages.portnum, 1),
+          eq(messages.channel, -1),
+          or(
+            and(eq(messages.fromNodeId, nodeId1), eq(messages.toNodeId, nodeId2)),
+            and(eq(messages.fromNodeId, nodeId2), eq(messages.toNodeId, nodeId1))
           )
         )
-        .orderBy(desc(sql`COALESCE(${messagesSqlite.rxTime}, ${messagesSqlite.timestamp})`))
-        .limit(limit)
-        .offset(offset);
+      )
+      .orderBy(desc(sql`COALESCE(${messages.rxTime}, ${messages.timestamp})`))
+      .limit(limit)
+      .offset(offset);
 
-      return messages.map(m => this.normalizeBigInts(m) as DbMessage);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const messages = await db
-        .select()
-        .from(messagesMysql)
-        .where(
-          and(
-            eq(messagesMysql.portnum, 1),
-            eq(messagesMysql.channel, -1),
-            or(
-              and(eq(messagesMysql.fromNodeId, nodeId1), eq(messagesMysql.toNodeId, nodeId2)),
-              and(eq(messagesMysql.fromNodeId, nodeId2), eq(messagesMysql.toNodeId, nodeId1))
-            )
-          )
-        )
-        .orderBy(desc(sql`COALESCE(${messagesMysql.rxTime}, ${messagesMysql.timestamp})`))
-        .limit(limit)
-        .offset(offset);
-
-      return messages as DbMessage[];
-    } else {
-      const db = this.getPostgresDb();
-      const messages = await db
-        .select()
-        .from(messagesPostgres)
-        .where(
-          and(
-            eq(messagesPostgres.portnum, 1),
-            eq(messagesPostgres.channel, -1),
-            or(
-              and(eq(messagesPostgres.fromNodeId, nodeId1), eq(messagesPostgres.toNodeId, nodeId2)),
-              and(eq(messagesPostgres.fromNodeId, nodeId2), eq(messagesPostgres.toNodeId, nodeId1))
-            )
-          )
-        )
-        .orderBy(desc(sql`COALESCE(${messagesPostgres.rxTime}, ${messagesPostgres.timestamp})`))
-        .limit(limit)
-        .offset(offset);
-
-      return messages as DbMessage[];
-    }
+    return this.normalizeBigInts(result) as DbMessage[];
   }
 
   /**
    * Get messages after a timestamp
    */
   async getMessagesAfterTimestamp(timestamp: number): Promise<DbMessage[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const messages = await db
-        .select()
-        .from(messagesSqlite)
-        .where(gt(messagesSqlite.timestamp, timestamp))
-        .orderBy(messagesSqlite.timestamp);
+    const { messages } = this.tables;
+    const result = await this.db
+      .select()
+      .from(messages)
+      .where(gt(messages.timestamp, timestamp))
+      .orderBy(messages.timestamp);
 
-      return messages.map(m => this.normalizeBigInts(m) as DbMessage);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const messages = await db
-        .select()
-        .from(messagesMysql)
-        .where(gt(messagesMysql.timestamp, timestamp))
-        .orderBy(messagesMysql.timestamp);
-
-      return messages as DbMessage[];
-    } else {
-      const db = this.getPostgresDb();
-      const messages = await db
-        .select()
-        .from(messagesPostgres)
-        .where(gt(messagesPostgres.timestamp, timestamp))
-        .orderBy(messagesPostgres.timestamp);
-
-      return messages as DbMessage[];
-    }
+    return this.normalizeBigInts(result) as DbMessage[];
   }
 
   /**
    * Get total message count
    */
   async getMessageCount(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db.select().from(messagesSqlite);
-      return result.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db.select().from(messagesMysql);
-      return result.length;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db.select().from(messagesPostgres);
-      return result.length;
-    }
+    const { messages } = this.tables;
+    const result = await this.db.select({ count: count() }).from(messages);
+    return Number(result[0].count);
   }
 
   /**
    * Delete a message by ID
    */
   async deleteMessage(id: string): Promise<boolean> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const existing = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.id, id));
+    const { messages } = this.tables;
+    const existing = await this.db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.id, id));
 
-      if (existing.length === 0) return false;
+    if (existing.length === 0) return false;
 
-      await db.delete(messagesSqlite).where(eq(messagesSqlite.id, id));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const existing = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(eq(messagesMysql.id, id));
-
-      if (existing.length === 0) return false;
-
-      await db.delete(messagesMysql).where(eq(messagesMysql.id, id));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      const existing = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.id, id));
-
-      if (existing.length === 0) return false;
-
-      await db.delete(messagesPostgres).where(eq(messagesPostgres.id, id));
-      return true;
-    }
+    await this.db.delete(messages).where(eq(messages.id, id));
+    return true;
   }
 
   /**
    * Purge all messages from a channel
    */
   async purgeChannelMessages(channel: number): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.channel, channel));
-
-      for (const msg of toDelete) {
-        await db.delete(messagesSqlite).where(eq(messagesSqlite.id, msg.id));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(eq(messagesMysql.channel, channel));
-
-      for (const msg of toDelete) {
-        await db.delete(messagesMysql).where(eq(messagesMysql.id, msg.id));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.channel, channel));
-
-      for (const msg of toDelete) {
-        await db.delete(messagesPostgres).where(eq(messagesPostgres.id, msg.id));
-      }
-      return toDelete.length;
-    }
+    const { messages } = this.tables;
+    const [{ deletedCount }] = await this.db
+      .select({ deletedCount: count() })
+      .from(messages)
+      .where(eq(messages.channel, channel));
+    await this.db.delete(messages).where(eq(messages.channel, channel));
+    return deletedCount;
   }
 
   /**
    * Purge direct messages to/from a node
    */
   async purgeDirectMessages(nodeNum: number): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(
-          and(
-            or(
-              eq(messagesSqlite.fromNodeNum, nodeNum),
-              eq(messagesSqlite.toNodeNum, nodeNum)
-            ),
-            sql`${messagesSqlite.toNodeId} != '!ffffffff'`
-          )
-        );
-
-      for (const msg of toDelete) {
-        await db.delete(messagesSqlite).where(eq(messagesSqlite.id, msg.id));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(
-          and(
-            or(
-              eq(messagesMysql.fromNodeNum, nodeNum),
-              eq(messagesMysql.toNodeNum, nodeNum)
-            ),
-            sql`${messagesMysql.toNodeId} != '!ffffffff'`
-          )
-        );
-
-      for (const msg of toDelete) {
-        await db.delete(messagesMysql).where(eq(messagesMysql.id, msg.id));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(
-          and(
-            or(
-              eq(messagesPostgres.fromNodeNum, nodeNum),
-              eq(messagesPostgres.toNodeNum, nodeNum)
-            ),
-            sql`${messagesPostgres.toNodeId} != '!ffffffff'`
-          )
-        );
-
-      for (const msg of toDelete) {
-        await db.delete(messagesPostgres).where(eq(messagesPostgres.id, msg.id));
-      }
-      return toDelete.length;
-    }
+    const { messages } = this.tables;
+    const condition = and(
+      or(
+        eq(messages.fromNodeNum, nodeNum),
+        eq(messages.toNodeNum, nodeNum)
+      ),
+      sql`${messages.toNodeId} != '!ffffffff'`
+    );
+    const [{ deletedCount }] = await this.db
+      .select({ deletedCount: count() })
+      .from(messages)
+      .where(condition);
+    await this.db.delete(messages).where(condition);
+    return deletedCount;
   }
 
   /**
@@ -491,227 +219,90 @@ export class MessagesRepository extends BaseRepository {
    */
   async cleanupOldMessages(days: number = 30): Promise<number> {
     const cutoff = this.now() - (days * 24 * 60 * 60 * 1000);
+    const { messages } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(lt(messagesSqlite.timestamp, cutoff));
-
-      for (const msg of toDelete) {
-        await db.delete(messagesSqlite).where(eq(messagesSqlite.id, msg.id));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(lt(messagesMysql.timestamp, cutoff));
-
-      for (const msg of toDelete) {
-        await db.delete(messagesMysql).where(eq(messagesMysql.id, msg.id));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(lt(messagesPostgres.timestamp, cutoff));
-
-      for (const msg of toDelete) {
-        await db.delete(messagesPostgres).where(eq(messagesPostgres.id, msg.id));
-      }
-      return toDelete.length;
-    }
+    const [{ deletedCount }] = await this.db
+      .select({ deletedCount: count() })
+      .from(messages)
+      .where(lt(messages.timestamp, cutoff));
+    await this.db.delete(messages).where(lt(messages.timestamp, cutoff));
+    return deletedCount;
   }
 
   /**
    * Update message acknowledgement by requestId
    */
   async updateMessageAckByRequestId(requestId: number, ackFailed: boolean = false): Promise<boolean> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const existing = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.requestId, requestId));
+    const { messages } = this.tables;
+    const existing = await this.db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.requestId, requestId));
 
-      if (existing.length === 0) return false;
+    if (existing.length === 0) return false;
 
-      await db
-        .update(messagesSqlite)
-        .set({
-          ackFailed,
-          deliveryState: ackFailed ? 'failed' : 'confirmed',
-        })
-        .where(eq(messagesSqlite.requestId, requestId));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const existing = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(eq(messagesMysql.requestId, requestId));
-
-      if (existing.length === 0) return false;
-
-      await db
-        .update(messagesMysql)
-        .set({
-          ackFailed,
-          deliveryState: ackFailed ? 'failed' : 'confirmed',
-        })
-        .where(eq(messagesMysql.requestId, requestId));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      const existing = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.requestId, requestId));
-
-      if (existing.length === 0) return false;
-
-      await db
-        .update(messagesPostgres)
-        .set({
-          ackFailed,
-          deliveryState: ackFailed ? 'failed' : 'confirmed',
-        })
-        .where(eq(messagesPostgres.requestId, requestId));
-      return true;
-    }
+    await this.db
+      .update(messages)
+      .set({
+        ackFailed,
+        deliveryState: ackFailed ? 'failed' : 'confirmed',
+      })
+      .where(eq(messages.requestId, requestId));
+    return true;
   }
 
   /**
    * Update message delivery state
    */
   async updateMessageDeliveryState(requestId: number, deliveryState: 'delivered' | 'confirmed' | 'failed'): Promise<boolean> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const existing = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.requestId, requestId));
+    const { messages } = this.tables;
+    const existing = await this.db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.requestId, requestId));
 
-      if (existing.length === 0) return false;
+    if (existing.length === 0) return false;
 
-      await db
-        .update(messagesSqlite)
-        .set({ deliveryState })
-        .where(eq(messagesSqlite.requestId, requestId));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const existing = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(eq(messagesMysql.requestId, requestId));
-
-      if (existing.length === 0) return false;
-
-      await db
-        .update(messagesMysql)
-        .set({ deliveryState })
-        .where(eq(messagesMysql.requestId, requestId));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      const existing = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.requestId, requestId));
-
-      if (existing.length === 0) return false;
-
-      await db
-        .update(messagesPostgres)
-        .set({ deliveryState })
-        .where(eq(messagesPostgres.requestId, requestId));
-      return true;
-    }
+    await this.db
+      .update(messages)
+      .set({ deliveryState })
+      .where(eq(messages.requestId, requestId));
+    return true;
   }
 
   async updateMessageTimestamps(requestId: number, rxTime: number): Promise<boolean> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const existing = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite)
-        .where(eq(messagesSqlite.requestId, requestId));
+    const { messages } = this.tables;
+    const existing = await this.db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.requestId, requestId));
 
-      if (existing.length === 0) return false;
+    if (existing.length === 0) return false;
 
-      await db
-        .update(messagesSqlite)
-        .set({ rxTime, timestamp: rxTime })
-        .where(eq(messagesSqlite.requestId, requestId));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const existing = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql)
-        .where(eq(messagesMysql.requestId, requestId));
-
-      if (existing.length === 0) return false;
-
-      await db
-        .update(messagesMysql)
-        .set({ rxTime, timestamp: rxTime })
-        .where(eq(messagesMysql.requestId, requestId));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      const existing = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres)
-        .where(eq(messagesPostgres.requestId, requestId));
-
-      if (existing.length === 0) return false;
-
-      await db
-        .update(messagesPostgres)
-        .set({ rxTime, timestamp: rxTime })
-        .where(eq(messagesPostgres.requestId, requestId));
-      return true;
-    }
+    await this.db
+      .update(messages)
+      .set({ rxTime, timestamp: rxTime })
+      .where(eq(messages.requestId, requestId));
+    return true;
   }
 
   /**
    * Delete all messages
    */
   async deleteAllMessages(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const count = await db
-        .select({ id: messagesSqlite.id })
-        .from(messagesSqlite);
-      await db.delete(messagesSqlite);
-      return count.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const count = await db
-        .select({ id: messagesMysql.id })
-        .from(messagesMysql);
-      await db.delete(messagesMysql);
-      return count.length;
-    } else {
-      const db = this.getPostgresDb();
-      const count = await db
-        .select({ id: messagesPostgres.id })
-        .from(messagesPostgres);
-      await db.delete(messagesPostgres);
-      return count.length;
-    }
+    const { messages } = this.tables;
+    const result = await this.db.select({ count: count() }).from(messages);
+    const total = Number(result[0].count);
+    await this.db.delete(messages);
+    return total;
   }
 
   /**
    * Search messages with text matching, filtering, and pagination.
    * Returns matching messages and total count for pagination.
+   *
+   * Keeps branching: different text search functions per dialect
+   * (SQLite: instr/LOWER LIKE, MySQL: BINARY LIKE/like, PostgreSQL: like/ilike).
    */
   async searchMessages(options: {
     query: string;
@@ -736,197 +327,159 @@ export class MessagesRepository extends BaseRepository {
       offset = 0,
     } = options;
 
+    const { messages: table } = this.tables;
     const pattern = `%${query}%`;
+    const timeExpr = sql`COALESCE(${table.rxTime}, ${table.timestamp})`;
 
+    // Build conditions array - shared across all dialects
+    const conditions: SQL[] = [];
+
+    // Text must exist
+    conditions.push(isNotNull(table.text));
+    conditions.push(ne(table.text, ''));
+
+    // Text search - dialect-specific
     if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const table = messagesSqlite;
-      const timeExpr = sql`COALESCE(${table.rxTime}, ${table.timestamp})`;
-
-      // Build conditions array
-      const conditions: SQL[] = [];
-
-      // Text must exist
-      conditions.push(isNotNull(table.text));
-      conditions.push(ne(table.text, ''));
-
-      // Text search
       if (caseSensitive) {
         conditions.push(sql`instr(${table.text}, ${query}) > 0`);
       } else {
         conditions.push(sql`LOWER(${table.text}) LIKE LOWER(${pattern})`);
       }
-
-      // Scope filter
-      if (scope === 'channels') {
-        conditions.push(gte(table.channel, 0));
-      } else if (scope === 'dms') {
-        conditions.push(eq(table.channel, -1));
-      }
-
-      // Channel filter
-      if (channels && channels.length > 0) {
-        conditions.push(inArray(table.channel, channels));
-      }
-
-      // From node filter
-      if (fromNodeId) {
-        conditions.push(eq(table.fromNodeId, fromNodeId));
-      }
-
-      // Date range filters
-      if (startDate !== undefined) {
-        conditions.push(sql`${timeExpr} >= ${startDate}`);
-      }
-      if (endDate !== undefined) {
-        conditions.push(sql`${timeExpr} <= ${endDate}`);
-      }
-
-      const whereClause = and(...conditions);
-
-      // Get total count
-      const countResult = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(table)
-        .where(whereClause);
-      const total = Number(countResult[0]?.count ?? 0);
-
-      // Get paginated messages
-      const messages = await db
-        .select()
-        .from(table)
-        .where(whereClause)
-        .orderBy(desc(timeExpr))
-        .limit(limit)
-        .offset(offset);
-
-      return { messages: messages.map(m => this.normalizeBigInts(m) as DbMessage), total };
     } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const table = messagesMysql;
-      const timeExpr = sql`COALESCE(${table.rxTime}, ${table.timestamp})`;
-
-      // Build conditions array
-      const conditions: SQL[] = [];
-
-      // Text must exist
-      conditions.push(isNotNull(table.text));
-      conditions.push(ne(table.text, ''));
-
-      // Text search
       if (caseSensitive) {
         conditions.push(sql`BINARY ${table.text} LIKE ${pattern}`);
       } else {
         conditions.push(like(table.text, pattern));
       }
-
-      // Scope filter
-      if (scope === 'channels') {
-        conditions.push(gte(table.channel, 0));
-      } else if (scope === 'dms') {
-        conditions.push(eq(table.channel, -1));
-      }
-
-      // Channel filter
-      if (channels && channels.length > 0) {
-        conditions.push(inArray(table.channel, channels));
-      }
-
-      // From node filter
-      if (fromNodeId) {
-        conditions.push(eq(table.fromNodeId, fromNodeId));
-      }
-
-      // Date range filters
-      if (startDate !== undefined) {
-        conditions.push(sql`${timeExpr} >= ${startDate}`);
-      }
-      if (endDate !== undefined) {
-        conditions.push(sql`${timeExpr} <= ${endDate}`);
-      }
-
-      const whereClause = and(...conditions);
-
-      // Get total count
-      const countResult = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(table)
-        .where(whereClause);
-      const total = Number(countResult[0]?.count ?? 0);
-
-      // Get paginated messages
-      const messages = await db
-        .select()
-        .from(table)
-        .where(whereClause)
-        .orderBy(desc(timeExpr))
-        .limit(limit)
-        .offset(offset);
-
-      return { messages: messages as DbMessage[], total };
     } else {
-      const db = this.getPostgresDb();
-      const table = messagesPostgres;
-      const timeExpr = sql`COALESCE(${table.rxTime}, ${table.timestamp})`;
-
-      // Build conditions array
-      const conditions: SQL[] = [];
-
-      // Text must exist
-      conditions.push(isNotNull(table.text));
-      conditions.push(ne(table.text, ''));
-
-      // Text search
+      // PostgreSQL
       if (caseSensitive) {
         conditions.push(like(table.text, pattern));
       } else {
         conditions.push(ilike(table.text, pattern));
       }
+    }
 
-      // Scope filter
-      if (scope === 'channels') {
-        conditions.push(gte(table.channel, 0));
-      } else if (scope === 'dms') {
-        conditions.push(eq(table.channel, -1));
+    // Scope filter
+    if (scope === 'channels') {
+      conditions.push(gte(table.channel, 0));
+    } else if (scope === 'dms') {
+      conditions.push(eq(table.channel, -1));
+    }
+
+    // Channel filter
+    if (channels && channels.length > 0) {
+      conditions.push(inArray(table.channel, channels));
+    }
+
+    // From node filter
+    if (fromNodeId) {
+      conditions.push(eq(table.fromNodeId, fromNodeId));
+    }
+
+    // Date range filters
+    if (startDate !== undefined) {
+      conditions.push(sql`${timeExpr} >= ${startDate}`);
+    }
+    if (endDate !== undefined) {
+      conditions.push(sql`${timeExpr} <= ${endDate}`);
+    }
+
+    const whereClause = and(...conditions);
+
+    // Get total count
+    const countResult = await this.db
+      .select({ count: sql<number>`count(*)` })
+      .from(table)
+      .where(whereClause);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    // Get paginated messages
+    const messages = await this.db
+      .select()
+      .from(table)
+      .where(whereClause)
+      .orderBy(desc(timeExpr))
+      .limit(limit)
+      .offset(offset);
+
+    return { messages: this.normalizeBigInts(messages) as DbMessage[], total };
+  }
+
+  /**
+   * Migrate messages when channels are moved between slots.
+   * Runs all updates in a single transaction — rolls back entirely on any error.
+   *
+   * @param moves - Array of {from, to} slot pairs. Handles swaps automatically.
+   * @returns {success, totalRowsAffected} or throws on failure (transaction rolled back)
+   */
+  async migrateMessagesForChannelMoves(moves: { from: number; to: number }[]): Promise<{ success: boolean; totalRowsAffected: number }> {
+    if (moves.length === 0) return { success: true, totalRowsAffected: 0 };
+
+    const TEMP_CHANNEL = -99;
+    let totalRowsAffected = 0;
+
+    // Detect swaps: if A→B and B→A both exist
+    const swapPairs = new Set<string>();
+    for (const move of moves) {
+      const reverse = moves.find(m => m.from === move.to && m.to === move.from);
+      if (reverse) {
+        const key = [Math.min(move.from, move.to), Math.max(move.from, move.to)].join(',');
+        swapPairs.add(key);
+      }
+    }
+
+    // Build ordered SQL operations
+    const operations: { sql: any; description: string }[] = [];
+
+    // Process swaps first (need temp value to avoid conflicts)
+    const processedSwaps = new Set<string>();
+    for (const move of moves) {
+      const key = [Math.min(move.from, move.to), Math.max(move.from, move.to)].join(',');
+      if (swapPairs.has(key) && !processedSwaps.has(key)) {
+        processedSwaps.add(key);
+        const a = Math.min(move.from, move.to);
+        const b = Math.max(move.from, move.to);
+        operations.push(
+          { sql: sql`UPDATE messages SET channel = ${TEMP_CHANNEL} WHERE channel = ${a}`, description: `swap step 1: channel ${a} → temp` },
+          { sql: sql`UPDATE messages SET channel = ${a} WHERE channel = ${b}`, description: `swap step 2: channel ${b} → ${a}` },
+          { sql: sql`UPDATE messages SET channel = ${b} WHERE channel = ${TEMP_CHANNEL}`, description: `swap step 3: temp → ${b}` }
+        );
+      }
+    }
+
+    // Process simple moves (not part of a swap)
+    for (const move of moves) {
+      const key = [Math.min(move.from, move.to), Math.max(move.from, move.to)].join(',');
+      if (!swapPairs.has(key)) {
+        operations.push(
+          { sql: sql`UPDATE messages SET channel = ${move.to} WHERE channel = ${move.from}`, description: `move: channel ${move.from} → ${move.to}` }
+        );
+      }
+    }
+
+    // Execute all operations in a transaction
+    try {
+      await this.executeRun(sql`BEGIN`);
+
+      for (const op of operations) {
+        const result = await this.executeRun(op.sql);
+        const rows = this.getAffectedRows(result);
+        totalRowsAffected += rows;
+        logger.info(`📦 Message migration: ${op.description} (${rows} rows)`);
       }
 
-      // Channel filter
-      if (channels && channels.length > 0) {
-        conditions.push(inArray(table.channel, channels));
+      await this.executeRun(sql`COMMIT`);
+      logger.info(`📦 Message migration complete: ${moves.length} move(s), ${totalRowsAffected} total rows affected`);
+      return { success: true, totalRowsAffected };
+    } catch (error) {
+      logger.error('📦 Message migration failed, rolling back:', error);
+      try {
+        await this.executeRun(sql`ROLLBACK`);
+      } catch (rollbackError) {
+        logger.error('📦 Rollback also failed:', rollbackError);
       }
-
-      // From node filter
-      if (fromNodeId) {
-        conditions.push(eq(table.fromNodeId, fromNodeId));
-      }
-
-      // Date range filters
-      if (startDate !== undefined) {
-        conditions.push(sql`${timeExpr} >= ${startDate}`);
-      }
-      if (endDate !== undefined) {
-        conditions.push(sql`${timeExpr} <= ${endDate}`);
-      }
-
-      const whereClause = and(...conditions);
-
-      // Get total count
-      const countResult = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(table)
-        .where(whereClause);
-      const total = Number(countResult[0]?.count ?? 0);
-
-      // Get paginated messages
-      const messages = await db
-        .select()
-        .from(table)
-        .where(whereClause)
-        .orderBy(desc(timeExpr))
-        .limit(limit)
-        .offset(offset);
-
-      return { messages: messages as DbMessage[], total };
+      throw error;
     }
   }
 }

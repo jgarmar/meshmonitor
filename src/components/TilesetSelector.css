@@ -1,23 +1,61 @@
 .tileset-selector {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  position: relative;
 }
 
 .tileset-selector.collapsed {
   padding: 8px 12px;
 }
 
-.tileset-selector-label {
-  font-size: 14px;
+.tileset-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+}
+
+.tileset-collapse-btn {
+  background: var(--ctp-surface1);
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--ctp-text);
+  cursor: pointer;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  transition: all 0.2s ease;
+  padding: 0;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.tileset-collapse-btn:hover {
+  background: var(--ctp-surface2);
+  transform: scale(1.1);
+}
+
+.tileset-collapse-btn:active {
+  transform: scale(0.95);
+}
+
+.tileset-selector-title {
+  font-size: 0.8rem;
   font-weight: 600;
-  color: #333;
-  white-space: nowrap;
+  color: var(--ctp-mauve);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
 .tileset-buttons {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
   gap: 8px;
 }
 
@@ -26,9 +64,9 @@
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  background: white;
-  border: 2px solid #ddd;
-  border-radius: 6px;
+  background: var(--ctp-base);
+  border: 2px solid var(--ctp-surface2);
+  border-radius: var(--radius-md);
   padding: 8px;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -36,31 +74,31 @@
 }
 
 .tileset-button:hover {
-  border-color: #007bff;
+  border-color: var(--ctp-blue);
   transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0, 123, 255, 0.2);
+  box-shadow: var(--shadow-md);
 }
 
 .tileset-button.active {
-  border-color: #007bff;
-  background: #e7f3ff;
-  box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.1);
+  border-color: var(--ctp-blue);
+  background: color-mix(in srgb, var(--ctp-blue) 15%, var(--ctp-base));
+  box-shadow: var(--shadow-sm);
 }
 
 .tileset-preview {
   width: 64px;
   height: 64px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  box-shadow: var(--shadow-sm);
 }
 
 .tileset-name {
   font-size: 11px;
   font-weight: 500;
-  color: #555;
+  color: var(--ctp-subtext0);
   text-align: center;
   line-height: 1.2;
   max-width: 80px;
@@ -68,44 +106,20 @@
 }
 
 .tileset-button.active .tileset-name {
-  color: #007bff;
+  color: var(--ctp-blue);
   font-weight: 600;
 }
 
-.collapse-button {
-  background: white;
-  border: 2px solid #ddd;
-  border-radius: 6px;
-  padding: 8px 12px;
-  cursor: pointer;
-  font-size: 16px;
-  transition: all 0.2s ease;
-  color: #555;
-  min-width: 40px;
-}
-
-.collapse-button:hover {
-  border-color: #007bff;
-  color: #007bff;
-  background: #f0f8ff;
-}
-
-.expand-button {
-  background: white;
-  border: 2px solid #007bff;
-  border-radius: 6px;
-  padding: 8px 16px;
-  cursor: pointer;
-  font-size: 12px;
+.custom-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 4px;
+  background-color: var(--ctp-blue);
+  color: var(--ctp-base);
+  font-size: 9px;
   font-weight: 600;
-  transition: all 0.2s ease;
-  color: #007bff;
-  white-space: nowrap;
-}
-
-.expand-button:hover {
-  background: #007bff;
-  color: white;
+  border-radius: var(--radius-xs);
+  text-transform: uppercase;
 }
 
 /* Hide on mobile devices */
@@ -118,14 +132,11 @@
 /* Responsive adjustments for smaller desktop screens */
 @media (max-width: 1024px) {
   .tileset-selector {
-    padding: 8px 12px;
-  }
-
-  .tileset-selector-label {
-    font-size: 12px;
+    padding: 8px;
   }
 
   .tileset-buttons {
+    grid-template-columns: repeat(2, 1fr);
     gap: 6px;
   }
 
@@ -143,16 +154,4 @@
     font-size: 10px;
     max-width: 70px;
   }
-}
-
-.custom-badge {
-  display: inline-block;
-  margin-left: 4px;
-  padding: 1px 4px;
-  background-color: #007bff;
-  color: white;
-  font-size: 9px;
-  font-weight: 600;
-  border-radius: 3px;
-  text-transform: uppercase;
 }

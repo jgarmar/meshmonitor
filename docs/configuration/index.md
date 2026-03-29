@@ -74,6 +74,10 @@ MeshMonitor can be configured using environment variables. Here are the most imp
 | `MESHTASTIC_NODE_IP` | IP address of your Meshtastic node | `192.168.1.100` |
 | `MESHTASTIC_TCP_PORT` | TCP port for Meshtastic connection | `4403` |
 | `MESHTASTIC_STALE_CONNECTION_TIMEOUT` | Connection timeout in milliseconds before reconnecting if no data received | `300000` (5 minutes) |
+| `MESHTASTIC_CONNECT_TIMEOUT_MS` | Initial TCP connection timeout in milliseconds | `10000` (10 seconds) |
+| `MESHTASTIC_RECONNECT_INITIAL_DELAY_MS` | Initial delay before first reconnect attempt (base for exponential backoff) | `1000` (1 second) |
+| `MESHTASTIC_RECONNECT_MAX_DELAY_MS` | Maximum delay between reconnect attempts (backoff cap) | `60000` (60 seconds) |
+| `MESHTASTIC_MODULE_CONFIG_DELAY_MS` | Delay between consecutive module config requests to avoid overwhelming the device | `100` (100ms) |
 
 ### Virtual Node Variables
 
@@ -160,6 +164,14 @@ See the [SSO Setup guide](/configuration/sso) for detailed OIDC configuration.
 
 See the [Push Notifications guide](/features/notifications) for setup instructions and key generation.
 
+### Logging Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, `error` | `debug` in development, `info` in production |
+
+**Note**: `LOG_LEVEL` controls log output independently of `NODE_ENV`. This lets you enable debug logging in production Docker deployments without changing rate limits, cookie warnings, or other `NODE_ENV`-dependent behavior.
+
 ### System Management Variables
 
 | Variable | Description | Default |
@@ -201,9 +213,9 @@ For Kubernetes deployments, use the Helm chart values file:
 
 ```yaml
 # values.yaml
-meshmonitor:
-  nodeIp: "192.168.1.100"
-  port: 3000
+env:
+  meshtasticNodeIp: "192.168.1.100"
+  port: "3001"
 
 ingress:
   enabled: true
@@ -211,6 +223,23 @@ ingress:
   tls:
     enabled: true
 ```
+
+For environment variables not covered by the built-in chart fields (CORS, reverse proxy, database, sessions, etc.), use `extraEnv`:
+
+```yaml
+extraEnv:
+  - name: ALLOWED_ORIGINS
+    value: "https://meshmonitor.example.com"
+  - name: TRUST_PROXY
+    value: "true"
+  - name: SESSION_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: meshmonitor-secrets
+        key: session-secret
+```
+
+This accepts standard Kubernetes env var syntax, including `valueFrom` for Secrets and ConfigMaps.
 
 See the [Production Deployment guide](/configuration/production) for complete Helm configuration.
 
@@ -256,7 +285,35 @@ Always use HTTPS in production environments. See the [HTTP vs HTTPS guide](/conf
 
 ## Logging
 
-MeshMonitor logs to stdout/stderr by default. Configure log aggregation in your deployment platform:
+MeshMonitor logs to stdout/stderr by default. Log output uses level prefixes: `[DEBUG]`, `[INFO]`, `[WARN]`, `[ERROR]`.
+
+### Log Levels
+
+Control verbosity with the `LOG_LEVEL` environment variable:
+
+| Level | What is logged |
+|-------|---------------|
+| `debug` | Everything — verbose diagnostics, state changes, data inspection |
+| `info` | Informational messages, warnings, and errors |
+| `warn` | Warnings and errors only |
+| `error` | Errors only |
+
+If `LOG_LEVEL` is not set, the default depends on `NODE_ENV`:
+- `development` or `test` → `debug`
+- `production` → `info`
+
+::: tip Troubleshooting in Production
+Set `LOG_LEVEL=debug` to get verbose logging without changing `NODE_ENV`. This avoids side effects like altered rate limits or cookie warnings:
+```yaml
+environment:
+  - NODE_ENV=production
+  - LOG_LEVEL=debug
+```
+:::
+
+### Log Aggregation
+
+Configure log collection in your deployment platform:
 
 - **Docker**: Use `docker logs` or configure a logging driver
 - **Kubernetes**: Logs are available via `kubectl logs`

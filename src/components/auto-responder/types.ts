@@ -20,7 +20,9 @@ export interface AutoResponderTrigger {
   response: string; // Either text content, HTTP URL, or script path
   multiline?: boolean; // Enable multiline support for text/http responses
   verifyResponse?: boolean; // Enable retry logic (3 attempts) for this trigger (DM only)
-  channel?: number | 'dm' | 'none'; // Channel index (0-7), 'dm' for direct messages, or 'none' for scripts with no mesh output
+  channels?: Array<number | 'dm' | 'none'>; // Channel indexes (0-7), 'dm' for direct messages, or 'none' for scripts with no mesh output
+  /** @deprecated Use channels instead. Kept for backward compatibility during migration. */
+  channel?: number | 'dm' | 'none';
   scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
 }
 
@@ -69,6 +71,7 @@ export interface GeofenceTrigger {
   shape: GeofenceShape;
   event: GeofenceEvent;
   whileInsideIntervalMinutes?: number; // Required when event is 'while_inside'
+  cooldownMinutes?: number; // Minimum time between triggers per node (0 = no cooldown)
   nodeFilter: GeofenceNodeFilter;
   responseType: GeofenceResponseType;
   response?: string; // Text message with expansion tokens (when responseType is 'text')
@@ -101,7 +104,7 @@ export interface TriggerItemProps {
   baseUrl: string;
   onStartEdit: () => void;
   onCancelEdit: () => void;
-  onSaveEdit: (trigger: string | string[], responseType: ResponseType, response: string, multiline: boolean, verifyResponse: boolean, channel: number | 'dm' | 'none', scriptArgs?: string) => void;
+  onSaveEdit: (trigger: string | string[], responseType: ResponseType, response: string, multiline: boolean, verifyResponse: boolean, channels: Array<number | 'dm' | 'none'>, scriptArgs?: string) => void;
   onRemove: () => void;
   showToast?: (message: string, type: 'success' | 'error' | 'warning') => void;
 }

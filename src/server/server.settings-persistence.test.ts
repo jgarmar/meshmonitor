@@ -29,19 +29,21 @@ const settingsStore: Record<string, string> = {};
 vi.mock('../services/database.js', () => ({
   default: {
     drizzleDbType: 'sqlite',
-    getAllSettings: vi.fn(() => ({ ...settingsStore })),
-    setSettings: vi.fn((settings: Record<string, string>) => {
-      Object.assign(settingsStore, settings);
-    }),
-    setSetting: vi.fn((key: string, value: string) => {
-      settingsStore[key] = value;
-    }),
-    getSetting: vi.fn((key: string) => settingsStore[key] ?? null),
-    deleteAllSettings: vi.fn(() => {
-      Object.keys(settingsStore).forEach((k) => delete settingsStore[k]);
-    }),
+    settings: {
+      getAllSettings: vi.fn(async () => ({ ...settingsStore })),
+      setSettings: vi.fn(async (settings: Record<string, string>) => {
+        Object.assign(settingsStore, settings);
+      }),
+      setSetting: vi.fn(async (key: string, value: string) => {
+        settingsStore[key] = value;
+      }),
+      getSetting: vi.fn(async (key: string) => settingsStore[key] ?? null),
+      deleteAllSettings: vi.fn(async () => {
+        Object.keys(settingsStore).forEach((k) => delete settingsStore[k]);
+      }),
+    },
     handleAutoWelcomeEnabled: vi.fn(() => 0),
-    auditLog: vi.fn(),
+    auditLogAsync: vi.fn(),
     // Async methods required by authMiddleware
     findUserByIdAsync: vi.fn(),
     findUserByUsernameAsync: vi.fn(),
@@ -54,12 +56,14 @@ vi.mock('../services/database.js', () => ({
 import databaseService from '../services/database.js';
 
 const mockDb = databaseService as unknown as {
-  getAllSettings: ReturnType<typeof vi.fn>;
-  setSettings: ReturnType<typeof vi.fn>;
-  setSetting: ReturnType<typeof vi.fn>;
-  getSetting: ReturnType<typeof vi.fn>;
-  deleteAllSettings: ReturnType<typeof vi.fn>;
-  auditLog: ReturnType<typeof vi.fn>;
+  settings: {
+    getAllSettings: ReturnType<typeof vi.fn>;
+    setSettings: ReturnType<typeof vi.fn>;
+    setSetting: ReturnType<typeof vi.fn>;
+    getSetting: ReturnType<typeof vi.fn>;
+    deleteAllSettings: ReturnType<typeof vi.fn>;
+  };
+  auditLogAsync: ReturnType<typeof vi.fn>;
   findUserByIdAsync: ReturnType<typeof vi.fn>;
   findUserByUsernameAsync: ReturnType<typeof vi.fn>;
   checkPermissionAsync: ReturnType<typeof vi.fn>;
@@ -122,6 +126,7 @@ function validTestValue(key: string, suffix = ''): string {
   const VALID_VALUES: Record<string, string> = {
     autoAckRegex: 'hello',
     autoAckChannels: '0,1',
+    autoAckIgnoredNodes: '!b29fa8d4,!a1b2c3d4',
     inactiveNodeThresholdHours: '24',
     inactiveNodeCheckIntervalMinutes: '60',
     inactiveNodeCooldownHours: '24',
@@ -156,6 +161,10 @@ function validTestValue(key: string, suffix = ''): string {
     dashboardWidgets: JSON.stringify([]),
     autoAnnounceSchedule: JSON.stringify({ start: '08:00', end: '18:00' }),
     autoAnnounceNodeInfoChannels: '0',
+    autoDeleteByDistanceIntervalHours: '24',
+    autoDeleteByDistanceThresholdKm: '100',
+    autoDeleteByDistanceLat: '40.7128',
+    autoDeleteByDistanceLon: '-74.006',
   };
 
   if (key in VALID_VALUES) {
@@ -397,6 +406,8 @@ describe('Settings Persistence', () => {
         'homoglyphEnabled',
         // Local stats interval — backend reads directly
         'localStatsIntervalMinutes',
+        // Analytics — backend injects into HTML, frontend doesn't need them
+        'analyticsProvider', 'analyticsConfig',
       ];
 
       const keysNotLoaded = SETTINGS_TAB_SENDS.filter(

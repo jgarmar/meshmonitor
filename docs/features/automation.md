@@ -890,9 +890,22 @@ Scripts must:
 All scripts receive these environment variables:
 - `MESSAGE`: Full message text received
 - `FROM_NODE`: Sender's node number
+- `NODE_ID`: Sender's node ID (hex format, e.g., `!a2e4ff4c`)
+- `LONG_NAME` / `SHORT_NAME`: Sender's node names
+- `HOPS`: Number of hops the message traveled
+- `SNR` / `RSSI`: Signal quality of received packet
+- `CHANNEL`: Channel number the message was received on
+- `VERSION`: Sender's firmware version
+- `NODECOUNT`: Number of active nodes on the mesh
+- `VIA_MQTT`: Whether message arrived via MQTT bridge
+- `IS_DIRECT`: Whether the message is a direct message
+- `MESHTASTIC_IP` / `MESHTASTIC_PORT`: Connected node address
 - `PACKET_ID`: Message packet ID
 - `TRIGGER`: The trigger pattern that matched
 - `PARAM_*`: Extracted parameters (e.g., `PARAM_location`, `PARAM_name`)
+- `MSG_*`: All message fields as individual variables
+
+See the [Auto Responder Scripting Guide](/developers/auto-responder-scripting#environment-variables) for the complete list.
 
 **JSON Output Format**:
 
@@ -1744,6 +1757,70 @@ The log refreshes automatically every 30 seconds.
 
 - [Duplicate Encryption Keys](/security-duplicate-keys) - Understanding key mismatches and how to fix them manually
 - [Security](/features/security) - Learn about node security and encryption
+
+## Auto Favorite {#auto-favorite}
+
+Automatically favorite nodes that are actively communicating with your mesh, ensuring important nodes are always pinned to the top of your node list without manual intervention.
+
+### How It Works
+
+When enabled, MeshMonitor monitors incoming NodeInfo packets and automatically favorites nodes that meet eligibility criteria based on your local node's role. A periodic sweep runs every 60 minutes to unfavorite stale nodes that haven't been heard from within the configured staleness window.
+
+### Manual vs Auto Favorites
+
+MeshMonitor distinguishes between **manual** and **auto-managed** favorites using a lock mechanism:
+
+| Action | Favorite | Locked | Meaning |
+|--------|----------|--------|---------|
+| Manual favorite (click star) | Yes | Yes | Protected from automation |
+| Manual unfavorite (click star) | No | Yes | Won't be re-auto-favorited |
+| Auto-favorite (automation) | Yes | No | Can be swept when stale |
+| Auto-sweep unfavorite | No | No | Available for re-auto-favorite |
+
+**Key behavior:**
+- Automation **never** changes manually locked favorites
+- The lock icon (🔒/🔓) appears as a small subscript on the favorite star
+- Click the lock to promote an auto-favorite to manual (locked), or release a manual favorite to automation (unlocked)
+
+### Configuration
+
+Navigate to **Settings > Automation** and find the **Auto Favorite** section.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Enable Auto Favorite | Toggle the feature on/off | Off |
+| Stale Hours | Hours since last heard before a node is considered stale and unfavorited | 24 |
+
+### Eligibility Rules
+
+Which nodes are auto-favorited depends on your local node's role:
+
+| Local Node Role | Eligible Nodes |
+|----------------|----------------|
+| Client / Client_Mute | Direct neighbors only (hopsAway = 1) |
+| Router / Router_Client | All heard nodes (any hop count) |
+| Repeater | All heard nodes (any hop count) |
+
+Nodes must also:
+- Have a valid `longName` (not unknown/unnamed)
+- Not be the local node itself
+- Not have `favoriteLocked = true` (manually managed)
+
+### Permissions
+
+- Viewing auto-favorite status requires `settings:read` permission
+- Modifying auto-favorite settings requires `settings:write` permission
+- Toggling favorite lock requires `nodes:write` permission
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Manually favorited node was unfavorited | Check if the lock icon shows unlocked — click it to lock |
+| Node keeps getting re-favorited after manual unfavorite | Should not happen — manual unfavorite sets lock. Check if another user unlocked it |
+| Auto-favorite not triggering | Verify feature is enabled and node meets eligibility criteria for your role |
+
+---
 
 ## Ignored Nodes {#ignored-nodes}
 

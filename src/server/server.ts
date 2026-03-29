@@ -32,14 +32,18 @@ import { databaseMaintenanceService } from './services/databaseMaintenanceServic
 import { systemBackupService } from './services/systemBackupService.js';
 import { systemRestoreService } from './services/systemRestoreService.js';
 import { duplicateKeySchedulerService } from './services/duplicateKeySchedulerService.js';
+import { securityDigestService } from './services/securityDigestService.js';
 import { solarMonitoringService } from './services/solarMonitoringService.js';
 import { newsService } from './services/newsService.js';
 import { inactiveNodeNotificationService } from './services/inactiveNodeNotificationService.js';
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
-import { getUserNotificationPreferencesAsync, saveUserNotificationPreferencesAsync, applyNodeNamePrefix } from './utils/notificationFiltering.js';
+import { autoDeleteByDistanceService } from './services/autoDeleteByDistanceService.js';
+import { getUserNotificationPreferencesAsync, saveUserNotificationPreferencesAsync, applyNodeNamePrefixAsync } from './utils/notificationFiltering.js';
 import { upgradeService } from './services/upgradeService.js';
 import { enhanceNodeForClient, filterNodesByChannelPermission, checkNodeChannelAccess } from './utils/nodeEnhancer.js';
 import { dynamicCspMiddleware, refreshTileHostnameCache } from './middleware/dynamicCsp.js';
+import { generateAnalyticsScript, AnalyticsProvider } from './utils/analyticsScriptGenerator.js';
+import { migrateAutomationChannels } from './utils/automationChannelMigration.js';
 import { PortNum } from './constants/meshtastic.js';
 import settingsRoutes, { setSettingsCallbacks } from './routes/settingsRoutes.js';
 
@@ -168,6 +172,9 @@ const helmetConfig =
         },
         noSniff: true,
         xssFilter: true,
+        // Send origin as Referer for cross-origin requests (e.g. map tile fetches).
+        // Helmet defaults to no-referrer which violates OSM tile usage policy.
+        referrerPolicy: { policy: 'strict-origin-when-cross-origin' as const },
       }
     : {
         // Development or HTTP-only: no HSTS
@@ -179,6 +186,7 @@ const helmetConfig =
         },
         noSniff: true,
         xssFilter: true,
+        referrerPolicy: { policy: 'strict-origin-when-cross-origin' as const },
       };
 
 app.use(helmet(helmetConfig));
@@ -201,8 +209,34 @@ let embedOriginsCache: string[] = [];
 let embedOriginsCacheTime = 0;
 const EMBED_ORIGINS_CACHE_TTL = 60000;
 
+/** Convert protobuf bytes (Uint8Array, Buffer, byte array, or object) to base64 string */
+function bytesToBase64(key: any): string {
+  if (key instanceof Uint8Array || Buffer.isBuffer(key)) {
+    return Buffer.from(key).toString('base64');
+  }
+  if (key && typeof key === 'object' && key.type === 'Buffer' && Array.isArray(key.data)) {
+    return Buffer.from(key.data).toString('base64');
+  }
+  if (Array.isArray(key)) {
+    return Buffer.from(key).toString('base64');
+  }
+  if (typeof key === 'string') {
+    return key;
+  }
+  // Handle generic iterables/objects with byte data (e.g., protobuf Bytes wrappers)
+  if (key && typeof key === 'object') {
+    try {
+      return Buffer.from(Object.values(key) as number[]).toString('base64');
+    } catch {
+      // fall through
+    }
+  }
+  logger.warn('Unknown admin key format:', typeof key, key);
+  return '';
+}
+
 function refreshEmbedOriginsCache(): void {
-  databaseService.getEmbedProfilesAsync().then(profiles => {
+  databaseService.embedProfiles.getAllAsync().then(profiles => {
     embedOriginsCache = [...new Set(
       profiles.filter(p => p.enabled).flatMap(p => p.allowedOrigins)
     )];
@@ -359,7 +393,7 @@ systemRestoreService.markRestoreStarted();
         }
 
         // Audit log to mark restore completion point (after migrations)
-        databaseService.auditLog(
+        databaseService.auditLogAsync(
           null, // System action during bootstrap
           'system_restore_bootstrap_complete',
           'system_backup',
@@ -398,7 +432,7 @@ setTimeout(async () => {
     await databaseService.waitForReady();
 
     // Load saved traceroute interval from database before connecting
-    const savedInterval = databaseService.getSetting('tracerouteIntervalMinutes');
+    const savedInterval = await databaseService.settings.getSetting('tracerouteIntervalMinutes');
     if (savedInterval !== null) {
       const intervalMinutes = parseInt(savedInterval);
       if (!isNaN(intervalMinutes) && intervalMinutes >= 0 && intervalMinutes <= 60) {
@@ -410,21 +444,23 @@ setTimeout(async () => {
     }
 
     // Load auto key repair settings
-    const keyRepairEnabled = databaseService.getSetting('autoKeyManagementEnabled');
-    const keyRepairInterval = databaseService.getSetting('autoKeyManagementIntervalMinutes');
-    const keyRepairMaxExchanges = databaseService.getSetting('autoKeyManagementMaxExchanges');
-    const keyRepairAutoPurge = databaseService.getSetting('autoKeyManagementAutoPurge');
+    const keyRepairEnabled = await databaseService.settings.getSetting('autoKeyManagementEnabled');
+    const keyRepairInterval = await databaseService.settings.getSetting('autoKeyManagementIntervalMinutes');
+    const keyRepairMaxExchanges = await databaseService.settings.getSetting('autoKeyManagementMaxExchanges');
+    const keyRepairAutoPurge = await databaseService.settings.getSetting('autoKeyManagementAutoPurge');
+    const keyRepairImmediatePurge = await databaseService.settings.getSetting('autoKeyManagementImmediatePurge');
 
     meshtasticManager.setKeyRepairSettings({
       enabled: keyRepairEnabled === 'true',
       intervalMinutes: keyRepairInterval ? parseInt(keyRepairInterval) : 5,
       maxExchanges: keyRepairMaxExchanges ? parseInt(keyRepairMaxExchanges) : 3,
-      autoPurge: keyRepairAutoPurge === 'true'
+      autoPurge: keyRepairAutoPurge === 'true',
+      immediatePurge: keyRepairImmediatePurge === 'true'
     });
     logger.debug('✅ Loaded auto key repair settings');
 
     // Load remote admin scanner interval
-    const remoteAdminScannerInterval = databaseService.getSetting('remoteAdminScannerIntervalMinutes');
+    const remoteAdminScannerInterval = await databaseService.settings.getSetting('remoteAdminScannerIntervalMinutes');
     if (remoteAdminScannerInterval !== null) {
       const intervalMinutes = parseInt(remoteAdminScannerInterval);
       if (!isNaN(intervalMinutes) && intervalMinutes >= 0 && intervalMinutes <= 60) {
@@ -436,7 +472,7 @@ setTimeout(async () => {
     }
 
     // Load LocalStats collection interval
-    const localStatsInterval = databaseService.getSetting('localStatsIntervalMinutes');
+    const localStatsInterval = await databaseService.settings.getSetting('localStatsIntervalMinutes');
     if (localStatsInterval !== null) {
       const intervalMinutes = parseInt(localStatsInterval);
       if (!isNaN(intervalMinutes) && intervalMinutes >= 0 && intervalMinutes <= 60) {
@@ -454,8 +490,8 @@ setTimeout(async () => {
 
     // Clear any runtime IP/port overrides from previous sessions
     // These are temporary settings that should reset on container restart
-    await databaseService.setSettingAsync('meshtasticNodeIpOverride', '');
-    await databaseService.setSettingAsync('meshtasticTcpPortOverride', '');
+    await databaseService.settings.setSetting('meshtasticNodeIpOverride', '');
+    await databaseService.settings.setSetting('meshtasticTcpPortOverride', '');
 
     await meshtasticManager.connect();
     logger.debug('Meshtastic manager connected successfully');
@@ -467,6 +503,10 @@ setTimeout(async () => {
     // Initialize duplicate key scanner
     duplicateKeySchedulerService.start();
     logger.debug('Duplicate key scanner initialized');
+
+    // Initialize security digest scheduler
+    securityDigestService.initialize(databaseService);
+    logger.debug('Security digest service initialized');
 
     // Initialize solar monitoring service
     solarMonitoringService.initialize();
@@ -481,12 +521,12 @@ setTimeout(async () => {
     logger.debug('Database maintenance service initialized');
 
     // Start inactive node notification service with validation
-    const inactiveThresholdHoursRaw = parseInt(databaseService.getSetting('inactiveNodeThresholdHours') || '24', 10);
+    const inactiveThresholdHoursRaw = parseInt(await databaseService.settings.getSetting('inactiveNodeThresholdHours') || '24', 10);
     const inactiveCheckIntervalMinutesRaw = parseInt(
-      databaseService.getSetting('inactiveNodeCheckIntervalMinutes') || '60',
+      await databaseService.settings.getSetting('inactiveNodeCheckIntervalMinutes') || '60',
       10
     );
-    const inactiveCooldownHoursRaw = parseInt(databaseService.getSetting('inactiveNodeCooldownHours') || '24', 10);
+    const inactiveCooldownHoursRaw = parseInt(await databaseService.settings.getSetting('inactiveNodeCooldownHours') || '24', 10);
 
     // Validate and use defaults if invalid values are found in database
     const inactiveThresholdHours =
@@ -518,6 +558,13 @@ setTimeout(async () => {
     inactiveNodeNotificationService.start(inactiveThresholdHours, inactiveCheckIntervalMinutes, inactiveCooldownHours);
     logger.info('✅ Inactive node notification service started');
 
+    // Start auto-delete-by-distance service if enabled
+    const autoDeleteByDistanceEnabled = await databaseService.settings.getSetting('autoDeleteByDistanceEnabled');
+    if (autoDeleteByDistanceEnabled === 'true') {
+      const intervalHours = parseInt(await databaseService.settings.getSetting('autoDeleteByDistanceIntervalHours') || '24', 10);
+      autoDeleteByDistanceService.start(intervalHours);
+    }
+
     // Note: Virtual node server initialization has been moved to a callback
     // that triggers when config capture completes (see registerConfigCaptureCompleteCallback above)
   } catch (error) {
@@ -530,12 +577,12 @@ setTimeout(async () => {
 // Schedule hourly telemetry purge to keep database performant
 // Keep telemetry for 7 days (168 hours) by default
 const TELEMETRY_RETENTION_HOURS = 168; // 7 days
-setInterval(() => {
+setInterval(async () => {
   try {
     // Get favorite telemetry storage days from settings (defaults to 7 if not set)
-    const favoriteDaysStr = databaseService.getSetting('favoriteTelemetryStorageDays');
+    const favoriteDaysStr = await databaseService.settings.getSetting('favoriteTelemetryStorageDays');
     const favoriteDays = favoriteDaysStr ? parseInt(favoriteDaysStr) : 7;
-    const purgedCount = databaseService.purgeOldTelemetry(TELEMETRY_RETENTION_HOURS, favoriteDays);
+    const purgedCount = await databaseService.purgeOldTelemetryAsync(TELEMETRY_RETENTION_HOURS, favoriteDays);
     if (purgedCount > 0) {
       logger.debug(`⏰ Hourly telemetry purge completed: removed ${purgedCount} records`);
     }
@@ -545,12 +592,12 @@ setInterval(() => {
 }, 60 * 60 * 1000); // Run every hour
 
 // Run initial purge on startup
-setTimeout(() => {
+setTimeout(async () => {
   try {
     // Get favorite telemetry storage days from settings (defaults to 7 if not set)
-    const favoriteDaysStr = databaseService.getSetting('favoriteTelemetryStorageDays');
+    const favoriteDaysStr = await databaseService.settings.getSetting('favoriteTelemetryStorageDays');
     const favoriteDays = favoriteDaysStr ? parseInt(favoriteDaysStr) : 7;
-    databaseService.purgeOldTelemetry(TELEMETRY_RETENTION_HOURS, favoriteDays);
+    await databaseService.purgeOldTelemetryAsync(TELEMETRY_RETENTION_HOURS, favoriteDays);
   } catch (error) {
     logger.error('Error during initial telemetry purge:', error);
   }
@@ -575,7 +622,7 @@ async function checkForAutoUpgrade(): Promise<void> {
   }
 
   // Skip if autoUpgradeImmediate is not enabled
-  const autoUpgradeImmediate = databaseService.getSetting('autoUpgradeImmediate') === 'true';
+  const autoUpgradeImmediate = await databaseService.settings.getSetting('autoUpgradeImmediate') === 'true';
   if (!autoUpgradeImmediate) {
     return;
   }
@@ -632,7 +679,7 @@ async function checkForAutoUpgrade(): Promise<void> {
 
     if (upgradeResult.success) {
       logger.info(`✅ Scheduled auto-upgrade triggered successfully: ${upgradeResult.upgradeId}`);
-      databaseService.auditLog(
+      databaseService.auditLogAsync(
         null,
         'auto_upgrade_triggered',
         'system',
@@ -689,6 +736,8 @@ import meshcoreRoutes from './routes/meshcoreRoutes.js';
 import embedProfileRoutes from './routes/embedProfileRoutes.js';
 import { createEmbedCspMiddleware } from './middleware/embedMiddleware.js';
 import embedPublicRoutes from './routes/embedPublicRoutes.js';
+import firmwareUpdateRoutes from './routes/firmwareUpdateRoutes.js';
+import { firmwareUpdateService } from './services/firmwareUpdateService.js';
 
 // CSRF token endpoint (must be before CSRF protection middleware)
 apiRouter.get('/csrf-token', csrfTokenEndpoint);
@@ -700,6 +749,7 @@ apiRouter.get('/health', (_req, res) => {
     version: packageJson.version,
     uptime: Date.now() - serverStartTime,
     databaseType: databaseService.drizzleDbType,
+    firmwareOtaEnabled: process.env.IS_DESKTOP !== 'true',
   });
 });
 
@@ -788,6 +838,9 @@ apiRouter.use('/settings', settingsRoutes);
 // Embed profile admin routes (admin only)
 apiRouter.use('/embed-profiles', embedProfileRoutes);
 
+// Firmware OTA update routes (admin only)
+apiRouter.use('/firmware', firmwareUpdateRoutes);
+
 // Wire up side-effect callbacks for settingsRoutes
 setSettingsCallbacks({
   refreshTileHostnameCache,
@@ -801,7 +854,11 @@ setSettingsCallbacks({
   restartAnnounceScheduler: () => meshtasticManager.restartAnnounceScheduler(),
   restartTimerScheduler: () => meshtasticManager.restartTimerScheduler(),
   restartGeofenceEngine: () => meshtasticManager.restartGeofenceEngine(),
-  handleAutoWelcomeEnabled: () => databaseService.handleAutoWelcomeEnabled(),
+  handleAutoWelcomeEnabled: () => { databaseService.handleAutoWelcomeEnabledAsync().catch(() => {}); return 0; },
+  invalidateHtmlCache,
+  restartAutoDeleteByDistanceService: (intervalHours: number) =>
+    autoDeleteByDistanceService.start(intervalHours),
+  stopAutoDeleteByDistanceService: () => autoDeleteByDistanceService.stop(),
 });
 
 // API Routes
@@ -811,8 +868,8 @@ setSettingsCallbacks({
  */
 apiRouter.get('/nodes', optionalAuth(), async (req, res) => {
   try {
-    const allNodes = meshtasticManager.getAllNodes();
-    const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
+    const allNodes = await meshtasticManager.getAllNodesAsync();
+    const estimatedPositions = await databaseService.getAllNodesEstimatedPositionsAsync();
 
     // Filter nodes based on channel read permissions
     const filteredNodes = await filterNodesByChannelPermission(allNodes, (req as any).user);
@@ -827,7 +884,7 @@ apiRouter.get('/nodes', optionalAuth(), async (req, res) => {
 apiRouter.get('/nodes/active', optionalAuth(), async (req, res) => {
   try {
     const days = parseInt(req.query.days as string) || 7;
-    const allDbNodes = databaseService.getActiveNodes(days);
+    const allDbNodes = await databaseService.nodes.getActiveNodes(days);
 
     // Filter nodes based on channel read permissions
     const dbNodes = await filterNodesByChannelPermission(allDbNodes, (req as any).user);
@@ -881,7 +938,7 @@ apiRouter.get('/nodes/:nodeId/position-history', optionalAuth(), async (req, res
 
     // Check privacy for position history
     const nodeNum = parseInt(nodeId.replace('!', ''), 16);
-    const node = databaseService.getNode(nodeNum);
+    const node = await databaseService.nodes.getNode(nodeNum);
     const isPrivate = node?.positionOverrideIsPrivate === true;
     const canViewPrivate = !!req.user && await hasPermission(req.user, 'nodes_private', 'read');
     if (isPrivate && !canViewPrivate) {
@@ -1024,16 +1081,16 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
 
     const nodeNum = parseInt(nodeNumStr, 16);
 
-    // Update favorite status in database
-    databaseService.setNodeFavorite(nodeNum, isFavorite);
+    // Update favorite status in database — manual action always locks
+    await databaseService.nodes.setNodeFavorite(nodeNum, isFavorite, true);
 
     // If manually unfavoriting, remove from auto-favorite tracking list
     if (!isFavorite) {
-      const autoFavoriteNodesJson = databaseService.getSetting('autoFavoriteNodes') || '[]';
+      const autoFavoriteNodesJson = await databaseService.settings.getSetting('autoFavoriteNodes') || '[]';
       const autoFavoriteNodes: number[] = JSON.parse(autoFavoriteNodesJson);
       if (autoFavoriteNodes.includes(nodeNum)) {
         const updated = autoFavoriteNodes.filter(n => n !== nodeNum);
-        databaseService.setSetting('autoFavoriteNodes', JSON.stringify(updated));
+        await databaseService.settings.setSetting('autoFavoriteNodes', JSON.stringify(updated));
       }
     }
 
@@ -1042,7 +1099,7 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
     if (virtualNodeServer) {
       try {
         // Fetch the updated node from database
-        const node = databaseService.getNode(nodeNum);
+        const node = await databaseService.nodes.getNode(nodeNum);
         if (node) {
           // Create NodeInfo message with updated favorite status
           const nodeInfoMessage = await meshtasticProtobufService.createNodeInfo({
@@ -1052,8 +1109,8 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
               longName: node.longName || 'Unknown',
               shortName: node.shortName || '????',
               hwModel: node.hwModel || 0,
-              role: node.role,
-              publicKey: node.publicKey,
+              role: node.role ?? undefined,
+              publicKey: node.publicKey ?? undefined,
             },
             position:
               node.latitude && node.longitude
@@ -1065,20 +1122,20 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
                   }
                 : undefined,
             deviceMetrics:
-              node.batteryLevel !== undefined ||
-              node.voltage !== undefined ||
-              node.channelUtilization !== undefined ||
-              node.airUtilTx !== undefined
+              node.batteryLevel != null ||
+              node.voltage != null ||
+              node.channelUtilization != null ||
+              node.airUtilTx != null
                 ? {
-                    batteryLevel: node.batteryLevel,
-                    voltage: node.voltage,
-                    channelUtilization: node.channelUtilization,
-                    airUtilTx: node.airUtilTx,
+                    batteryLevel: node.batteryLevel ?? undefined,
+                    voltage: node.voltage ?? undefined,
+                    channelUtilization: node.channelUtilization ?? undefined,
+                    airUtilTx: node.airUtilTx ?? undefined,
                   }
                 : undefined,
-            snr: node.snr,
-            lastHeard: node.lastHeard,
-            hopsAway: node.hopsAway,
+            snr: node.snr ?? undefined,
+            lastHeard: node.lastHeard ?? undefined,
+            hopsAway: node.hopsAway ?? undefined,
             isFavorite: isFavorite,
           });
 
@@ -1143,22 +1200,87 @@ apiRouter.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write'), a
   }
 });
 
-// Get auto-favorite status (local role, firmware, managed nodes)
-apiRouter.get('/auto-favorite/status', requirePermission('nodes', 'read'), (_req, res) => {
+// Toggle favorite lock status (lock/unlock a node from auto-favorite automation)
+apiRouter.post('/nodes/:nodeId/favorite-lock', requirePermission('nodes', 'write'), async (req, res) => {
   try {
-    const localNodeNum = databaseService.getSetting('localNodeNum');
+    const { nodeId } = req.params;
+    const { locked } = req.body;
+
+    if (typeof locked !== 'boolean') {
+      const errorResponse: ApiErrorResponse = {
+        error: 'locked must be a boolean',
+        code: 'INVALID_PARAMETER_TYPE',
+        details: 'Expected boolean value for locked parameter',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    // Convert nodeId (hex string like !a1b2c3d4) to nodeNum (integer)
+    const nodeNumStr = nodeId.replace('!', '');
+
+    if (!/^[0-9a-fA-F]{8}$/.test(nodeNumStr)) {
+      const errorResponse: ApiErrorResponse = {
+        error: 'Invalid nodeId format',
+        code: 'INVALID_NODE_ID',
+        details: 'nodeId must be in format !XXXXXXXX (8 hex characters)',
+      };
+      res.status(400).json(errorResponse);
+      return;
+    }
+
+    const nodeNum = parseInt(nodeNumStr, 16);
+
+    await databaseService.nodes.setNodeFavoriteLocked(nodeNum, locked);
+
+    // If unlocking, also add to auto-favorite tracking list if node is currently favorited
+    // so that automation can manage it going forward
+    if (!locked) {
+      const node = await databaseService.nodes.getNode(nodeNum);
+      if (node?.isFavorite) {
+        const autoFavoriteNodesJson = await databaseService.settings.getSetting('autoFavoriteNodes') || '[]';
+        const autoFavoriteNodes: number[] = JSON.parse(autoFavoriteNodesJson);
+        if (!autoFavoriteNodes.includes(nodeNum)) {
+          autoFavoriteNodes.push(nodeNum);
+          await databaseService.settings.setSetting('autoFavoriteNodes', JSON.stringify(autoFavoriteNodes));
+        }
+      }
+    }
+
+    logger.info(`${locked ? '🔒' : '🔓'} Node ${nodeNum} favorite lock set to: ${locked}`);
+
+    res.json({
+      success: true,
+      nodeNum,
+      locked,
+    });
+  } catch (error) {
+    logger.error('Error setting node favorite lock:', error);
+    const errorResponse: ApiErrorResponse = {
+      error: 'Failed to set node favorite lock',
+      code: 'INTERNAL_ERROR',
+      details: error instanceof Error ? error.message : 'Unknown error occurred',
+    };
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Get auto-favorite status (local role, firmware, managed nodes)
+apiRouter.get('/auto-favorite/status', requirePermission('nodes', 'read'), async (_req, res) => {
+  try {
+    const localNodeNum = await databaseService.settings.getSetting('localNodeNum');
     const localNodeNumInt = localNodeNum ? parseInt(localNodeNum) : meshtasticManager.getLocalNodeInfo()?.nodeNum;
-    const localNode = localNodeNumInt ? databaseService.getNode(localNodeNumInt) : null;
+    const localNode = localNodeNumInt ? await databaseService.nodes.getNode(localNodeNumInt) : null;
     const firmwareVersion = meshtasticManager.getLocalNodeInfo()?.firmwareVersion || null;
     const supportsFavorites = meshtasticManager.supportsFavorites();
 
-    const autoFavoriteNodesJson = databaseService.getSetting('autoFavoriteNodes') || '[]';
+    const autoFavoriteNodesJson = await databaseService.settings.getSetting('autoFavoriteNodes') || '[]';
     const autoFavoriteNodeNums: number[] = JSON.parse(autoFavoriteNodesJson);
 
     // Get node details for each auto-favorited node
-    const autoFavoriteNodes = autoFavoriteNodeNums
-      .map(nodeNum => {
-        const node = databaseService.getNode(nodeNum);
+    const autoFavoriteNodes = (await Promise.all(autoFavoriteNodeNums
+      .map(async nodeNum => {
+        const node = await databaseService.nodes.getNode(nodeNum);
         if (!node) return null;
         return {
           nodeNum: node.nodeNum,
@@ -1168,8 +1290,9 @@ apiRouter.get('/auto-favorite/status', requirePermission('nodes', 'read'), (_req
           role: node.role,
           hopsAway: node.hopsAway,
           lastHeard: node.lastHeard,
+          favoriteLocked: Boolean(node.favoriteLocked),
         };
-      })
+      })))
       .filter(Boolean);
 
     res.json({
@@ -1222,14 +1345,14 @@ apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), as
     const nodeNum = parseInt(nodeNumStr, 16);
 
     // Update ignored status in database
-    databaseService.setNodeIgnored(nodeNum, isIgnored);
+    await databaseService.setNodeIgnoredAsync(nodeNum, isIgnored);
 
     // Broadcast updated NodeInfo to virtual node clients
     const virtualNodeServer = (global as any).virtualNodeServer;
     if (virtualNodeServer) {
       try {
         // Fetch the updated node from database
-        const node = databaseService.getNode(nodeNum);
+        const node = await databaseService.nodes.getNode(nodeNum);
         if (node) {
           // Create NodeInfo message with updated ignored status
           const nodeInfoMessage = await meshtasticProtobufService.createNodeInfo({
@@ -1239,8 +1362,8 @@ apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), as
               longName: node.longName || 'Unknown',
               shortName: node.shortName || '????',
               hwModel: node.hwModel || 0,
-              role: node.role,
-              publicKey: node.publicKey,
+              role: node.role ?? undefined,
+              publicKey: node.publicKey ?? undefined,
             },
             position:
               node.latitude && node.longitude
@@ -1252,20 +1375,20 @@ apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), as
                   }
                 : undefined,
             deviceMetrics:
-              node.batteryLevel !== undefined ||
-              node.voltage !== undefined ||
-              node.channelUtilization !== undefined ||
-              node.airUtilTx !== undefined
+              node.batteryLevel != null ||
+              node.voltage != null ||
+              node.channelUtilization != null ||
+              node.airUtilTx != null
                 ? {
-                    batteryLevel: node.batteryLevel,
-                    voltage: node.voltage,
-                    channelUtilization: node.channelUtilization,
-                    airUtilTx: node.airUtilTx,
+                    batteryLevel: node.batteryLevel ?? undefined,
+                    voltage: node.voltage ?? undefined,
+                    channelUtilization: node.channelUtilization ?? undefined,
+                    airUtilTx: node.airUtilTx ?? undefined,
                   }
                 : undefined,
-            snr: node.snr,
-            lastHeard: node.lastHeard,
-            hopsAway: node.hopsAway,
+            snr: node.snr ?? undefined,
+            lastHeard: node.lastHeard ?? undefined,
+            hopsAway: node.hopsAway ?? undefined,
             isIgnored: isIgnored,
           });
 
@@ -1333,7 +1456,7 @@ apiRouter.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write'), as
 // Get persistent ignored nodes list
 apiRouter.get('/ignored-nodes', requirePermission('nodes', 'read'), async (_req, res) => {
   try {
-    const ignoredNodes = await databaseService.getIgnoredNodesAsync();
+    const ignoredNodes = await databaseService.ignoredNodes.getIgnoredNodesAsync();
     res.json(ignoredNodes);
   } catch (error) {
     logger.error('Error fetching ignored nodes:', error);
@@ -1368,11 +1491,11 @@ apiRouter.delete('/ignored-nodes/:nodeId', requirePermission('nodes', 'write'), 
     const nodeNum = parseInt(nodeNumStr, 16);
 
     // Remove from persistent ignore list
-    await databaseService.removeIgnoredNodeAsync(nodeNum);
+    await databaseService.ignoredNodes.removeIgnoredNodeAsync(nodeNum);
 
     // Also un-ignore the node record if it still exists
     try {
-      databaseService.setNodeIgnored(nodeNum, false);
+      await databaseService.setNodeIgnoredAsync(nodeNum, false);
     } catch {
       // Node may not exist in nodes table - that's OK
     }
@@ -1414,7 +1537,7 @@ apiRouter.get('/nodes/:nodeId/position-override', optionalAuth(), async (req, re
     }
 
     const nodeNum = parseInt(nodeNumStr, 16);
-    const override = databaseService.getNodePositionOverride(nodeNum);
+    const override = await databaseService.getNodePositionOverrideAsync(nodeNum);
 
     if (!override) {
       const errorResponse: ApiErrorResponse = {
@@ -1450,7 +1573,7 @@ apiRouter.get('/nodes/:nodeId/position-override', optionalAuth(), async (req, re
 });
 
 // Set node position override
-apiRouter.post('/nodes/:nodeId/position-override', requirePermission('nodes', 'write'), (req, res) => {
+apiRouter.post('/nodes/:nodeId/position-override', requirePermission('nodes', 'write'), async (req, res) => {
   try {
     const { nodeId } = req.params;
     const { enabled, latitude, longitude, altitude, isPrivate } = req.body;
@@ -1527,7 +1650,7 @@ apiRouter.post('/nodes/:nodeId/position-override', requirePermission('nodes', 'w
     const nodeNum = parseInt(nodeNumStr, 16);
 
     // Set position override in database
-    databaseService.setNodePositionOverride(
+    await databaseService.setNodePositionOverrideAsync(
       nodeNum,
       enabled,
       enabled ? latitude : undefined,
@@ -1557,7 +1680,7 @@ apiRouter.post('/nodes/:nodeId/position-override', requirePermission('nodes', 'w
 });
 
 // Delete node position override
-apiRouter.delete('/nodes/:nodeId/position-override', requirePermission('nodes', 'write'), (req, res) => {
+apiRouter.delete('/nodes/:nodeId/position-override', requirePermission('nodes', 'write'), async (req, res) => {
   try {
     const { nodeId } = req.params;
 
@@ -1578,7 +1701,7 @@ apiRouter.delete('/nodes/:nodeId/position-override', requirePermission('nodes', 
     const nodeNum = parseInt(nodeNumStr, 16);
 
     // Clear position override in database
-    databaseService.clearNodePositionOverride(nodeNum);
+    await databaseService.clearNodePositionOverrideAsync(nodeNum);
 
     res.json({
       success: true,
@@ -1654,7 +1777,7 @@ apiRouter.post('/nodes/:nodeNum/scan-remote-admin', requirePermission('settings'
     }
 
     // Check if the node exists
-    const node = databaseService.getNode(parsedNodeNum);
+    const node = await databaseService.nodes.getNode(parsedNodeNum);
     if (!node) {
       const errorResponse: ApiErrorResponse = {
         error: 'Node not found',
@@ -1688,9 +1811,9 @@ apiRouter.post('/nodes/:nodeNum/scan-remote-admin', requirePermission('settings'
 });
 
 // Get nodes with key security issues (low-entropy or duplicate keys)
-apiRouter.get('/nodes/security-issues', optionalAuth(), (_req, res) => {
+apiRouter.get('/nodes/security-issues', optionalAuth(), async (_req, res) => {
   try {
-    const nodes = databaseService.getNodesWithKeySecurityIssues();
+    const nodes = await databaseService.getNodesWithKeySecurityIssuesAsync();
     res.json(nodes);
   } catch (error) {
     logger.error('Error getting nodes with security issues:', error);
@@ -1725,7 +1848,7 @@ apiRouter.post('/nodes/:nodeId/send-key-warning', requirePermission('messages', 
     const nodeNum = parseInt(nodeNumStr, 16);
 
     // Verify the node actually has a security issue
-    const node = databaseService.getNode(nodeNum);
+    const node = await databaseService.nodes.getNode(nodeNum);
     if (!node) {
       const errorResponse: ApiErrorResponse = {
         error: 'Node not found',
@@ -1781,14 +1904,14 @@ apiRouter.post('/nodes/:nodeId/send-key-warning', requirePermission('messages', 
 apiRouter.post('/nodes/scan-duplicate-keys', requirePermission('nodes', 'write'), async (_req, res) => {
   try {
     const { detectDuplicateKeys } = await import('../services/lowEntropyKeyService.js');
-    const nodesWithKeys = databaseService.getNodesWithPublicKeys();
+    const nodesWithKeys = await databaseService.getNodesWithPublicKeysAsync();
     const duplicates = detectDuplicateKeys(nodesWithKeys);
 
     // Clear existing duplicate flags first
-    const allNodes = databaseService.getAllNodes();
+    const allNodes = await databaseService.nodes.getAllNodes();
     for (const node of allNodes) {
       if (node.duplicateKeyDetected) {
-        databaseService.upsertNode({
+        await databaseService.nodes.upsertNode({
           nodeNum: node.nodeNum,
           nodeId: node.nodeId,
           duplicateKeyDetected: false,
@@ -1800,7 +1923,7 @@ apiRouter.post('/nodes/scan-duplicate-keys', requirePermission('nodes', 'write')
     // Update database with new duplicate flags
     for (const [keyHash, nodeNums] of duplicates) {
       for (const nodeNum of nodeNums) {
-        const node = databaseService.getNode(nodeNum);
+        const node = await databaseService.nodes.getNode(nodeNum);
         if (!node) continue;
 
         const otherNodes = nodeNums.filter(n => n !== nodeNum);
@@ -1808,7 +1931,7 @@ apiRouter.post('/nodes/scan-duplicate-keys', requirePermission('nodes', 'write')
           ? `Known low-entropy key; Key shared with nodes: ${otherNodes.join(', ')}`
           : `Key shared with nodes: ${otherNodes.join(', ')}`;
 
-        databaseService.upsertNode({
+        await databaseService.nodes.upsertNode({
           nodeNum,
           nodeId: node.nodeId,
           duplicateKeyDetected: true,
@@ -1850,7 +1973,7 @@ apiRouter.get('/messages', optionalAuth(), async (req, res) => {
     }
 
     const limit = parseInt(req.query.limit as string) || 100;
-    let messages = meshtasticManager.getRecentMessages(limit);
+    let messages = await meshtasticManager.getRecentMessages(limit);
 
     // Filter messages based on permissions
     // If user only has channels permission, exclude direct messages (channel -1)
@@ -1882,15 +2005,15 @@ function transformDbMessageToMeshMessage(msg: DbMessage): MeshMessage {
     toNodeId: msg.toNodeId,
     text: msg.text,
     channel: msg.channel,
-    portnum: msg.portnum,
+    portnum: msg.portnum ?? undefined,
     timestamp: new Date(msg.rxTime ?? msg.timestamp),
-    hopStart: msg.hopStart,
-    hopLimit: msg.hopLimit,
-    relayNode: msg.relayNode,
-    replyId: msg.replyId,
-    emoji: msg.emoji,
-    rxSnr: msg.rxSnr,
-    rxRssi: msg.rxRssi,
+    hopStart: msg.hopStart ?? undefined,
+    hopLimit: msg.hopLimit ?? undefined,
+    relayNode: msg.relayNode ?? undefined,
+    replyId: msg.replyId ?? undefined,
+    emoji: msg.emoji ?? undefined,
+    rxSnr: msg.rxSnr ?? undefined,
+    rxRssi: msg.rxRssi ?? undefined,
     requestId: (msg as any).requestId,
     wantAck: Boolean((msg as any).wantAck),
     ackFailed: Boolean((msg as any).ackFailed),
@@ -1934,7 +2057,7 @@ apiRouter.get('/messages/channel/:channel', optionalAuth(), async (req, res) => 
     }
 
     // Fetch limit+1 to accurately detect if more messages exist
-    const dbMessages = databaseService.getMessagesByChannel(messageChannel, limit + 1, offset);
+    const dbMessages = await databaseService.getMessagesByChannelAsync(messageChannel, limit + 1, offset);
     const hasMore = dbMessages.length > limit;
     // Return only the requested limit
     const messages = dbMessages.slice(0, limit).map(transformDbMessageToMeshMessage);
@@ -1945,14 +2068,14 @@ apiRouter.get('/messages/channel/:channel', optionalAuth(), async (req, res) => 
   }
 });
 
-apiRouter.get('/messages/direct/:nodeId1/:nodeId2', requirePermission('messages', 'read'), (req, res) => {
+apiRouter.get('/messages/direct/:nodeId1/:nodeId2', requirePermission('messages', 'read'), async (req, res) => {
   try {
     const { nodeId1, nodeId2 } = req.params;
     // Validate and clamp limit (1-500) and offset (0-50000) to prevent abuse
     const limit = Math.max(1, Math.min(parseInt(req.query.limit as string) || 100, 500));
     const offset = Math.max(0, Math.min(parseInt(req.query.offset as string) || 0, 50000));
     // Fetch limit+1 to accurately detect if more messages exist
-    const dbMessages = databaseService.getDirectMessages(nodeId1, nodeId2, limit + 1, offset);
+    const dbMessages = await databaseService.messages.getDirectMessages(nodeId1, nodeId2, limit + 1, offset) as DbMessage[];
     const hasMore = dbMessages.length > limit;
     // Return only the requested limit
     const messages = dbMessages.slice(0, limit).map(transformDbMessageToMeshMessage);
@@ -1997,7 +2120,7 @@ apiRouter.post('/messages/mark-read', optionalAuth(), async (req, res) => {
 
     if (messageIds && Array.isArray(messageIds)) {
       // Mark specific messages as read
-      databaseService.markMessagesAsRead(messageIds, userId);
+      await databaseService.markMessagesAsReadAsync(messageIds, userId);
       markedCount = messageIds.length;
     } else if (allDMs) {
       // Mark ALL DMs as read
@@ -2005,17 +2128,17 @@ apiRouter.post('/messages/mark-read', optionalAuth(), async (req, res) => {
       if (!localNodeInfo) {
         return res.status(500).json({ error: 'Local node not connected' });
       }
-      markedCount = databaseService.markAllDMMessagesAsRead(localNodeInfo.nodeId, userId);
+      markedCount = await databaseService.markAllDMMessagesAsReadAsync(localNodeInfo.nodeId, userId);
     } else if (channelId !== undefined) {
       // Mark all messages in a channel as read (specific channel permission already checked above)
-      markedCount = databaseService.markChannelMessagesAsRead(channelId, userId, beforeTimestamp);
+      markedCount = await databaseService.markChannelMessagesAsReadAsync(channelId, userId, beforeTimestamp);
     } else if (nodeId) {
       // Mark all DMs with a node as read (permission already checked above)
       const localNodeInfo = meshtasticManager.getLocalNodeInfo();
       if (!localNodeInfo) {
         return res.status(500).json({ error: 'Local node not connected' });
       }
-      markedCount = databaseService.markDMMessagesAsRead(localNodeInfo.nodeId, nodeId, userId, beforeTimestamp);
+      markedCount = await databaseService.markDMMessagesAsReadAsync(localNodeInfo.nodeId, nodeId, userId, beforeTimestamp);
     } else {
       return res.status(400).json({ error: 'Must provide messageIds, channelId, nodeId, or allDMs' });
     }
@@ -2059,7 +2182,7 @@ apiRouter.get('/messages/unread-counts', optionalAuth(), async (req, res) => {
     // Get DM unread counts if user has messages permission (batch query)
     if (hasMessagesRead && localNodeInfo) {
       const allUnreadDMs = await databaseService.getBatchUnreadDMCountsAsync(localNodeInfo.nodeId, userId);
-      const allNodes = meshtasticManager.getAllNodes();
+      const allNodes = await meshtasticManager.getAllNodesAsync();
       const visibleNodes = await filterNodesByChannelPermission(allNodes, req.user);
       const visibleNodeIds = new Set(visibleNodes.map(n => n.user?.id).filter(Boolean));
       const directMessages: { [nodeId: string]: number } = {};
@@ -2109,9 +2232,9 @@ apiRouter.get('/virtual-node/status', requireAuth(), (_req, res) => {
 });
 
 // Debug endpoint to see all channels
-apiRouter.get('/channels/debug', requirePermission('messages', 'read'), (_req, res) => {
+apiRouter.get('/channels/debug', requirePermission('messages', 'read'), async (_req, res) => {
   try {
-    const allChannels = databaseService.getAllChannels();
+    const allChannels = await databaseService.channels.getAllChannels();
     logger.debug('🔍 DEBUG: All channels in database:', allChannels);
     res.json(allChannels);
   } catch (error) {
@@ -2121,9 +2244,9 @@ apiRouter.get('/channels/debug', requirePermission('messages', 'read'), (_req, r
 });
 
 // Get all channels (unfiltered, for export/config purposes)
-apiRouter.get('/channels/all', requirePermission('channel_0', 'read'), (_req, res) => {
+apiRouter.get('/channels/all', requirePermission('channel_0', 'read'), async (_req, res) => {
   try {
-    const allChannels = databaseService.getAllChannels();
+    const allChannels = await databaseService.channels.getAllChannels();
     logger.debug(`📡 Serving all ${allChannels.length} channels (unfiltered)`);
     res.json(allChannels);
   } catch (error) {
@@ -2132,9 +2255,9 @@ apiRouter.get('/channels/all', requirePermission('channel_0', 'read'), (_req, re
   }
 });
 
-apiRouter.get('/channels', requirePermission('channel_0', 'read'), (_req, res) => {
+apiRouter.get('/channels', requirePermission('channel_0', 'read'), async (_req, res) => {
   try {
-    const allChannels = databaseService.getAllChannels();
+    const allChannels = await databaseService.channels.getAllChannels();
 
     // Channel 0 will be created automatically when device config syncs
     // It should have an empty name as per Meshtastic protocol
@@ -2189,14 +2312,14 @@ apiRouter.get('/channels', requirePermission('channel_0', 'read'), (_req, res) =
 });
 
 // Export a specific channel configuration
-apiRouter.get('/channels/:id/export', requirePermission('channel_0', 'read'), (req, res) => {
+apiRouter.get('/channels/:id/export', requirePermission('channel_0', 'read'), async (req, res) => {
   try {
     const channelId = parseInt(req.params.id);
     if (isNaN(channelId)) {
       return res.status(400).json({ error: 'Invalid channel ID' });
     }
 
-    const channel = databaseService.getChannelById(channelId);
+    const channel = await databaseService.channels.getChannelById(channelId);
     if (!channel) {
       return res.status(404).json({ error: 'Channel not found' });
     }
@@ -2243,6 +2366,58 @@ apiRouter.get('/channels/:id/export', requirePermission('channel_0', 'read'), (r
   }
 });
 
+/**
+ * Detect channel moves/swaps by comparing PSKs before and after a change.
+ * Returns an array of {from, to} slot pairs indicating where channels moved.
+ */
+function detectChannelMoves(
+  before: { id: number; psk?: string | null }[],
+  after: { id: number; psk?: string | null }[]
+): { from: number; to: number }[] {
+  const moves: { from: number; to: number }[] = [];
+
+  for (const oldCh of before) {
+    if (!oldCh.psk || oldCh.psk === '') continue;
+    const newCh = after.find(ch => ch.psk === oldCh.psk && ch.id !== oldCh.id);
+    if (newCh) {
+      // This PSK moved from oldCh.id to newCh.id
+      // Avoid duplicates (swap would register A→B and B→A)
+      if (!moves.find(m => m.from === newCh.id && m.to === oldCh.id)) {
+        moves.push({ from: oldCh.id, to: newCh.id });
+      }
+    }
+  }
+
+  return moves;
+}
+
+/**
+ * Snapshot channel slots and migrate messages after a channel configuration change.
+ * Call snapshotBefore() before applying changes, then migrateIfNeeded() after.
+ */
+async function snapshotChannelsBeforeChange() {
+  return (await databaseService.channels.getAllChannels()).map(ch => ({ id: ch.id, psk: ch.psk }));
+}
+
+async function migrateMessagesIfChannelsMoved(beforeSnapshot: { id: number; psk?: string | null }[]) {
+  try {
+    const afterSnapshot = (await databaseService.channels.getAllChannels()).map(ch => ({ id: ch.id, psk: ch.psk }));
+    const moves = detectChannelMoves(beforeSnapshot, afterSnapshot);
+    if (moves.length > 0) {
+      logger.info(`📦 Detected channel move(s): ${moves.map(m => `${m.from}→${m.to}`).join(', ')}`);
+      await databaseService.messages.migrateMessagesForChannelMoves(moves);
+      await migrateAutomationChannels(
+        moves,
+        (key) => databaseService.settings.getSetting(key),
+        (key, value) => databaseService.settings.setSetting(key, value)
+      );
+    }
+  } catch (error) {
+    logger.error('📦 Failed to migrate messages after channel change:', error);
+    // Don't fail the channel operation — message migration is best-effort
+  }
+}
+
 // Update a channel configuration
 apiRouter.put('/channels/:id', requirePermission('channel_0', 'write'), async (req, res) => {
   try {
@@ -2283,10 +2458,13 @@ apiRouter.put('/channels/:id', requirePermission('channel_0', 'write'), async (r
     }
 
     // Get existing channel
-    const existingChannel = databaseService.getChannelById(channelId);
+    const existingChannel = await databaseService.channels.getChannelById(channelId);
     if (!existingChannel) {
       return res.status(404).json({ error: 'Channel not found' });
     }
+
+    // Snapshot channels before change for message migration
+    const beforeSnapshot = await snapshotChannelsBeforeChange();
 
     // Prepare the updated channel data
     const updatedChannelData = {
@@ -2303,7 +2481,7 @@ apiRouter.put('/channels/:id', requirePermission('channel_0', 'write'), async (r
     };
 
     // Update channel in database
-    databaseService.upsertChannel(updatedChannelData);
+    await databaseService.channels.upsertChannel(updatedChannelData);
 
     // Send channel configuration to Meshtastic device
     try {
@@ -2321,7 +2499,10 @@ apiRouter.put('/channels/:id', requirePermission('channel_0', 'write'), async (r
       // Continue even if device update fails - database is updated
     }
 
-    const updatedChannel = databaseService.getChannelById(channelId);
+    // Migrate messages if channel PSK moved to a different slot
+    await migrateMessagesIfChannelsMoved(beforeSnapshot);
+
+    const updatedChannel = await databaseService.channels.getChannelById(channelId);
     logger.info(`✅ Updated channel ${channelId}: ${name}`);
     res.json({ success: true, channel: updatedChannel });
   } catch (error) {
@@ -2391,6 +2572,9 @@ apiRouter.post('/channels/:slotId/import', requirePermission('channel_0', 'write
       return !!value;
     };
 
+    // Snapshot channels before change for message migration
+    const beforeSnapshot = await snapshotChannelsBeforeChange();
+
     const importedChannelData = {
       id: slotId,
       name,
@@ -2402,7 +2586,7 @@ apiRouter.post('/channels/:slotId/import', requirePermission('channel_0', 'write
     };
 
     // Import channel to the specified slot in database
-    databaseService.upsertChannel(importedChannelData);
+    await databaseService.channels.upsertChannel(importedChannelData);
 
     // Send channel configuration to Meshtastic device
     try {
@@ -2420,12 +2604,127 @@ apiRouter.post('/channels/:slotId/import', requirePermission('channel_0', 'write
       // Continue even if device update fails - database is updated
     }
 
-    const importedChannel = databaseService.getChannelById(slotId);
+    // Migrate messages if channel PSK moved to a different slot
+    await migrateMessagesIfChannelsMoved(beforeSnapshot);
+
+    const importedChannel = await databaseService.channels.getChannelById(slotId);
     logger.info(`✅ Imported channel to slot ${slotId}: ${name}`);
     res.json({ success: true, channel: importedChannel });
   } catch (error) {
     logger.error('Error importing channel:', error);
     res.status(500).json({ error: 'Failed to import channel' });
+  }
+});
+
+// Reorder device channel slots (drag-and-drop)
+apiRouter.post('/channels/reorder', requirePermission('channel_0', 'write'), async (req, res) => {
+  try {
+    const { newOrder } = req.body;
+
+    // Validate: newOrder must be an array of 8 slot indices [0-7], each used exactly once
+    if (!Array.isArray(newOrder) || newOrder.length !== 8) {
+      return res.status(400).json({ error: 'newOrder must be an array of 8 slot indices' });
+    }
+    const sorted = [...newOrder].sort();
+    if (sorted.some((v, i) => v !== i)) {
+      return res.status(400).json({ error: 'newOrder must contain each slot index 0-7 exactly once' });
+    }
+
+    // Check if anything actually changed
+    const isIdentity = newOrder.every((v: number, i: number) => v === i);
+    if (isIdentity) {
+      return res.json({ success: true, requiresReboot: false });
+    }
+
+    const allChannels = await databaseService.channels.getAllChannels();
+
+    // Build the new channel configs based on the reorder mapping
+    // newOrder[newSlot] = oldSlot — means "new slot i gets the channel from old slot newOrder[i]"
+    const channelsBySlot = new Map(allChannels.map(ch => [ch.id, ch]));
+
+    // Begin edit settings transaction
+    logger.info(`🔄 Beginning channel reorder: ${newOrder.join(',')}`);
+    await meshtasticManager.beginEditSettings();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    for (let newSlot = 0; newSlot < 8; newSlot++) {
+      const oldSlot = newOrder[newSlot];
+      if (oldSlot === newSlot) continue; // No change for this slot
+
+      const sourceChannel = channelsBySlot.get(oldSlot);
+      // Slot 0 is always primary, others secondary
+      const role = newSlot === 0 ? 1 : (sourceChannel?.role === 1 ? 2 : (sourceChannel?.role ?? 0));
+
+      if (sourceChannel && sourceChannel.role !== 0) {
+        await meshtasticManager.setChannelConfig(newSlot, {
+          name: sourceChannel.name || '',
+          psk: sourceChannel.psk || undefined,
+          role,
+          uplinkEnabled: sourceChannel.uplinkEnabled ?? true,
+          downlinkEnabled: sourceChannel.downlinkEnabled ?? true,
+          positionPrecision: sourceChannel.positionPrecision ?? undefined,
+        });
+
+        // Update database
+        await databaseService.channels.upsertChannel({
+          id: newSlot,
+          name: sourceChannel.name || '',
+          psk: sourceChannel.psk,
+          role,
+          uplinkEnabled: sourceChannel.uplinkEnabled,
+          downlinkEnabled: sourceChannel.downlinkEnabled,
+          positionPrecision: sourceChannel.positionPrecision,
+        });
+      } else {
+        // Empty/disabled slot
+        await meshtasticManager.setChannelConfig(newSlot, {
+          name: '',
+          psk: undefined,
+          role: 0,
+        });
+        await databaseService.channels.upsertChannel({
+          id: newSlot,
+          name: '',
+          psk: null,
+          role: 0,
+        });
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+
+    // Commit to device
+    await meshtasticManager.commitEditSettings();
+    logger.info(`✅ Channel reorder committed`);
+
+    // Migrate messages — derive moves directly from newOrder mapping
+    // newOrder[newSlot] = oldSlot, so messages on oldSlot should move to newSlot
+    const moves: { from: number; to: number }[] = [];
+    for (let newSlot = 0; newSlot < 8; newSlot++) {
+      const oldSlot = newOrder[newSlot];
+      if (oldSlot !== newSlot) {
+        moves.push({ from: oldSlot, to: newSlot });
+      }
+    }
+    if (moves.length > 0) {
+      logger.info(`📦 Channel reorder message migration: ${moves.map(m => `${m.from}→${m.to}`).join(', ')}`);
+      try {
+        await databaseService.messages.migrateMessagesForChannelMoves(moves);
+      } catch (error) {
+        logger.error('📦 Failed to migrate messages after channel reorder:', error);
+      }
+      try {
+        await databaseService.auth.migratePermissionsForChannelMoves(moves);
+        logger.info(`🔑 Permission migration complete for channel reorder`);
+      } catch (error) {
+        logger.error('🔑 Failed to migrate permissions after channel reorder:', error);
+      }
+    }
+
+    res.json({ success: true, requiresReboot: true });
+  } catch (error) {
+    logger.error('Error reordering channels:', error);
+    res.status(500).json({ error: 'Failed to reorder channels' });
   }
 });
 
@@ -2464,8 +2763,10 @@ apiRouter.post('/channels/encode-url', requirePermission('configuration', 'read'
     const channelUrlService = (await import('./services/channelUrlService.js')).default;
 
     // Get selected channels from database
-    const channels = channelIds
-      .map((id: number) => databaseService.getChannelById(id))
+    const channelResults = await Promise.all(
+      channelIds.map((id: number) => databaseService.channels.getChannelById(id))
+    );
+    const channels = channelResults
       .filter((ch): ch is NonNullable<typeof ch> => ch !== null)
       .map(ch => {
         logger.info(`📡 Channel ${ch.id} from DB - name: "${ch.name}" (length: ${ch.name.length})`);
@@ -2562,6 +2863,9 @@ apiRouter.post('/channels/import-config', requirePermission('configuration', 'wr
       throw new Error('Failed to start configuration transaction');
     }
 
+    // Snapshot channels before change for message migration
+    const beforeSnapshot = await snapshotChannelsBeforeChange();
+
     // Import channels FIRST (before LoRa config to avoid premature reboot)
     const importedChannels = [];
     if (decoded.channels && decoded.channels.length > 0) {
@@ -2625,6 +2929,29 @@ apiRouter.post('/channels/import-config', requirePermission('configuration', 'wr
       }
     }
 
+    // Migrate messages before device reboots — build "after" from decoded config
+    // since the DB won't be updated until device reconnects
+    if (decoded.channels && decoded.channels.length > 0) {
+      const afterSnapshot = decoded.channels.map((ch: any, i: number) => ({
+        id: i,
+        psk: ch.psk === 'none' ? null : (ch.psk || null),
+      }));
+      const moves = detectChannelMoves(beforeSnapshot, afterSnapshot);
+      if (moves.length > 0) {
+        logger.info(`📦 Detected channel move(s) from config import: ${moves.map(m => `${m.from}→${m.to}`).join(', ')}`);
+        try {
+          await databaseService.messages.migrateMessagesForChannelMoves(moves);
+          await migrateAutomationChannels(
+            moves,
+            (key) => databaseService.settings.getSetting(key),
+            (key, value) => databaseService.settings.setSetting(key, value)
+          );
+        } catch (error) {
+          logger.error('📦 Failed to migrate messages after config import:', error);
+        }
+      }
+    }
+
     // Commit all changes (channels + LoRa config) as a single transaction
     // This will save everything to flash and trigger device reboot if needed
     try {
@@ -2654,12 +2981,12 @@ apiRouter.post('/channels/import-config', requirePermission('configuration', 'wr
   }
 });
 
-apiRouter.get('/stats', requirePermission('dashboard', 'read'), (_req, res) => {
+apiRouter.get('/stats', requirePermission('dashboard', 'read'), async (_req, res) => {
   try {
-    const messageCount = databaseService.getMessageCount();
-    const nodeCount = databaseService.getNodeCount();
-    const channelCount = databaseService.getChannelCount();
-    const messagesByDay = databaseService.getMessagesByDay(7);
+    const messageCount = await databaseService.messages.getMessageCount();
+    const nodeCount = await databaseService.nodes.getNodeCount();
+    const channelCount = await databaseService.channels.getChannelCount();
+    const messagesByDay = await databaseService.getMessagesByDayAsync(7);
 
     res.json({
       messageCount,
@@ -2673,9 +3000,9 @@ apiRouter.get('/stats', requirePermission('dashboard', 'read'), (_req, res) => {
   }
 });
 
-apiRouter.post('/export', requireAdmin(), (_req, res) => {
+apiRouter.post('/export', requireAdmin(), async (_req, res) => {
   try {
-    const data = databaseService.exportData();
+    const data = await databaseService.exportDataAsync();
     res.json(data);
   } catch (error) {
     logger.error('Error exporting data:', error);
@@ -2683,10 +3010,10 @@ apiRouter.post('/export', requireAdmin(), (_req, res) => {
   }
 });
 
-apiRouter.post('/import', requireAdmin(), (req, res) => {
+apiRouter.post('/import', requireAdmin(), async (req, res) => {
   try {
     const data = req.body;
-    databaseService.importData(data);
+    await databaseService.importDataAsync(data);
     res.json({ success: true });
   } catch (error) {
     logger.error('Error importing data:', error);
@@ -2694,10 +3021,10 @@ apiRouter.post('/import', requireAdmin(), (req, res) => {
   }
 });
 
-apiRouter.post('/cleanup/messages', requireAdmin(), (req, res) => {
+apiRouter.post('/cleanup/messages', requireAdmin(), async (req, res) => {
   try {
     const days = parseInt(req.body.days) || 30;
-    const deletedCount = databaseService.cleanupOldMessages(days);
+    const deletedCount = await databaseService.cleanupOldMessagesAsync(days);
     res.json({ deletedCount });
   } catch (error) {
     logger.error('Error cleaning up messages:', error);
@@ -2705,10 +3032,10 @@ apiRouter.post('/cleanup/messages', requireAdmin(), (req, res) => {
   }
 });
 
-apiRouter.post('/cleanup/nodes', requireAdmin(), (req, res) => {
+apiRouter.post('/cleanup/nodes', requireAdmin(), async (req, res) => {
   try {
     const days = parseInt(req.body.days) || 30;
-    const deletedCount = databaseService.cleanupInactiveNodes(days);
+    const deletedCount = await databaseService.cleanupInactiveNodesAsync(days);
     res.json({ deletedCount });
   } catch (error) {
     logger.error('Error cleaning up nodes:', error);
@@ -2716,9 +3043,9 @@ apiRouter.post('/cleanup/nodes', requireAdmin(), (req, res) => {
   }
 });
 
-apiRouter.post('/cleanup/channels', requireAdmin(), (_req, res) => {
+apiRouter.post('/cleanup/channels', requireAdmin(), async (_req, res) => {
   try {
-    const deletedCount = databaseService.cleanupInvalidChannels();
+    const deletedCount = await databaseService.cleanupInvalidChannelsAsync();
     res.json({ deletedCount });
   } catch (error) {
     logger.error('Error cleaning up channels:', error);
@@ -2758,7 +3085,7 @@ apiRouter.post('/messages/send', optionalAuth(), async (req, res) => {
     // For DMs, use the channel we last heard the target node on (from NodeInfo)
     // This ensures we send on a channel the target node has configured
     if (destinationNum) {
-      const targetNode = databaseService.getNode(destinationNum);
+      const targetNode = await databaseService.nodes.getNode(destinationNum);
       if (targetNode && targetNode.channel !== undefined && targetNode.channel !== null) {
         meshChannel = targetNode.channel;
         logger.info(`📨 DM to ${destination} - Using target node's channel: ${meshChannel}`);
@@ -2819,7 +3146,7 @@ apiRouter.post('/traceroute', requirePermission('traceroute', 'write'), async (r
     const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
 
     // Look up the node to get its channel
-    const node = databaseService.getNode(destinationNum);
+    const node = await databaseService.nodes.getNode(destinationNum);
     const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
 
     await meshtasticManager.sendTraceroute(destinationNum, channel);
@@ -2844,7 +3171,7 @@ apiRouter.post('/position/request', requirePermission('messages', 'write'), asyn
     const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
 
     // Look up the node to get its channel
-    const node = databaseService.getNode(destinationNum);
+    const node = await databaseService.nodes.getNode(destinationNum);
     // Use explicit channel from request if provided and valid (0-7), otherwise fall back to node's stored channel
     const channel = (typeof req.body.channel === 'number' && req.body.channel >= 0 && req.body.channel <= 7)
       ? req.body.channel
@@ -2860,6 +3187,8 @@ apiRouter.post('/position/request', requirePermission('messages', 'write'), asyn
       }`
     );
 
+    const isBroadcast = destinationNum === 0xFFFFFFFF;
+
     if (localNodeInfo) {
       // Create a system message to record the position request using the actual packet ID and requestId
       const messageId = `${packetId}`;
@@ -2869,18 +3198,19 @@ apiRouter.post('/position/request', requirePermission('messages', 'write'), asyn
       const messageChannel = channel === 0 ? -1 : channel;
 
       logger.info(
-        `📍 Inserting position request system message to database: ${messageId} (channel: ${messageChannel}, packetId: ${packetId}, requestId: ${requestId})`
+        `📍 Inserting position request system message to database: ${messageId} (channel: ${messageChannel}, packetId: ${packetId}, requestId: ${requestId}, broadcast: ${isBroadcast})`
       );
-      databaseService.insertMessage({
+      await databaseService.messages.insertMessage({
         id: messageId,
         fromNodeNum: localNodeInfo.nodeNum,
         toNodeNum: destinationNum,
         fromNodeId: localNodeInfo.nodeId,
         toNodeId: `!${destinationNum.toString(16).padStart(8, '0')}`,
-        text: 'Position exchange requested',
+        text: isBroadcast ? 'Position broadcast sent' : 'Position exchange requested',
         channel: messageChannel,
         portnum: PortNum.TEXT_MESSAGE_APP, // Shows in DM view (DM filter requires TEXT_MESSAGE_APP)
-        requestId: requestId, // Store requestId for ACK matching
+        // Broadcast packets don't get ACKed, so omit requestId to avoid permanent pending state
+        ...(isBroadcast ? {} : { requestId: requestId }),
         timestamp: timestamp,
         rxTime: timestamp,
         createdAt: timestamp,
@@ -2900,7 +3230,7 @@ apiRouter.post('/position/request', requirePermission('messages', 'write'), asyn
   }
 });
 
-// NodeInfo request endpoint (Exchange User Info - triggers key exchange)
+// NodeInfo request endpoint (Exchange Node Info - triggers key exchange)
 apiRouter.post('/nodeinfo/request', requirePermission('messages', 'write'), async (req, res) => {
   try {
     const { destination } = req.body;
@@ -2911,7 +3241,7 @@ apiRouter.post('/nodeinfo/request', requirePermission('messages', 'write'), asyn
     const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
 
     // Look up the node to get its channel
-    const node = databaseService.getNode(destinationNum);
+    const node = await databaseService.nodes.getNode(destinationNum);
     const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
 
     const { packetId, requestId } = await meshtasticManager.sendNodeInfoRequest(destinationNum, channel);
@@ -2935,7 +3265,7 @@ apiRouter.post('/nodeinfo/request', requirePermission('messages', 'write'), asyn
       logger.info(
         `📇 Inserting nodeinfo request system message to database: ${messageId} (channel: ${messageChannel}, packetId: ${packetId}, requestId: ${requestId})`
       );
-      databaseService.insertMessage({
+      await databaseService.messages.insertMessage({
         id: messageId,
         fromNodeNum: localNodeInfo.nodeNum,
         toNodeNum: destinationNum,
@@ -2965,6 +3295,10 @@ apiRouter.post('/nodeinfo/request', requirePermission('messages', 'write'), asyn
 });
 
 // NeighborInfo request endpoint (request neighbor info from remote node)
+// Rate limit: one request per destination every 180 seconds (firmware limit is ~3 minutes)
+const neighborInfoRequestTimestamps = new Map<number, number>();
+const NEIGHBOR_INFO_RATE_LIMIT_MS = 180_000;
+
 apiRouter.post('/neighborinfo/request', requirePermission('traceroute', 'write'), async (req, res) => {
   try {
     const { destination } = req.body;
@@ -2974,11 +3308,38 @@ apiRouter.post('/neighborinfo/request', requirePermission('traceroute', 'write')
 
     const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
 
-    // Look up the node to get its channel
-    const node = databaseService.getNode(destinationNum);
+    // Eligibility check: only allow requests to local node or 0-hop nodes
+    const localNodeNum = meshtasticManager.getLocalNodeInfo()?.nodeNum;
+    const node = await databaseService.nodes.getNode(destinationNum);
+    const isLocalNode = localNodeNum != null && Number(destinationNum) === Number(localNodeNum);
+    const isDirectNode = node != null && node.hopsAway != null && Number(node.hopsAway) === 0;
+
+    if (!isLocalNode && !isDirectNode) {
+      return res.status(403).json({
+        error: 'Neighbor info requests are only allowed for the local node or directly-heard (0-hop) nodes',
+        eligible: false,
+      });
+    }
+
+    // Rate limiting per destination
+    const lastRequest = neighborInfoRequestTimestamps.get(Number(destinationNum));
+    const now = Date.now();
+    if (lastRequest) {
+      if ((now - lastRequest) < NEIGHBOR_INFO_RATE_LIMIT_MS) {
+        const retryAfter = Math.ceil((NEIGHBOR_INFO_RATE_LIMIT_MS - (now - lastRequest)) / 1000);
+        return res.status(429).json({
+          error: 'Rate limited: firmware limits neighbor info responses to once per 3 minutes',
+          retryAfter,
+        });
+      }
+      // Expired entry — clean up
+      neighborInfoRequestTimestamps.delete(Number(destinationNum));
+    }
+
     const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
 
     const { packetId, requestId } = await meshtasticManager.sendNeighborInfoRequest(destinationNum, channel);
+    neighborInfoRequestTimestamps.set(Number(destinationNum), now);
 
     logger.info(`🏠 NeighborInfo request sent to ${destinationNum.toString(16)} on channel ${channel}, packetId=${packetId}, requestId=${requestId}`);
 
@@ -3011,7 +3372,7 @@ apiRouter.post('/telemetry/request', requirePermission('messages', 'write'), asy
     const destinationNum = typeof destination === 'string' ? parseInt(destination, 16) : destination;
 
     // Look up the node to get its channel
-    const node = databaseService.getNode(destinationNum);
+    const node = await databaseService.nodes.getNode(destinationNum);
     const channel = node?.channel ?? 0; // Default to 0 if node not found or channel not set
 
     const { packetId, requestId } = await meshtasticManager.sendTelemetryRequest(
@@ -3036,7 +3397,7 @@ apiRouter.post('/telemetry/request', requirePermission('messages', 'write'), asy
 });
 
 // Get recent traceroutes (last 24 hours)
-apiRouter.get('/traceroutes/recent', (req, res) => {
+apiRouter.get('/traceroutes/recent', async (req, res) => {
   try {
     const hoursParam = req.query.hours ? parseInt(req.query.hours as string) : 24;
     const cutoffTime = Date.now() - hoursParam * 60 * 60 * 1000;
@@ -3049,15 +3410,15 @@ apiRouter.get('/traceroutes/recent', (req, res) => {
       limit = parseInt(req.query.limit as string);
     } else {
       // Calculate dynamic default based on traceroute settings
-      const tracerouteIntervalMinutes = parseInt(databaseService.getSetting('tracerouteIntervalMinutes') || '5');
-      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
+      const tracerouteIntervalMinutes = parseInt(await databaseService.settings.getSetting('tracerouteIntervalMinutes') || '5');
+      const maxNodeAgeHours = parseInt(await databaseService.settings.getSetting('maxNodeAgeHours') || '24');
       const traceroutesPerHour = tracerouteIntervalMinutes > 0 ? 60 / tracerouteIntervalMinutes : 12;
       limit = Math.ceil(traceroutesPerHour * maxNodeAgeHours * 1.1);
       // Ensure a reasonable minimum
       limit = Math.max(limit, 100);
     }
 
-    const allTraceroutes = databaseService.getAllTraceroutes(limit);
+    const allTraceroutes = await databaseService.traceroutes.getAllTraceroutes(limit);
 
     const recentTraceroutes = allTraceroutes.filter(tr => tr.timestamp >= cutoffTime);
 
@@ -3110,7 +3471,7 @@ apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', async (req, res) =
       return;
     }
 
-    const traceroutes = await databaseService.getTraceroutesByNodesAsync(fromNodeNum, toNodeNum, limit);
+    const traceroutes = await databaseService.traceroutes.getTraceroutesByNodes(fromNodeNum, toNodeNum, limit);
 
     const traceroutesWithHops = traceroutes.map(tr => {
       let hopCount = 999;
@@ -3139,15 +3500,15 @@ apiRouter.get('/traceroutes/history/:fromNodeNum/:toNodeNum', async (req, res) =
 // Get longest active route segment (within last 7 days)
 apiRouter.get('/route-segments/longest-active', requirePermission('info', 'read'), async (_req, res) => {
   try {
-    const segment = await databaseService.getLongestActiveRouteSegmentAsync();
+    const segment = await databaseService.traceroutes.getLongestActiveRouteSegment();
     if (!segment) {
       res.json(null);
       return;
     }
 
     // Enrich with node names
-    const fromNode = databaseService.getNode(segment.fromNodeNum);
-    const toNode = databaseService.getNode(segment.toNodeNum);
+    const fromNode = await databaseService.nodes.getNode(segment.fromNodeNum);
+    const toNode = await databaseService.nodes.getNode(segment.toNodeNum);
 
     const enrichedSegment = {
       ...segment,
@@ -3165,15 +3526,15 @@ apiRouter.get('/route-segments/longest-active', requirePermission('info', 'read'
 // Get record holder route segment
 apiRouter.get('/route-segments/record-holder', requirePermission('info', 'read'), async (_req, res) => {
   try {
-    const segment = await databaseService.getRecordHolderRouteSegmentAsync();
+    const segment = await databaseService.traceroutes.getRecordHolderRouteSegment();
     if (!segment) {
       res.json(null);
       return;
     }
 
     // Enrich with node names
-    const fromNode = databaseService.getNode(segment.fromNodeNum);
-    const toNode = databaseService.getNode(segment.toNodeNum);
+    const fromNode = await databaseService.nodes.getNode(segment.fromNodeNum);
+    const toNode = await databaseService.nodes.getNode(segment.toNodeNum);
 
     const enrichedSegment = {
       ...segment,
@@ -3189,9 +3550,9 @@ apiRouter.get('/route-segments/record-holder', requirePermission('info', 'read')
 });
 
 // Clear record holder route segment
-apiRouter.delete('/route-segments/record-holder', requirePermission('info', 'write'), (_req, res) => {
+apiRouter.delete('/route-segments/record-holder', requirePermission('info', 'write'), async (_req, res) => {
   try {
-    databaseService.clearRecordHolderSegment();
+    await databaseService.clearRecordHolderSegmentAsync();
     res.json({ success: true, message: 'Record holder cleared' });
   } catch (error) {
     logger.error('Error clearing record holder:', error);
@@ -3200,7 +3561,7 @@ apiRouter.delete('/route-segments/record-holder', requirePermission('info', 'wri
 });
 
 // Helper to get effective position (respecting overrides)
-const getEffectivePosition = (node: ReturnType<typeof databaseService.getNode>) => {
+const getEffectivePosition = (node: Awaited<ReturnType<typeof databaseService.nodes.getNode>>) => {
   if (!node) return { latitude: undefined, longitude: undefined };
 
   // Check for position override first
@@ -3215,20 +3576,23 @@ const getEffectivePosition = (node: ReturnType<typeof databaseService.getNode>) 
 };
 
 // Get all neighbor info (latest per node pair)
-apiRouter.get('/neighbor-info', requirePermission('info', 'read'), (_req, res) => {
+apiRouter.get('/neighbor-info', requirePermission('info', 'read'), async (_req, res) => {
   try {
     const neighborInfo = databaseService.getLatestNeighborInfoPerNode();
 
     // Get max node age setting (default 24 hours)
-    const maxNodeAgeStr = databaseService.getSetting('maxNodeAge');
+    const maxNodeAgeStr = await databaseService.settings.getSetting('maxNodeAge');
     const maxNodeAgeHours = maxNodeAgeStr ? parseInt(maxNodeAgeStr, 10) : 24;
     const cutoffTime = Math.floor(Date.now() / 1000) - maxNodeAgeHours * 60 * 60;
 
-    // Enrich with node names and filter by node age
-    const enrichedNeighborInfo = neighborInfo
-      .map(ni => {
-        const node = databaseService.getNode(ni.nodeNum);
-        const neighbor = databaseService.getNode(ni.neighborNodeNum);
+    // Build a set of all link keys for bidirectionality detection
+    const linkKeys = new Set(neighborInfo.map(ni => `${ni.nodeNum}-${ni.neighborNodeNum}`));
+
+    // Enrich with node names, bidirectionality, and filter by node age
+    const enrichedNeighborInfo = (await Promise.all(neighborInfo
+      .map(async ni => {
+        const node = await databaseService.nodes.getNode(ni.nodeNum);
+        const neighbor = await databaseService.nodes.getNode(ni.neighborNodeNum);
         const nodePos = getEffectivePosition(node);
         const neighborPos = getEffectivePosition(neighbor);
 
@@ -3238,6 +3602,7 @@ apiRouter.get('/neighbor-info', requirePermission('info', 'read'), (_req, res) =
           nodeName: node?.longName || `Node !${ni.nodeNum.toString(16).padStart(8, '0')}`,
           neighborNodeId: neighbor?.nodeId || `!${ni.neighborNodeNum.toString(16).padStart(8, '0')}`,
           neighborName: neighbor?.longName || `Node !${ni.neighborNodeNum.toString(16).padStart(8, '0')}`,
+          bidirectional: linkKeys.has(`${ni.neighborNodeNum}-${ni.nodeNum}`),
           nodeLatitude: nodePos.latitude,
           nodeLongitude: nodePos.longitude,
           neighborLatitude: neighborPos.latitude,
@@ -3245,7 +3610,7 @@ apiRouter.get('/neighbor-info', requirePermission('info', 'read'), (_req, res) =
           node,
           neighbor,
         };
-      })
+      })))
       .filter(ni => {
         // Filter out connections where either node is too old or missing lastHeard
         if (!ni.node?.lastHeard || !ni.neighbor?.lastHeard) {
@@ -3263,14 +3628,14 @@ apiRouter.get('/neighbor-info', requirePermission('info', 'read'), (_req, res) =
 });
 
 // Get neighbor info for a specific node
-apiRouter.get('/neighbor-info/:nodeNum', requirePermission('info', 'read'), (req, res) => {
+apiRouter.get('/neighbor-info/:nodeNum', requirePermission('info', 'read'), async (req, res) => {
   try {
     const nodeNum = parseInt(req.params.nodeNum);
-    const neighborInfo = databaseService.getNeighborsForNode(nodeNum);
+    const neighborInfo = await databaseService.getNeighborsForNodeAsync(nodeNum);
 
     // Enrich with node names
-    const enrichedNeighborInfo = neighborInfo.map(ni => {
-      const neighbor = databaseService.getNode(ni.neighborNodeNum);
+    const enrichedNeighborInfo = await Promise.all(neighborInfo.map(async ni => {
+      const neighbor = await databaseService.nodes.getNode(ni.neighborNodeNum);
       const neighborPos = getEffectivePosition(neighbor);
 
       return {
@@ -3280,7 +3645,7 @@ apiRouter.get('/neighbor-info/:nodeNum', requirePermission('info', 'read'), (req
         neighborLatitude: neighborPos.latitude,
         neighborLongitude: neighborPos.longitude,
       };
-    });
+    }));
 
     res.json(enrichedNeighborInfo);
   } catch (error) {
@@ -3332,26 +3697,22 @@ apiRouter.get('/telemetry/:nodeId', optionalAuth(), async (req, res) => {
 
     // Check if node has private position override
     const nodeNum = parseInt(nodeId.replace('!', ''), 16);
-    const node = databaseService.getNode(nodeNum);
+    const node = await databaseService.nodes.getNode(nodeNum);
     const isPrivate = node?.positionOverrideIsPrivate === true;
     const canViewPrivate = !!req.user && await hasPermission(req.user, 'nodes_private', 'read');
 
     let telemetry: any[];
     // For PostgreSQL/MySQL, use async repo directly
     if (databaseService.drizzleDbType === 'postgres' || databaseService.drizzleDbType === 'mysql') {
-      if (databaseService.telemetryRepo) {
-        const limit = Math.min(hoursParam * 60, 5000);
-        telemetry = await databaseService.telemetryRepo.getTelemetryByNode(nodeId, limit, cutoffTime);
-      } else {
-        telemetry = [];
-      }
+      const limit = Math.min(hoursParam * 60, 5000);
+      telemetry = await databaseService.telemetry.getTelemetryByNode(nodeId, limit, cutoffTime);
     } else {
       // Use averaged query for graph data to reduce data points
       // Dynamic bucketing automatically adjusts interval based on time range:
       // - 0-24h: 3-minute intervals (high detail)
       // - 1-7d: 30-minute intervals (medium detail)
       // - 7d+: 2-hour intervals (low detail, full coverage)
-      telemetry = databaseService.getTelemetryByNodeAveraged(nodeId, cutoffTime, undefined, hoursParam);
+      telemetry = await databaseService.getTelemetryByNodeAveragedAsync(nodeId, cutoffTime, undefined, hoursParam);
     }
 
     // Filter out location telemetry if private and unauthorized
@@ -3412,36 +3773,34 @@ apiRouter.get('/telemetry/:nodeId/rates', optionalAuth(), async (req, res) => {
         rates[type] = [];
       }
 
-      if (databaseService.telemetryRepo) {
-        // Fetch telemetry for each packet type and calculate rates
-        for (const type of packetTypes) {
-          const telemetry = await databaseService.telemetryRepo.getTelemetryByNode(
-            nodeId, 5000, cutoffTime, undefined, 0, type
-          );
+      // Fetch telemetry for each packet type and calculate rates
+      for (const type of packetTypes) {
+        const telemetry = await databaseService.telemetry.getTelemetryByNode(
+          nodeId, 5000, cutoffTime, undefined, 0, type
+        );
 
-          // Sort by timestamp ascending for rate calculation
-          telemetry.sort((a, b) => a.timestamp - b.timestamp);
+        // Sort by timestamp ascending for rate calculation
+        telemetry.sort((a, b) => a.timestamp - b.timestamp);
 
-          // Calculate rates from consecutive samples
-          for (let i = 1; i < telemetry.length; i++) {
-            const prev = telemetry[i - 1];
-            const curr = telemetry[i];
-            const timeDiffMs = curr.timestamp - prev.timestamp;
-            const valueDiff = curr.value - prev.value;
+        // Calculate rates from consecutive samples
+        for (let i = 1; i < telemetry.length; i++) {
+          const prev = telemetry[i - 1];
+          const curr = telemetry[i];
+          const timeDiffMs = curr.timestamp - prev.timestamp;
+          const valueDiff = curr.value - prev.value;
 
-            if (timeDiffMs > 0 && valueDiff >= 0) {
-              const timeDiffMinutes = timeDiffMs / 60000;
-              const ratePerMinute = valueDiff / timeDiffMinutes;
-              rates[type].push({
-                timestamp: curr.timestamp,
-                ratePerMinute: Math.round(ratePerMinute * 100) / 100,
-              });
-            }
+          if (timeDiffMs > 0 && valueDiff >= 0) {
+            const timeDiffMinutes = timeDiffMs / 60000;
+            const ratePerMinute = valueDiff / timeDiffMinutes;
+            rates[type].push({
+              timestamp: curr.timestamp,
+              ratePerMinute: Math.round(ratePerMinute * 100) / 100,
+            });
           }
         }
       }
     } else {
-      rates = databaseService.getPacketRates(nodeId, packetTypes, cutoffTime);
+      rates = await databaseService.getPacketRatesAsync(nodeId, packetTypes, cutoffTime);
     }
 
     res.json(rates);
@@ -3522,13 +3881,13 @@ apiRouter.get('/telemetry/:nodeId/linkquality', optionalAuth(), async (req, res)
 });
 
 // Delete telemetry data for a specific node and type
-apiRouter.delete('/telemetry/:nodeId/:telemetryType', requireAuth(), requirePermission('info', 'write'), (req, res) => {
+apiRouter.delete('/telemetry/:nodeId/:telemetryType', requireAuth(), requirePermission('info', 'write'), async (req, res) => {
   try {
     const { nodeId, telemetryType } = req.params;
 
     logger.info(`Purging telemetry data for node ${nodeId}, type ${telemetryType}`);
 
-    const deleted = databaseService.deleteTelemetryByNodeAndType(nodeId, telemetryType);
+    const deleted = await databaseService.telemetry.deleteTelemetryByNodeAndType(nodeId, telemetryType);
 
     if (deleted) {
       logger.info(`Successfully purged ${telemetryType} telemetry for node ${nodeId}`);
@@ -3545,7 +3904,7 @@ apiRouter.delete('/telemetry/:nodeId/:telemetryType', requireAuth(), requirePerm
 // Check which nodes have telemetry data
 apiRouter.get('/telemetry/available/nodes', requirePermission('info', 'read'), async (req, res) => {
   try {
-    const allNodes = databaseService.getAllNodes();
+    const allNodes = await databaseService.nodes.getAllNodes();
     // Filter nodes based on channel read permissions
     const nodes = await filterNodesByChannelPermission(allNodes, (req as any).user);
 
@@ -3557,7 +3916,7 @@ apiRouter.get('/telemetry/available/nodes', requirePermission('info', 'read'), a
     const estimatedPositionTypes = new Set(['estimated_latitude', 'estimated_longitude']);
 
     // Efficient bulk query: get all telemetry types for all nodes at once
-    const nodeTelemetryTypes = databaseService.getAllNodesTelemetryTypes();
+    const nodeTelemetryTypes = await databaseService.getAllNodesTelemetryTypesAsync();
 
     nodes.forEach(node => {
       const telemetryTypes = nodeTelemetryTypes.get(node.nodeId);
@@ -3584,7 +3943,7 @@ apiRouter.get('/telemetry/available/nodes', requirePermission('info', 'read'), a
     const nodesWithPKC: string[] = [];
 
     // Get the local node ID to ensure it's always marked as secure
-    const localNodeNumStr = databaseService.getSetting('localNodeNum');
+    const localNodeNumStr = await databaseService.settings.getSetting('localNodeNum');
     let localNodeId: string | null = null;
     if (localNodeNumStr) {
       const localNodeNum = parseInt(localNodeNumStr, 10);
@@ -3612,9 +3971,9 @@ apiRouter.get('/telemetry/available/nodes', requirePermission('info', 'read'), a
 });
 
 // Connection status endpoint
-apiRouter.get('/connection', optionalAuth(), (req, res) => {
+apiRouter.get('/connection', optionalAuth(), async (req, res) => {
   try {
-    const status = meshtasticManager.getConnectionStatus();
+    const status = await meshtasticManager.getConnectionStatus();
     // Hide nodeIp from anonymous users
     if (!req.session.userId) {
       const { nodeIp, ...statusWithoutNodeIp } = status;
@@ -3654,7 +4013,7 @@ apiRouter.get('/device/security-keys', requireAuth(), async (_req, res) => {
 
 // Consolidated polling endpoint - reduces multiple API calls to one
 apiRouter.get('/poll', optionalAuth(), async (req, res) => {
-  logger.info('🔔 [POLL] Endpoint called');
+  logger.debug('🔔 [POLL] Endpoint called');
   try {
     const result: {
       connection?: any;
@@ -3666,13 +4025,14 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       config?: any;
       deviceConfig?: any;
       traceroutes?: any[];
+      deviceNodeNums?: number[];
     } = {};
 
     // Pre-compute shared values used across multiple sections
     const user = (req as any).user;
     const userId = req.user?.id ?? null;
     const localNodeInfo = meshtasticManager.getLocalNodeInfo();
-    const allMemoryNodes = meshtasticManager.getAllNodes();
+    const allMemoryNodes = await meshtasticManager.getAllNodesAsync();
     const filteredMemoryNodes = await filterNodesByChannelPermission(allMemoryNodes, user);
     const hasChannelsRead = req.user?.isAdmin || await hasPermission(req.user!, 'channel_0', 'read');
     const hasMessagesRead = req.user?.isAdmin || await hasPermission(req.user!, 'messages', 'read');
@@ -3681,7 +4041,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 1. Connection status (always available)
     try {
-      const connectionStatus = meshtasticManager.getConnectionStatus();
+      const connectionStatus = await meshtasticManager.getConnectionStatus();
       // Hide nodeIp from anonymous users
       if (!req.session.userId) {
         const { nodeIp, ...statusWithoutNodeIp } = connectionStatus;
@@ -3696,7 +4056,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 2. Nodes (always available with optionalAuth, filtered by channel permissions)
     try {
-      const estimatedPositions = databaseService.getAllNodesEstimatedPositions();
+      const estimatedPositions = await databaseService.getAllNodesEstimatedPositionsAsync();
       result.nodes = await Promise.all(filteredMemoryNodes.map(node => enhanceNodeForClient(node, user, estimatedPositions, canViewPrivate)));
     } catch (error) {
       logger.error('Error fetching nodes in poll:', error);
@@ -3706,7 +4066,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
     // 3. Messages (requires any channel permission OR messages permission)
     try {
       if (hasChannelsRead || hasMessagesRead) {
-        let messages = meshtasticManager.getRecentMessages(100);
+        let messages = await meshtasticManager.getRecentMessages(100);
 
         // Filter messages based on permissions
         if (hasChannelsRead && !hasMessagesRead) {
@@ -3765,7 +4125,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 5. Channels (filtered based on per-channel read permissions)
     try {
-      const allChannels = databaseService.getAllChannels();
+      const allChannels = await databaseService.channels.getAllChannels();
 
       // Filter channels async
       const filteredChannels: typeof allChannels = [];
@@ -3817,7 +4177,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
     try {
       if (hasInfoRead) {
         // Use DB nodes for telemetry (has telemetryTypes), filtered by channel permissions
-        const allDbNodes = databaseService.getAllNodes();
+        const allDbNodes = await databaseService.nodes.getAllNodes();
         const dbNodes = await filterNodesByChannelPermission(allDbNodes, req.user);
 
         const nodesWithTelemetry: string[] = [];
@@ -3827,7 +4187,7 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
         const weatherTypes = new Set(['temperature', 'humidity', 'pressure']);
         const estimatedPositionTypes = new Set(['estimated_latitude', 'estimated_longitude']);
 
-        const nodeTelemetryTypes = databaseService.getAllNodesTelemetryTypes();
+        const nodeTelemetryTypes = await databaseService.getAllNodesTelemetryTypesAsync();
 
         dbNodes.forEach(node => {
           const telemetryTypes = nodeTelemetryTypes.get(node.nodeId);
@@ -3868,13 +4228,13 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
 
     // 7. Config (always available with optionalAuth)
     try {
-      const localNodeNumStr = databaseService.getSetting('localNodeNum');
+      const localNodeNumStr = await databaseService.settings.getSetting('localNodeNum');
 
       let deviceMetadata = undefined;
       let localNodeInfo = undefined;
       if (localNodeNumStr) {
         const localNodeNum = parseInt(localNodeNumStr, 10);
-        const currentNode = databaseService.getNode(localNodeNum);
+        const currentNode = await databaseService.nodes.getNode(localNodeNum);
 
         if (currentNode) {
           deviceMetadata = {
@@ -3936,13 +4296,13 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       const cutoffTime = Date.now() - hoursParam * 60 * 60 * 1000;
 
       // Calculate dynamic default limit based on settings
-      const tracerouteIntervalMinutes = parseInt(databaseService.getSetting('tracerouteIntervalMinutes') || '5');
-      const maxNodeAgeHours = parseInt(databaseService.getSetting('maxNodeAgeHours') || '24');
+      const tracerouteIntervalMinutes = parseInt(await databaseService.settings.getSetting('tracerouteIntervalMinutes') || '5');
+      const maxNodeAgeHours = parseInt(await databaseService.settings.getSetting('maxNodeAgeHours') || '24');
       const traceroutesPerHour = tracerouteIntervalMinutes > 0 ? 60 / tracerouteIntervalMinutes : 12;
       let limit = Math.ceil(traceroutesPerHour * maxNodeAgeHours * 1.1);
       limit = Math.max(limit, 100);
 
-      const allTraceroutes = databaseService.getAllTraceroutes(limit);
+      const allTraceroutes = await databaseService.traceroutes.getAllTraceroutes(limit);
       const recentTraceroutes = allTraceroutes.filter(tr => tr.timestamp >= cutoffTime);
 
       // Add hopCount for each traceroute
@@ -3968,6 +4328,9 @@ apiRouter.get('/poll', optionalAuth(), async (req, res) => {
       logger.error('Error fetching traceroutes in poll:', error);
     }
 
+    // 10. Device node numbers (nodes in the connected radio's local database)
+    result.deviceNodeNums = meshtasticManager.getDeviceNodeNums();
+
     res.json(result);
   } catch (error) {
     logger.error('Error in consolidated poll endpoint:', error);
@@ -3981,7 +4344,7 @@ apiRouter.post('/connection/disconnect', requirePermission('connection', 'write'
     await meshtasticManager.userDisconnect();
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'connection_disconnected',
       'connection',
@@ -4002,7 +4365,7 @@ apiRouter.post('/connection/reconnect', requirePermission('connection', 'write')
     const success = await meshtasticManager.userReconnect();
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'connection_reconnected',
       'connection',
@@ -4021,12 +4384,12 @@ apiRouter.post('/connection/reconnect', requirePermission('connection', 'write')
 });
 
 // Get detailed connection info (authenticated users only)
-apiRouter.get('/connection/info', requireAuth(), (_req, res) => {
+apiRouter.get('/connection/info', requireAuth(), async (_req, res) => {
   try {
-    const status = meshtasticManager.getConnectionStatus();
+    const status = await meshtasticManager.getConnectionStatus();
     const env = getEnvironmentConfig();
-    const ipOverride = databaseService.getSetting('meshtasticNodeIpOverride');
-    const portOverride = databaseService.getSetting('meshtasticTcpPortOverride');
+    const ipOverride = await databaseService.settings.getSetting('meshtasticNodeIpOverride');
+    const portOverride = await databaseService.settings.getSetting('meshtasticTcpPortOverride');
 
     res.json({
       ...status,
@@ -4066,7 +4429,7 @@ apiRouter.post('/connection/configure', requireAdmin(), async (req, res) => {
     await meshtasticManager.setNodeIpOverride(nodeIp);
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'connection_address_changed',
       'connection',
@@ -4089,13 +4452,13 @@ apiRouter.post('/connection/configure', requireAdmin(), async (req, res) => {
 apiRouter.get('/config', optionalAuth(), async (req, res) => {
   try {
     // Get the local node number from settings to include rebootCount
-    const localNodeNumStr = databaseService.getSetting('localNodeNum');
+    const localNodeNumStr = await databaseService.settings.getSetting('localNodeNum');
 
     let deviceMetadata = undefined;
     let localNodeInfo = undefined;
     if (localNodeNumStr) {
       const localNodeNum = parseInt(localNodeNumStr, 10);
-      const currentNode = databaseService.getNode(localNodeNum);
+      const currentNode = await databaseService.nodes.getNode(localNodeNum);
 
       if (currentNode) {
         deviceMetadata = {
@@ -4197,9 +4560,9 @@ apiRouter.get('/device/backup', requirePermission('configuration', 'read'), asyn
 // Get backup settings
 apiRouter.get('/backup/settings', requirePermission('configuration', 'read'), async (_req, res) => {
   try {
-    const enabled = databaseService.getSetting('backup_enabled') === 'true';
-    const maxBackups = parseInt(databaseService.getSetting('backup_maxBackups') || '7', 10);
-    const backupTime = databaseService.getSetting('backup_time') || '02:00';
+    const enabled = await databaseService.settings.getSetting('backup_enabled') === 'true';
+    const maxBackups = parseInt(await databaseService.settings.getSetting('backup_maxBackups') || '7', 10);
+    const backupTime = await databaseService.settings.getSetting('backup_time') || '02:00';
 
     res.json({
       enabled,
@@ -4234,9 +4597,9 @@ apiRouter.post('/backup/settings', requirePermission('configuration', 'write'), 
     }
 
     // Save settings
-    databaseService.setSetting('backup_enabled', enabled.toString());
-    databaseService.setSetting('backup_maxBackups', maxBackups.toString());
-    databaseService.setSetting('backup_time', backupTime);
+    await databaseService.settings.setSetting('backup_enabled', enabled.toString());
+    await databaseService.settings.setSetting('backup_maxBackups', maxBackups.toString());
+    await databaseService.settings.setSetting('backup_time', backupTime);
 
     logger.info(`⚙️  Backup settings updated: enabled=${enabled}, maxBackups=${maxBackups}, time=${backupTime}`);
 
@@ -4324,7 +4687,7 @@ apiRouter.post('/system/backup', requirePermission('configuration', 'write'), as
     const dirname = await systemBackupService.createBackup('manual');
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'system_backup_created',
       'system_backup',
@@ -4396,7 +4759,7 @@ apiRouter.get('/system/backup/download/:dirname', requirePermission('configurati
     });
 
     // Audit log before streaming
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'system_backup_downloaded',
       'system_backup',
@@ -4431,7 +4794,7 @@ apiRouter.delete('/system/backup/delete/:dirname', requirePermission('configurat
     await systemBackupService.deleteBackup(dirname);
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'system_backup_deleted',
       'system_backup',
@@ -4454,9 +4817,9 @@ apiRouter.delete('/system/backup/delete/:dirname', requirePermission('configurat
 // Get system backup settings
 apiRouter.get('/system/backup/settings', requirePermission('configuration', 'read'), async (_req, res) => {
   try {
-    const enabled = databaseService.getSetting('system_backup_enabled') === 'true';
-    const maxBackups = parseInt(databaseService.getSetting('system_backup_maxBackups') || '7', 10);
-    const backupTime = databaseService.getSetting('system_backup_time') || '03:00';
+    const enabled = await databaseService.settings.getSetting('system_backup_enabled') === 'true';
+    const maxBackups = parseInt(await databaseService.settings.getSetting('system_backup_maxBackups') || '7', 10);
+    const backupTime = await databaseService.settings.getSetting('system_backup_time') || '03:00';
 
     res.json({
       enabled,
@@ -4491,9 +4854,9 @@ apiRouter.post('/system/backup/settings', requirePermission('configuration', 'wr
     }
 
     // Save settings
-    databaseService.setSetting('system_backup_enabled', enabled.toString());
-    databaseService.setSetting('system_backup_maxBackups', maxBackups.toString());
-    databaseService.setSetting('system_backup_time', backupTime);
+    await databaseService.settings.setSetting('system_backup_enabled', enabled.toString());
+    await databaseService.settings.setSetting('system_backup_maxBackups', maxBackups.toString());
+    await databaseService.settings.setSetting('system_backup_time', backupTime);
 
     logger.info(`⚙️  System backup settings updated: enabled=${enabled}, maxBackups=${maxBackups}, time=${backupTime}`);
 
@@ -4512,9 +4875,9 @@ apiRouter.post('/system/backup/settings', requirePermission('configuration', 'wr
 // ==========================================
 
 // Get database maintenance status
-apiRouter.get('/maintenance/status', requirePermission('configuration', 'read'), (_req, res) => {
+apiRouter.get('/maintenance/status', requirePermission('configuration', 'read'), async (_req, res) => {
   try {
-    const status = databaseMaintenanceService.getStatus();
+    const status = await databaseMaintenanceService.getStatus();
     res.json(status);
   } catch (error) {
     logger.error('❌ Error getting maintenance status:', error);
@@ -4569,8 +4932,8 @@ apiRouter.post('/nodes/refresh', requirePermission('nodes', 'write'), async (_re
     // Trigger full node database refresh
     await meshtasticManager.refreshNodeDatabase();
 
-    const nodeCount = databaseService.getNodeCount();
-    const channelCount = databaseService.getChannelCount();
+    const nodeCount = await databaseService.nodes.getNodeCount();
+    const channelCount = await databaseService.channels.getChannelCount();
 
     logger.debug(`✅ Node refresh complete: ${nodeCount} nodes, ${channelCount} channels`);
 
@@ -4597,7 +4960,7 @@ apiRouter.post('/channels/refresh', requirePermission('messages', 'write'), asyn
     // Trigger full node database refresh (includes channels)
     await meshtasticManager.refreshNodeDatabase();
 
-    const channelCount = databaseService.getChannelCount();
+    const channelCount = await databaseService.channels.getChannelCount();
 
     logger.debug(`✅ Channel refresh complete: ${channelCount} channels`);
 
@@ -4733,11 +5096,11 @@ apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'writ
       return res.status(400).json({ error: (error as Error).message });
     }
 
-    // Validate expirationHours (optional, must be a positive integer between 1 and 168)
+    // Validate expirationHours (optional, must be an integer between 0 and 168; 0 = always retraceroute)
     let validatedExpirationHours: number | undefined;
     if (expirationHours !== undefined) {
-      if (!Number.isInteger(expirationHours) || expirationHours < 1 || expirationHours > 168) {
-        return res.status(400).json({ error: 'Invalid expirationHours value. Must be an integer between 1 and 168.' });
+      if (!Number.isInteger(expirationHours) || expirationHours < 0 || expirationHours > 168) {
+        return res.status(400).json({ error: 'Invalid expirationHours value. Must be an integer between 0 and 168.' });
       }
       validatedExpirationHours = expirationHours;
     }
@@ -4852,7 +5215,7 @@ apiRouter.post('/settings/time-sync-nodes', requirePermission('settings', 'write
       meshtasticManager.setTimeSyncInterval(enabled ? Number(intervalMinutes) : 0);
     } else if (enabled !== undefined) {
       // If only enabled/disabled changed, use existing interval
-      const currentInterval = databaseService.getAutoTimeSyncIntervalMinutes();
+      const currentInterval = await databaseService.getAutoTimeSyncIntervalMinutesAsync();
       meshtasticManager.setTimeSyncInterval(enabled ? currentInterval : 0);
     }
 
@@ -4870,15 +5233,15 @@ apiRouter.post('/settings/time-sync-nodes', requirePermission('settings', 'write
 });
 
 // Get auto-ping settings and active sessions
-apiRouter.get('/settings/auto-ping', requirePermission('settings', 'read'), (_req, res) => {
+apiRouter.get('/settings/auto-ping', requirePermission('settings', 'read'), async (_req, res) => {
   try {
     const settings = {
-      autoPingEnabled: databaseService.getSetting('autoPingEnabled') === 'true',
-      autoPingIntervalSeconds: parseInt(databaseService.getSetting('autoPingIntervalSeconds') || '30', 10),
-      autoPingMaxPings: parseInt(databaseService.getSetting('autoPingMaxPings') || '20', 10),
-      autoPingTimeoutSeconds: parseInt(databaseService.getSetting('autoPingTimeoutSeconds') || '60', 10),
+      autoPingEnabled: await databaseService.settings.getSetting('autoPingEnabled') === 'true',
+      autoPingIntervalSeconds: parseInt(await databaseService.settings.getSetting('autoPingIntervalSeconds') || '30', 10),
+      autoPingMaxPings: parseInt(await databaseService.settings.getSetting('autoPingMaxPings') || '20', 10),
+      autoPingTimeoutSeconds: parseInt(await databaseService.settings.getSetting('autoPingTimeoutSeconds') || '60', 10),
     };
-    const sessions = meshtasticManager.getAutoPingSessions();
+    const sessions = await meshtasticManager.getAutoPingSessions();
     res.json({ settings, sessions });
   } catch (error) {
     logger.error('Error fetching auto-ping settings:', error);
@@ -4887,40 +5250,40 @@ apiRouter.get('/settings/auto-ping', requirePermission('settings', 'read'), (_re
 });
 
 // Update auto-ping settings
-apiRouter.post('/settings/auto-ping', requirePermission('settings', 'write'), (req, res) => {
+apiRouter.post('/settings/auto-ping', requirePermission('settings', 'write'), async (req, res) => {
   try {
     const { autoPingEnabled, autoPingIntervalSeconds, autoPingMaxPings, autoPingTimeoutSeconds } = req.body;
 
     if (autoPingEnabled !== undefined) {
-      databaseService.setSetting('autoPingEnabled', String(autoPingEnabled));
+      await databaseService.settings.setSetting('autoPingEnabled', String(autoPingEnabled));
     }
     if (autoPingIntervalSeconds !== undefined) {
       const val = parseInt(String(autoPingIntervalSeconds), 10);
       if (isNaN(val) || val < 10) {
         return res.status(400).json({ error: 'Interval must be at least 10 seconds.' });
       }
-      databaseService.setSetting('autoPingIntervalSeconds', String(val));
+      await databaseService.settings.setSetting('autoPingIntervalSeconds', String(val));
     }
     if (autoPingMaxPings !== undefined) {
       const val = parseInt(String(autoPingMaxPings), 10);
       if (isNaN(val) || val < 1 || val > 100) {
         return res.status(400).json({ error: 'Max pings must be between 1 and 100.' });
       }
-      databaseService.setSetting('autoPingMaxPings', String(val));
+      await databaseService.settings.setSetting('autoPingMaxPings', String(val));
     }
     if (autoPingTimeoutSeconds !== undefined) {
       const val = parseInt(String(autoPingTimeoutSeconds), 10);
       if (isNaN(val) || val < 10) {
         return res.status(400).json({ error: 'Timeout must be at least 10 seconds.' });
       }
-      databaseService.setSetting('autoPingTimeoutSeconds', String(val));
+      await databaseService.settings.setSetting('autoPingTimeoutSeconds', String(val));
     }
 
     const settings = {
-      autoPingEnabled: databaseService.getSetting('autoPingEnabled') === 'true',
-      autoPingIntervalSeconds: parseInt(databaseService.getSetting('autoPingIntervalSeconds') || '30', 10),
-      autoPingMaxPings: parseInt(databaseService.getSetting('autoPingMaxPings') || '20', 10),
-      autoPingTimeoutSeconds: parseInt(databaseService.getSetting('autoPingTimeoutSeconds') || '60', 10),
+      autoPingEnabled: await databaseService.settings.getSetting('autoPingEnabled') === 'true',
+      autoPingIntervalSeconds: parseInt(await databaseService.settings.getSetting('autoPingIntervalSeconds') || '30', 10),
+      autoPingMaxPings: parseInt(await databaseService.settings.getSetting('autoPingMaxPings') || '20', 10),
+      autoPingTimeoutSeconds: parseInt(await databaseService.settings.getSetting('autoPingTimeoutSeconds') || '60', 10),
     };
 
     res.json({ success: true, settings });
@@ -4946,9 +5309,9 @@ apiRouter.post('/auto-ping/stop/:nodeNum', requirePermission('settings', 'write'
 });
 
 // Get auto key repair log (recent key repair attempts with success/fail status)
-apiRouter.get('/settings/key-repair-log', requirePermission('settings', 'read'), (_req, res) => {
+apiRouter.get('/settings/key-repair-log', requirePermission('settings', 'read'), async (_req, res) => {
   try {
-    const log = databaseService.getKeyRepairLog(50);
+    const log = await databaseService.getKeyRepairLogAsync(50);
     res.json({
       success: true,
       log,
@@ -4959,16 +5322,38 @@ apiRouter.get('/settings/key-repair-log', requirePermission('settings', 'read'),
   }
 });
 
+// Auto-delete-by-distance log
+apiRouter.get('/settings/distance-delete/log', requirePermission('settings', 'read'), async (_req, res) => {
+  try {
+    const entries = await databaseService.misc.getDistanceDeleteLog(10);
+    res.json(entries);
+  } catch (error) {
+    logger.error('Error fetching distance-delete log:', error);
+    res.status(500).json({ error: 'Failed to fetch log' });
+  }
+});
+
+// Auto-delete-by-distance run now
+apiRouter.post('/settings/distance-delete/run-now', requirePermission('settings', 'write'), async (_req, res) => {
+  try {
+    const result = await autoDeleteByDistanceService.runNow();
+    res.json(result);
+  } catch (error) {
+    logger.error('Error running distance-delete:', error);
+    res.status(500).json({ error: 'Failed to run distance delete' });
+  }
+});
+
 // Note: GET/POST/DELETE /settings routes are in routes/settingsRoutes.ts
 
 // Mark all nodes as welcomed (for auto-welcome feature)
-apiRouter.post('/settings/mark-all-welcomed', requirePermission('settings', 'write'), (req, res) => {
+apiRouter.post('/settings/mark-all-welcomed', requirePermission('settings', 'write'), async (req, res) => {
   try {
-    const count = databaseService.markAllNodesAsWelcomed();
+    const count = await databaseService.markAllNodesAsWelcomedAsync();
     logger.info(`👋 Manually marked ${count} nodes as welcomed via API`);
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'mark_all_welcomed',
       'nodes',
@@ -4988,19 +5373,14 @@ apiRouter.post('/settings/mark-all-welcomed', requirePermission('settings', 'wri
 // User Map Preferences endpoints
 
 // Get user's map preferences
-apiRouter.get('/user/map-preferences', optionalAuth(), (req, res) => {
+apiRouter.get('/user/map-preferences', optionalAuth(), async (req, res) => {
   try {
-    // For PostgreSQL/MySQL, map preferences not yet implemented
-    if (databaseService.drizzleDbType === 'postgres' || databaseService.drizzleDbType === 'mysql') {
-      return res.json({ preferences: null });
-    }
-
     // Anonymous users get null (will fall back to defaults in frontend)
     if (!req.user || req.user.username === 'anonymous') {
       return res.json({ preferences: null });
     }
 
-    const preferences = databaseService.userModel.getMapPreferences(req.user.id);
+    const preferences = await databaseService.getMapPreferencesAsync(req.user.id);
     res.json({ preferences });
   } catch (error) {
     logger.error('Error fetching user map preferences:', error);
@@ -5009,13 +5389,8 @@ apiRouter.get('/user/map-preferences', optionalAuth(), (req, res) => {
 });
 
 // Save user's map preferences
-apiRouter.post('/user/map-preferences', requireAuth(), (req, res) => {
+apiRouter.post('/user/map-preferences', requireAuth(), async (req, res) => {
   try {
-    // For PostgreSQL/MySQL, map preferences not yet implemented
-    if (databaseService.drizzleDbType === 'postgres' || databaseService.drizzleDbType === 'mysql') {
-      return res.json({ success: true, message: 'Map preferences not yet implemented for PostgreSQL' });
-    }
-
     // Prevent saving preferences for anonymous user
     if (req.user!.username === 'anonymous') {
       return res.status(403).json({ error: 'Cannot save preferences for anonymous user' });
@@ -5042,7 +5417,7 @@ apiRouter.post('/user/map-preferences', requireAuth(), (req, res) => {
     }
 
     // Save preferences
-    databaseService.userModel.saveMapPreferences(req.user!.id, {
+    await databaseService.saveMapPreferencesAsync(req.user!.id, {
       mapTileset,
       showPaths,
       showNeighborInfo,
@@ -5066,9 +5441,9 @@ apiRouter.post('/user/map-preferences', requireAuth(), (req, res) => {
 // Custom Themes endpoints
 
 // Get all custom themes (available to all users for reading)
-apiRouter.get('/themes', optionalAuth(), (_req, res) => {
+apiRouter.get('/themes', optionalAuth(), async (_req, res) => {
   try {
-    const themes = databaseService.getAllCustomThemes();
+    const themes = await databaseService.misc.getAllCustomThemes();
     res.json({ themes });
   } catch (error) {
     logger.error('Error fetching custom themes:', error);
@@ -5077,10 +5452,10 @@ apiRouter.get('/themes', optionalAuth(), (_req, res) => {
 });
 
 // Get a specific theme by slug
-apiRouter.get('/themes/:slug', optionalAuth(), (req, res) => {
+apiRouter.get('/themes/:slug', optionalAuth(), async (req, res) => {
   try {
     const { slug } = req.params;
-    const theme = databaseService.getCustomThemeBySlug(slug);
+    const theme = await databaseService.misc.getCustomThemeBySlug(slug);
 
     if (!theme) {
       return res.status(404).json({ error: 'Theme not found' });
@@ -5094,7 +5469,7 @@ apiRouter.get('/themes/:slug', optionalAuth(), (req, res) => {
 });
 
 // Create a new custom theme
-apiRouter.post('/themes', requirePermission('themes', 'write'), (req, res) => {
+apiRouter.post('/themes', requirePermission('themes', 'write'), async (req, res) => {
   try {
     const { name, slug, definition } = req.body;
 
@@ -5110,7 +5485,7 @@ apiRouter.post('/themes', requirePermission('themes', 'write'), (req, res) => {
     }
 
     // Check if theme already exists
-    const existingTheme = databaseService.getCustomThemeBySlug(slug);
+    const existingTheme = await databaseService.misc.getCustomThemeBySlug(slug);
     if (existingTheme) {
       return res.status(409).json({ error: 'Theme with this slug already exists' });
     }
@@ -5119,14 +5494,14 @@ apiRouter.post('/themes', requirePermission('themes', 'write'), (req, res) => {
     if (!databaseService.validateThemeDefinition(definition)) {
       return res
         .status(400)
-        .json({ error: 'Invalid theme definition. All 26 color variables must be valid hex codes' });
+        .json({ error: 'Invalid theme definition. All required color variables must be valid hex codes' });
     }
 
     // Create the theme
-    const theme = databaseService.createCustomTheme(name, slug, definition, req.user!.id);
+    const theme = await databaseService.misc.createCustomTheme(name, slug, JSON.stringify(definition), req.user!.id);
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'theme_created',
       'themes',
@@ -5144,13 +5519,13 @@ apiRouter.post('/themes', requirePermission('themes', 'write'), (req, res) => {
 });
 
 // Update an existing custom theme
-apiRouter.put('/themes/:slug', requirePermission('themes', 'write'), (req, res) => {
+apiRouter.put('/themes/:slug', requirePermission('themes', 'write'), async (req, res) => {
   try {
     const { slug } = req.params;
     const { name, definition } = req.body;
 
     // Get existing theme for audit log
-    const existingTheme = databaseService.getCustomThemeBySlug(slug);
+    const existingTheme = await databaseService.misc.getCustomThemeBySlug(slug);
     if (!existingTheme) {
       return res.status(404).json({ error: 'Theme not found' });
     }
@@ -5174,7 +5549,7 @@ apiRouter.put('/themes/:slug', requirePermission('themes', 'write'), (req, res) 
       if (!databaseService.validateThemeDefinition(definition)) {
         return res
           .status(400)
-          .json({ error: 'Invalid theme definition. All 26 color variables must be valid hex codes' });
+          .json({ error: 'Invalid theme definition. All required color variables must be valid hex codes' });
       }
       updates.definition = definition;
     }
@@ -5184,10 +5559,13 @@ apiRouter.put('/themes/:slug', requirePermission('themes', 'write'), (req, res) 
     }
 
     // Update the theme
-    databaseService.updateCustomTheme(slug, updates);
+    const repoUpdates: Record<string, string> = {};
+    if (updates.name) repoUpdates.name = updates.name;
+    if (updates.definition) repoUpdates.definition = JSON.stringify(updates.definition);
+    await databaseService.misc.updateCustomTheme(slug, repoUpdates);
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'theme_updated',
       'themes',
@@ -5205,12 +5583,12 @@ apiRouter.put('/themes/:slug', requirePermission('themes', 'write'), (req, res) 
 });
 
 // Delete a custom theme
-apiRouter.delete('/themes/:slug', requirePermission('themes', 'write'), (req, res) => {
+apiRouter.delete('/themes/:slug', requirePermission('themes', 'write'), async (req, res) => {
   try {
     const { slug } = req.params;
 
     // Get theme for audit log before deletion
-    const theme = databaseService.getCustomThemeBySlug(slug);
+    const theme = await databaseService.misc.getCustomThemeBySlug(slug);
     if (!theme) {
       return res.status(404).json({ error: 'Theme not found' });
     }
@@ -5220,10 +5598,10 @@ apiRouter.delete('/themes/:slug', requirePermission('themes', 'write'), (req, re
     }
 
     // Delete the theme
-    databaseService.deleteCustomTheme(slug);
+    await databaseService.misc.deleteCustomTheme(slug);
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'theme_deleted',
       'themes',
@@ -5245,7 +5623,7 @@ apiRouter.post('/announce/send', requirePermission('automation', 'write'), async
   try {
     await meshtasticManager.sendAutoAnnouncement();
     // Update last announcement time
-    databaseService.setSetting('lastAnnouncementTime', Date.now().toString());
+    await databaseService.settings.setSetting('lastAnnouncementTime', Date.now().toString());
     res.json({ success: true, message: 'Announcement sent successfully' });
   } catch (error) {
     logger.error('Error sending announcement:', error);
@@ -5253,9 +5631,9 @@ apiRouter.post('/announce/send', requirePermission('automation', 'write'), async
   }
 });
 
-apiRouter.get('/announce/last', requirePermission('automation', 'read'), (_req, res) => {
+apiRouter.get('/announce/last', requirePermission('automation', 'read'), async (_req, res) => {
   try {
-    const lastAnnouncementTime = databaseService.getSetting('lastAnnouncementTime');
+    const lastAnnouncementTime = await databaseService.settings.getSetting('lastAnnouncementTime');
     res.json({ lastAnnouncementTime: lastAnnouncementTime ? parseInt(lastAnnouncementTime) : null });
   } catch (error) {
     logger.error('Error fetching last announcement time:', error);
@@ -5281,13 +5659,13 @@ apiRouter.get('/announce/preview', requirePermission('automation', 'read'), asyn
 // Danger zone endpoints
 apiRouter.post('/purge/nodes', requireAdmin(), async (req, res) => {
   try {
-    const nodeCount = databaseService.getNodeCount();
-    databaseService.purgeAllNodes();
+    const nodeCount = await databaseService.nodes.getNodeCount();
+    await databaseService.purgeAllNodesAsync();
     // Trigger a node refresh after purging
     await meshtasticManager.refreshNodeDatabase();
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'nodes_purged',
       'nodes',
@@ -5302,12 +5680,12 @@ apiRouter.post('/purge/nodes', requireAdmin(), async (req, res) => {
   }
 });
 
-apiRouter.post('/purge/telemetry', requireAdmin(), (req, res) => {
+apiRouter.post('/purge/telemetry', requireAdmin(), async (req, res) => {
   try {
-    databaseService.purgeAllTelemetry();
+    await databaseService.purgeAllTelemetryAsync();
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'telemetry_purged',
       'telemetry',
@@ -5322,13 +5700,13 @@ apiRouter.post('/purge/telemetry', requireAdmin(), (req, res) => {
   }
 });
 
-apiRouter.post('/purge/messages', requireAdmin(), (req, res) => {
+apiRouter.post('/purge/messages', requireAdmin(), async (req, res) => {
   try {
-    const messageCount = databaseService.getMessageCount();
-    databaseService.purgeAllMessages();
+    const messageCount = await databaseService.messages.getMessageCount();
+    await databaseService.messages.deleteAllMessages();
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'messages_purged',
       'messages',
@@ -5343,15 +5721,16 @@ apiRouter.post('/purge/messages', requireAdmin(), (req, res) => {
   }
 });
 
-apiRouter.post('/purge/traceroutes', requireAdmin(), (req, res) => {
+apiRouter.post('/purge/traceroutes', requireAdmin(), async (req, res) => {
   try {
-    databaseService.purgeAllTraceroutes();
+    await databaseService.traceroutes.deleteAllTraceroutes();
+    await databaseService.traceroutes.deleteAllRouteSegments();
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'traceroutes_purged',
-      'traceroutes',
+      'traceroute',
       'All traceroutes and route segments purged',
       req.ip || null
     );
@@ -5555,7 +5934,7 @@ apiRouter.post('/config/module/request', requirePermission('configuration', 'wri
 
 apiRouter.post('/device/reboot', requirePermission('configuration', 'write'), async (req, res) => {
   try {
-    const seconds = req.body?.seconds || 5;
+    const seconds = req.body?.seconds || 10;
     await meshtasticManager.rebootDevice(seconds);
     res.json({ success: true, message: `Device will reboot in ${seconds} seconds` });
   } catch (error) {
@@ -5679,7 +6058,15 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
             if (finalConfig.deviceConfig?.device) {
               config = {
                 role: finalConfig.deviceConfig.device.role,
-                nodeInfoBroadcastSecs: finalConfig.deviceConfig.device.nodeInfoBroadcastSecs
+                nodeInfoBroadcastSecs: finalConfig.deviceConfig.device.nodeInfoBroadcastSecs,
+                rebroadcastMode: finalConfig.deviceConfig.device.rebroadcastMode,
+                tzdef: finalConfig.deviceConfig.device.tzdef,
+                doubleTapAsButtonPress: finalConfig.deviceConfig.device.doubleTapAsButtonPress,
+                disableTripleClick: finalConfig.deviceConfig.device.disableTripleClick,
+                ledHeartbeatDisabled: finalConfig.deviceConfig.device.ledHeartbeatDisabled,
+                buzzerMode: finalConfig.deviceConfig.device.buzzerMode,
+                buttonGpio: finalConfig.deviceConfig.device.buttonGpio,
+                buzzerGpio: finalConfig.deviceConfig.device.buzzerGpio,
               };
             } else {
               return res.status(404).json({ error: 'Device config not available. The device may not have sent its configuration yet.' });
@@ -5729,7 +6116,7 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
               };
               // If fixedPosition is enabled, get the coordinates from the node's stored position
               if (finalConfig.deviceConfig.position.fixedPosition && localNodeNum) {
-                const nodeData = databaseService.getNode(localNodeNum);
+                const nodeData = await databaseService.nodes.getNode(localNodeNum);
                 if (nodeData?.latitude && nodeData?.longitude) {
                   config.fixedLatitude = nodeData.latitude;
                   config.fixedLongitude = nodeData.longitude;
@@ -5771,26 +6158,7 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
               // Convert admin keys from Uint8Array to base64 strings for UI
               const localAdminKeys = finalConfig.deviceConfig.security.adminKey || [];
               config = {
-                adminKeys: localAdminKeys.map((key: any) => {
-                  if (key instanceof Uint8Array || Buffer.isBuffer(key)) {
-                    return Buffer.from(key).toString('base64');
-                  }
-                  // Handle JSON-serialized Buffer objects (e.g., { type: 'Buffer', data: [...] })
-                  if (key && typeof key === 'object' && key.type === 'Buffer' && Array.isArray(key.data)) {
-                    return Buffer.from(key.data).toString('base64');
-                  }
-                  // Handle array of bytes
-                  if (Array.isArray(key)) {
-                    return Buffer.from(key).toString('base64');
-                  }
-                  // Already a string (base64)
-                  if (typeof key === 'string') {
-                    return key;
-                  }
-                  // Fallback - try to convert
-                  logger.warn('Unknown admin key format:', typeof key, key);
-                  return String(key);
-                }),
+                adminKeys: localAdminKeys.map((key: any) => bytesToBase64(key)),
                 isManaged: finalConfig.deviceConfig.security.isManaged,
                 serialEnabled: finalConfig.deviceConfig.security.serialEnabled,
                 debugLogApiEnabled: finalConfig.deviceConfig.security.debugLogApiEnabled,
@@ -5908,7 +6276,15 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
           case 'device':
             config = {
               role: remoteConfig.role,
-              nodeInfoBroadcastSecs: remoteConfig.nodeInfoBroadcastSecs
+              nodeInfoBroadcastSecs: remoteConfig.nodeInfoBroadcastSecs,
+              rebroadcastMode: remoteConfig.rebroadcastMode,
+              tzdef: remoteConfig.tzdef,
+              doubleTapAsButtonPress: remoteConfig.doubleTapAsButtonPress,
+              disableTripleClick: remoteConfig.disableTripleClick,
+              ledHeartbeatDisabled: remoteConfig.ledHeartbeatDisabled,
+              buzzerMode: remoteConfig.buzzerMode,
+              buttonGpio: remoteConfig.buttonGpio,
+              buzzerGpio: remoteConfig.buzzerGpio,
             };
             break;
           case 'lora':
@@ -5949,7 +6325,7 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
             };
             // If fixedPosition is enabled, get the coordinates from the node's stored position
             if (remoteConfig.fixedPosition) {
-              const nodeData = databaseService.getNode(destinationNodeNum);
+              const nodeData = await databaseService.nodes.getNode(destinationNodeNum);
               if (nodeData?.latitude && nodeData?.longitude) {
                 config.fixedLatitude = nodeData.latitude;
                 config.fixedLongitude = nodeData.longitude;
@@ -5974,26 +6350,7 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
             // Convert admin keys from Uint8Array to base64 strings for UI
             const remoteAdminKeys = remoteConfig.adminKey || [];
             config = {
-              adminKeys: remoteAdminKeys.map((key: any) => {
-                if (key instanceof Uint8Array || Buffer.isBuffer(key)) {
-                  return Buffer.from(key).toString('base64');
-                }
-                // Handle JSON-serialized Buffer objects (e.g., { type: 'Buffer', data: [...] })
-                if (key && typeof key === 'object' && key.type === 'Buffer' && Array.isArray(key.data)) {
-                  return Buffer.from(key.data).toString('base64');
-                }
-                // Handle array of bytes
-                if (Array.isArray(key)) {
-                  return Buffer.from(key).toString('base64');
-                }
-                // Already a string (base64)
-                if (typeof key === 'string') {
-                  return key;
-                }
-                // Fallback - try to convert
-                logger.warn('Unknown admin key format:', typeof key, key);
-                return String(key);
-              }),
+              adminKeys: remoteAdminKeys.map((key: any) => bytesToBase64(key)),
               isManaged: remoteConfig.isManaged,
               serialEnabled: remoteConfig.serialEnabled,
               debugLogApiEnabled: remoteConfig.debugLogApiEnabled,
@@ -6149,7 +6506,7 @@ apiRouter.post('/admin/get-channel', requireAdmin(), async (req, res) => {
 
     if (isLocalNode) {
       // For local node, get from database
-      const channel = databaseService.getChannelById(channelIndex);
+      const channel = await databaseService.channels.getChannelById(channelIndex);
       if (channel) {
         return res.json({ channel: {
           name: channel.name || '',
@@ -6241,7 +6598,7 @@ apiRouter.post('/admin/load-owner', requireAdmin(), async (req, res) => {
         // Get the public key from database if available (stored from security config)
         let publicKeyBase64: string | undefined;
         if (localNodeInfo.nodeNum) {
-          const nodeData = databaseService.getNode(localNodeInfo.nodeNum);
+          const nodeData = await databaseService.nodes.getNode(localNodeInfo.nodeNum);
           publicKeyBase64 = nodeData?.publicKey || undefined;
         }
         return res.json({ owner: {
@@ -6288,7 +6645,7 @@ apiRouter.post('/admin/get-device-metadata', requireAdmin(), async (req, res) =>
       const localNodeInfo = meshtasticManager.getLocalNodeInfo();
       if (localNodeInfo) {
         // Get node data from database for additional info
-        const nodeData = localNodeInfo.nodeNum ? databaseService.getNode(localNodeInfo.nodeNum) : null;
+        const nodeData = localNodeInfo.nodeNum ? await databaseService.nodes.getNode(localNodeInfo.nodeNum) : null;
         return res.json({
           deviceMetadata: {
             firmwareVersion: localNodeInfo.firmwareVersion || 'Unknown',
@@ -6350,7 +6707,7 @@ apiRouter.post('/admin/get-device-metadata', requireAdmin(), async (req, res) =>
 // Admin reboot endpoint - sends reboot command to a node
 apiRouter.post('/admin/reboot', requireAdmin(), async (req, res) => {
   try {
-    const { nodeNum, seconds = 5 } = req.body;
+    const { nodeNum, seconds = 10 } = req.body;
 
     const destinationNodeNum = nodeNum !== undefined ? Number(nodeNum) : (meshtasticManager.getLocalNodeInfo()?.nodeNum || 0);
 
@@ -6361,6 +6718,32 @@ apiRouter.post('/admin/reboot', requireAdmin(), async (req, res) => {
   } catch (error: any) {
     logger.error('Error sending reboot command:', error);
     res.status(500).json({ error: error.message || 'Failed to send reboot command' });
+  }
+});
+
+// Admin suppressed ghosts endpoint - list currently suppressed ghost nodes
+apiRouter.get('/admin/suppressed-ghosts', requireAdmin(), async (_req, res) => {
+  try {
+    const suppressed = await databaseService.getSuppressedGhostNodesAsync();
+    res.json({ success: true, suppressedNodes: suppressed });
+  } catch (error: any) {
+    logger.error('Error getting suppressed ghosts:', error);
+    res.status(500).json({ error: error.message || 'Failed to get suppressed ghosts' });
+  }
+});
+
+// Admin unsuppress ghost endpoint - manually unsuppress a ghost node
+apiRouter.delete('/admin/suppressed-ghosts/:nodeNum', requireAdmin(), async (req, res) => {
+  try {
+    const nodeNum = Number(req.params.nodeNum);
+    if (isNaN(nodeNum)) {
+      return res.status(400).json({ error: 'Invalid nodeNum' });
+    }
+    await databaseService.unsuppressGhostNodeAsync(nodeNum);
+    res.json({ success: true, message: `Unsuppressed node !${nodeNum.toString(16).padStart(8, '0')}` });
+  } catch (error: any) {
+    logger.error('Error unsuppressing ghost:', error);
+    res.status(500).json({ error: error.message || 'Failed to unsuppress ghost' });
   }
 });
 
@@ -6401,7 +6784,7 @@ apiRouter.post('/admin/export-config', requireAdmin(), async (req, res) => {
     const channels = [];
     for (const channelId of channelIds) {
       if (isLocalNode) {
-        const channel = databaseService.getChannelById(channelId);
+        const channel = await databaseService.channels.getChannelById(channelId);
         if (channel) {
           channels.push({
             psk: channel.psk ? channel.psk : 'none',
@@ -6693,7 +7076,7 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
     // Create the appropriate admin message based on command type
     switch (command) {
       case 'reboot':
-        adminMessage = protobufService.createRebootMessage(params.seconds || 5, sessionPasskey || undefined);
+        adminMessage = protobufService.createRebootMessage(params.seconds || 10, sessionPasskey || undefined);
         break;
       case 'setOwner':
         if (!params.longName || !params.shortName) {
@@ -6752,7 +7135,7 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
           // before any stale position broadcast arrives from the device firmware.
           if (isLocalNode && localNodeNum) {
             const localNodeId = `!${localNodeNum.toString(16).padStart(8, '0')}`;
-            databaseService.upsertNode({
+            await databaseService.nodes.upsertNode({
               nodeNum: localNodeNum,
               nodeId: localNodeId,
               latitude,
@@ -6897,11 +7280,22 @@ apiRouter.post('/admin/commands', requireAdmin(), async (req, res) => {
     // Send the admin command
     await meshtasticManager.sendAdminCommand(adminMessage, destinationNodeNum);
 
+    // For setSecurityConfig on the local node, update the cached config immediately
+    // so the frontend reads back the correct values before the next config sync
+    if (command === 'setSecurityConfig' && isLocalNode && params.config) {
+      meshtasticManager.updateCachedDeviceConfig('security', {
+        isManaged: params.config.isManaged,
+        serialEnabled: params.config.serialEnabled,
+        debugLogApiEnabled: params.config.debugLogApiEnabled,
+        adminChannelEnabled: params.config.adminChannelEnabled
+      });
+    }
+
     // For setFixedPosition on the local node, immediately update the database
     // so it's correct before any stale position broadcast arrives from the device firmware.
     if (command === 'setFixedPosition' && isLocalNode && localNodeNum) {
       const localNodeId = `!${localNodeNum.toString(16).padStart(8, '0')}`;
-      databaseService.upsertNode({
+      await databaseService.nodes.upsertNode({
         nodeNum: localNodeNum,
         nodeId: localNodeId,
         latitude: params.latitude,
@@ -6946,7 +7340,7 @@ apiRouter.post('/device/purge-nodedb', requirePermission('configuration', 'write
 
     // Also purge the local database
     logger.info('🗑️ Purging local node database');
-    databaseService.purgeAllNodes();
+    await databaseService.purgeAllNodesAsync();
     logger.info('✅ Local node database purged successfully');
 
     res.json({
@@ -7017,8 +7411,8 @@ apiRouter.get('/health', optionalAuth(), (_req, res) => {
 });
 
 // Detailed status endpoint - provides system statistics and connection status
-apiRouter.get('/status', optionalAuth(), (_req, res) => {
-  const connectionStatus = meshtasticManager.getConnectionStatus();
+apiRouter.get('/status', optionalAuth(), async (_req, res) => {
+  const connectionStatus = await meshtasticManager.getConnectionStatus();
   const localNode = meshtasticManager.getLocalNodeInfo();
 
   res.json({
@@ -7038,9 +7432,9 @@ apiRouter.get('/status', optionalAuth(), (_req, res) => {
         : null,
     },
     statistics: {
-      nodes: databaseService.getNodeCount(),
-      messages: databaseService.getMessageCount(),
-      channels: databaseService.getChannelCount(),
+      nodes: await databaseService.nodes.getNodeCount(),
+      messages: await databaseService.messages.getMessageCount(),
+      channels: await databaseService.channels.getChannelCount(),
     },
     uptime: process.uptime(),
   });
@@ -7177,7 +7571,7 @@ apiRouter.get('/version/check', optionalAuth(), async (_req, res) => {
     // Check if auto-upgrade immediate is enabled and trigger upgrade automatically
     let autoUpgradeTriggered = false;
     if (updateAvailable && upgradeService.isEnabled()) {
-      const autoUpgradeImmediate = databaseService.getSetting('autoUpgradeImmediate') === 'true';
+      const autoUpgradeImmediate = await databaseService.settings.getSetting('autoUpgradeImmediate') === 'true';
       if (autoUpgradeImmediate) {
         // Check if an upgrade is already in progress before triggering
         try {
@@ -7194,7 +7588,7 @@ apiRouter.get('/version/check', optionalAuth(), async (_req, res) => {
             if (upgradeResult.success) {
               autoUpgradeTriggered = true;
               logger.info(`✅ Auto-upgrade triggered successfully: ${upgradeResult.upgradeId}`);
-              databaseService.auditLog(
+              databaseService.auditLogAsync(
                 null,
                 'auto_upgrade_triggered',
                 'system',
@@ -7372,7 +7766,7 @@ apiRouter.post('/push/test', requireAdmin(), async (req, res) => {
 
     // Apply prefix if user has it enabled
     const baseBody = 'This is a test push notification from MeshMonitor';
-    const body = applyNodeNamePrefix(userId, baseBody, localNodeName);
+    const body = await applyNodeNamePrefixAsync(userId, baseBody, localNodeName);
 
     const result = await pushNotificationService.sendToUser(userId, {
       title: 'Test Notification',
@@ -7538,8 +7932,8 @@ apiRouter.get('/apprise/status', requireAdmin(), async (_req, res) => {
     const isAvailable = appriseNotificationService.isAvailable();
     res.json({
       available: isAvailable,
-      enabled: databaseService.getSetting('apprise_enabled') === 'true',
-      url: databaseService.getSetting('apprise_url') || 'http://localhost:8000',
+      enabled: await databaseService.settings.getSetting('apprise_enabled') === 'true',
+      url: await databaseService.settings.getSetting('apprise_url') || 'http://localhost:8000',
     });
   } catch (error: any) {
     logger.error('Error getting Apprise status:', error);
@@ -7570,7 +7964,7 @@ apiRouter.post('/apprise/test', requireAdmin(), async (req, res) => {
 
     // Apply prefix if user has it enabled
     const baseBody = 'This is a test notification from MeshMonitor via Apprise';
-    const body = applyNodeNamePrefix(userId, baseBody, localNodeName);
+    const body = await applyNodeNamePrefixAsync(userId, baseBody, localNodeName);
 
     // Send to user's configured URLs
     const success = await appriseNotificationService.sendNotificationToUrls(
@@ -7859,7 +8253,7 @@ apiRouter.post('/apprise/configure', requireAdmin(), async (req, res) => {
 });
 
 // Enable/disable Apprise system-wide (admin only)
-apiRouter.put('/apprise/enabled', requireAdmin(), (req, res) => {
+apiRouter.put('/apprise/enabled', requireAdmin(), async (req, res) => {
   try {
     const { enabled } = req.body;
 
@@ -7867,7 +8261,7 @@ apiRouter.put('/apprise/enabled', requireAdmin(), (req, res) => {
       return res.status(400).json({ error: 'Enabled must be a boolean' });
     }
 
-    databaseService.setSetting('apprise_enabled', enabled ? 'true' : 'false');
+    await databaseService.settings.setSetting('apprise_enabled', enabled ? 'true' : 'false');
     logger.info(`✅ Apprise ${enabled ? 'enabled' : 'disabled'} system-wide`);
     res.json({ success: true, enabled });
   } catch (error: any) {
@@ -8653,7 +9047,7 @@ if (BASE_URL) {
 }
 
 // Function to rewrite HTML with BASE_URL at runtime
-const rewriteHtml = (htmlContent: string, baseUrl: string): string => {
+const rewriteHtml = (htmlContent: string, baseUrl: string, analyticsScript?: string): string => {
   if (!baseUrl) return htmlContent;
 
   // Add <base> tag to set the base URL for all relative paths
@@ -8663,6 +9057,14 @@ const rewriteHtml = (htmlContent: string, baseUrl: string): string => {
 
   // Insert the base tag right after <head>
   let rewritten = htmlContent.replace(/<head>/, `<head>\n    ${baseTag}`);
+
+  // Inject analytics script after the base tag if provided
+  if (analyticsScript) {
+    rewritten = rewritten.replace(
+      baseTag,
+      `${baseTag}\n    ${analyticsScript}`
+    );
+  }
 
   // Replace asset paths in the HTML
   rewritten = rewritten
@@ -8687,6 +9089,23 @@ let cachedHtml: string | null = null;
 let cachedRewrittenHtml: string | null = null;
 let cachedEmbedHtml: string | null = null;
 let cachedRewrittenEmbedHtml: string | null = null;
+
+export function invalidateHtmlCache(): void {
+  cachedRewrittenHtml = null;
+  cachedRewrittenEmbedHtml = null;
+}
+
+async function getAnalyticsScript(): Promise<string> {
+  try {
+    const provider = (await databaseService.settings.getSetting('analyticsProvider') || 'none') as AnalyticsProvider;
+    if (provider === 'none') return '';
+    const configStr = await databaseService.settings.getSetting('analyticsConfig') || '{}';
+    const config = JSON.parse(configStr);
+    return generateAnalyticsScript(provider, config);
+  } catch {
+    return '';
+  }
+}
 
 // Serve static assets (JS, CSS, images)
 if (BASE_URL) {
@@ -8730,31 +9149,33 @@ if (BASE_URL) {
   });
 
   // Serve embed page (before SPA fallback)
-  app.get(`${BASE_URL}/embed/:profileId`, createEmbedCspMiddleware(), (_req: express.Request, res: express.Response) => {
+  app.get(`${BASE_URL}/embed/:profileId`, createEmbedCspMiddleware(), async (_req: express.Request, res: express.Response) => {
     if (!cachedRewrittenEmbedHtml) {
       const embedHtmlPath = path.join(buildPath, 'embed.html');
       if (!fs.existsSync(embedHtmlPath)) {
         return res.status(404).send('Embed page not found');
       }
       cachedEmbedHtml = fs.readFileSync(embedHtmlPath, 'utf-8');
-      cachedRewrittenEmbedHtml = rewriteHtml(cachedEmbedHtml, BASE_URL);
+      const embedAnalyticsScript = await getAnalyticsScript();
+      cachedRewrittenEmbedHtml = rewriteHtml(cachedEmbedHtml, BASE_URL, embedAnalyticsScript);
     }
     res.setHeader('Content-Type', 'text/html');
     res.send(cachedRewrittenEmbedHtml);
   });
 
   // Catch all handler for SPA routing - but exclude /api
-  app.get(`${BASE_URL}`, (_req: express.Request, res: express.Response) => {
+  app.get(`${BASE_URL}`, async (_req: express.Request, res: express.Response) => {
     // Use cached HTML if available, otherwise read and cache
     if (!cachedRewrittenHtml) {
       const htmlPath = path.join(buildPath, 'index.html');
       cachedHtml = fs.readFileSync(htmlPath, 'utf-8');
-      cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL);
+      const analyticsScript = await getAnalyticsScript();
+      cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL, analyticsScript);
     }
     res.type('html').send(cachedRewrittenHtml);
   });
   // Use a route pattern that Express 5 can handle
-  app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  app.use(async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     // Skip if this is not under our BASE_URL
     if (!req.path.startsWith(BASE_URL)) {
       return next();
@@ -8771,7 +9192,8 @@ if (BASE_URL) {
     if (!cachedRewrittenHtml) {
       const htmlPath = path.join(buildPath, 'index.html');
       cachedHtml = fs.readFileSync(htmlPath, 'utf-8');
-      cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL);
+      const analyticsScript = await getAnalyticsScript();
+      cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL, analyticsScript);
     }
     res.type('html').send(cachedRewrittenHtml);
   });
@@ -8876,9 +9298,10 @@ process.on('SIGTERM', () => {
 });
 
 // Data migration: Set channel field to 'dm' for existing auto-responder triggers without channel
-function migrateAutoResponderTriggers() {
+async function migrateAutoResponderTriggers() {
   try {
-    const triggersStr = databaseService.getSetting('autoResponderTriggers');
+    await databaseService.waitForReady();
+    const triggersStr = await databaseService.settings.getSetting('autoResponderTriggers');
     if (!triggersStr) {
       return; // No triggers to migrate
     }
@@ -8898,7 +9321,7 @@ function migrateAutoResponderTriggers() {
     });
 
     if (migrationCount > 0) {
-      databaseService.setSetting('autoResponderTriggers', JSON.stringify(migratedTriggers));
+      await databaseService.settings.setSetting('autoResponderTriggers', JSON.stringify(migratedTriggers));
       logger.info(`✅ Migrated ${migrationCount} auto-responder trigger(s) to default channel 'dm'`);
     }
   } catch (error) {
@@ -8933,6 +9356,9 @@ let server: ReturnType<typeof app.listen>;
 
     // Initialize WebSocket server for real-time updates
     initializeWebSocket(server, sessionMiddleware);
+
+    // Start firmware release polling (periodic GitHub checks)
+    firmwareUpdateService.startPolling();
 
     // Send server start notification
     (async () => {

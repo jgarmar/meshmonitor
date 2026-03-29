@@ -10,13 +10,114 @@
  * selectedNodeTraceroute useMemo blocks in App.tsx.
  */
 
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Popup, Polyline } from 'react-leaflet';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { calculateDistance, formatDistance } from '../utils/distance';
-import { generateCurvedArrowMarkers, generateCurvedPath, getLineWeight } from '../utils/mapHelpers';
+import { generateCurvedArrowMarkers, generateCurvedPath, getLineWeight, getSegmentSnrColor, getSegmentSnrOpacity, getTemporalOpacityMultiplier, isMqttSnr } from '../utils/mapHelpers';
 import { logger } from '../utils/logger';
 import type { DistanceUnit } from '../contexts/SettingsContext';
+
+/** Small component for route segment SNR chart with time-of-day / chronological toggle */
+function SegmentSnrChart({ chartData }: {
+  chartData: Array<{ timeDecimal: number; timeLabel: string; snr: number; fullTimestamp: number }>;
+}) {
+  const [mode, setMode] = useState<'timeOfDay' | 'chronological'>('timeOfDay');
+
+  const chronoData = useMemo(() =>
+    [...chartData].sort((a, b) => a.fullTimestamp - b.fullTimestamp).map(d => {
+      const date = new Date(d.fullTimestamp);
+      const month = (date.getMonth() + 1).toString().padStart(2, '0');
+      const day = date.getDate().toString().padStart(2, '0');
+      const hours = date.getHours().toString().padStart(2, '0');
+      const minutes = date.getMinutes().toString().padStart(2, '0');
+      return { ...d, chronoLabel: `${month}/${day} ${hours}:${minutes}`, chronoTime: d.fullTimestamp };
+    }), [chartData]);
+
+  return (
+    <div className="snr-timeline-chart">
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+        <button
+          className={`node-popup-tab ${mode === 'timeOfDay' ? 'active' : ''}`}
+          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', cursor: 'pointer', background: mode === 'timeOfDay' ? 'var(--ctp-blue)' : 'var(--ctp-surface0)', color: mode === 'timeOfDay' ? 'var(--ctp-base)' : 'var(--ctp-subtext1)' }}
+          onClick={e => { e.stopPropagation(); setMode('timeOfDay'); }}
+        >
+          Time of Day
+        </button>
+        <button
+          className={`node-popup-tab ${mode === 'chronological' ? 'active' : ''}`}
+          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', cursor: 'pointer', background: mode === 'chronological' ? 'var(--ctp-blue)' : 'var(--ctp-surface0)', color: mode === 'chronological' ? 'var(--ctp-base)' : 'var(--ctp-subtext1)' }}
+          onClick={e => { e.stopPropagation(); setMode('chronological'); }}
+        >
+          Over Time
+        </button>
+      </div>
+      <ResponsiveContainer width="100%" height={150}>
+        {mode === 'timeOfDay' ? (
+          <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--ctp-surface2)" />
+            <XAxis
+              dataKey="timeDecimal"
+              type="number"
+              domain={[0, 24]}
+              ticks={[0, 6, 12, 18, 24]}
+              tickFormatter={value => {
+                const hours = Math.floor(value);
+                const minutes = Math.round((value - hours) * 60);
+                return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+              }}
+              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
+              stroke="var(--ctp-surface2)"
+            />
+            <YAxis
+              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
+              stroke="var(--ctp-surface2)"
+              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--ctp-subtext1)', fontSize: 10 } }}
+            />
+            <Tooltip
+              contentStyle={{ backgroundColor: 'var(--ctp-surface0)', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', fontSize: '12px' }}
+              labelStyle={{ color: 'var(--ctp-text)' }}
+              labelFormatter={value => {
+                const item = chartData.find(d => d.timeDecimal === value);
+                return item ? item.timeLabel : String(value);
+              }}
+            />
+            <Line type="monotone" dataKey="snr" stroke="var(--ctp-mauve)" strokeWidth={2} dot={{ fill: 'var(--ctp-mauve)', r: 3 }} />
+          </LineChart>
+        ) : (
+          <LineChart data={chronoData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--ctp-surface2)" />
+            <XAxis
+              dataKey="chronoTime"
+              type="number"
+              domain={['dataMin', 'dataMax']}
+              tickFormatter={value => {
+                const date = new Date(value);
+                return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
+              }}
+              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
+              stroke="var(--ctp-surface2)"
+            />
+            <YAxis
+              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
+              stroke="var(--ctp-surface2)"
+              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--ctp-subtext1)', fontSize: 10 } }}
+            />
+            <Tooltip
+              contentStyle={{ backgroundColor: 'var(--ctp-surface0)', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', fontSize: '12px' }}
+              labelStyle={{ color: 'var(--ctp-text)' }}
+              labelFormatter={value => {
+                const item = chronoData.find(d => d.chronoTime === value);
+                return item ? item.chronoLabel : String(value);
+              }}
+            />
+            <Line type="monotone" dataKey="snr" stroke="var(--ctp-mauve)" strokeWidth={2} dot={{ fill: 'var(--ctp-mauve)', r: 3 }} />
+          </LineChart>
+        )}
+      </ResponsiveContainer>
+    </div>
+  );
+}
 
 /**
  * Minimal node data needed for traceroute rendering
@@ -33,6 +134,7 @@ export interface NodePositionDigest {
     shortName?: string;
     id?: string;
   };
+  viaMqtt?: boolean;
 }
 
 /**
@@ -65,6 +167,11 @@ export interface ThemeColors {
   tracerouteReturn?: string;
   mqttSegment?: string;
   neighborLine?: string;
+  snrColors?: {
+    good: string;
+    medium: string;
+    poor: string;
+  };
 }
 
 /**
@@ -91,6 +198,8 @@ export interface UseTraceroutePathsParams {
   callbacks: TracerouteCallbacks;
   /** Optional set of visible node numbers - when provided, only show route segments where both endpoints are visible */
   visibleNodeNums?: Set<number>;
+  /** Current map zoom level - controls detail filtering */
+  mapZoom?: number;
 }
 
 /**
@@ -176,6 +285,7 @@ export function useTraceroutePaths({
   themeColors,
   callbacks,
   visibleNodeNums,
+  mapZoom,
 }: UseTraceroutePathsParams): UseTraceroutePathsResult {
   // Memoize base traceroute paths (showPaths) - doesn't depend on selectedNodeId
   // This prevents re-rendering markers when clicking to select a node
@@ -188,9 +298,10 @@ export function useTraceroutePaths({
     // Calculate segment usage counts and collect SNR values with timestamps
     const segmentUsage = new Map<string, number>();
     const segmentSNRs = new Map<string, Array<{ snr: number; timestamp: number }>>();
-    // Track segments that have MQTT/unknown hops (-128 raw SNR = -32 scaled indicates MQTT/unknown)
-    // Note: -128 (INT8_MIN) is the Meshtastic sentinel value for unknown SNR (MQTT gateways, older firmware)
+    // Track segments that have MQTT/unknown hops (SNR sentinel indicates MQTT gateway or unknown)
     const segmentHasMqtt = new Map<string, boolean>();
+    // Track most recent timestamp per segment for temporal fade
+    const segmentLatestTimestamp = new Map<string, number>();
     const segmentsList: Array<{
       key: string;
       positions: [number, number][];
@@ -278,11 +389,15 @@ export function useTraceroutePaths({
               segmentSNRs.set(segmentKey, []);
             }
             segmentSNRs.get(segmentKey)!.push({ snr: snrValue, timestamp });
-            // Mark segment as MQTT/unknown if SNR is -32 dB (raw -128 / 4 = -32)
-            // -128 (INT8_MIN) is Meshtastic's sentinel value for unknown SNR (MQTT gateways, older firmware)
-            if (snrValue === -32) {
+            if (isMqttSnr(snrValue)) {
               segmentHasMqtt.set(segmentKey, true);
             }
+          }
+
+          // Track most recent timestamp for temporal fade
+          const existingTsFwd = segmentLatestTimestamp.get(segmentKey) || 0;
+          if (timestamp > existingTsFwd) {
+            segmentLatestTimestamp.set(segmentKey, timestamp);
           }
 
           segmentsList.push({
@@ -321,11 +436,15 @@ export function useTraceroutePaths({
               segmentSNRs.set(segmentKey, []);
             }
             segmentSNRs.get(segmentKey)!.push({ snr: snrValue, timestamp });
-            // Mark segment as MQTT/unknown if SNR is -32 dB (raw -128 / 4 = -32)
-            // -128 (INT8_MIN) is Meshtastic's sentinel value for unknown SNR (MQTT gateways, older firmware)
-            if (snrValue === -32) {
+            if (isMqttSnr(snrValue)) {
               segmentHasMqtt.set(segmentKey, true);
             }
+          }
+
+          // Track most recent timestamp for temporal fade
+          const existingTsBack = segmentLatestTimestamp.get(segmentKey) || 0;
+          if (timestamp > existingTsBack) {
+            segmentLatestTimestamp.set(segmentKey, timestamp);
           }
 
           segmentsList.push({
@@ -341,25 +460,40 @@ export function useTraceroutePaths({
 
     // Filter segments to only include those where both endpoints are visible
     // This ensures route segments are hidden when their connected nodes are filtered out
-    const filteredSegments = visibleNodeNums
+    let filteredSegments = visibleNodeNums
       ? segmentsList.filter(segment => {
           const [nodeNum1, nodeNum2] = segment.nodeNums;
           return visibleNodeNums.has(nodeNum1) && visibleNodeNums.has(nodeNum2);
         })
       : segmentsList;
 
+    // Zoom-adaptive filtering: at low zoom levels, only show stronger segments
+    if (mapZoom !== undefined && mapZoom < 8) {
+      // Regional view: only show segments with good or medium SNR (filter out poor/unknown)
+      filteredSegments = filteredSegments.filter(segment => {
+        const segKey = segment.nodeNums.slice().sort().join('-');
+        const snrData = segmentSNRs.get(segKey);
+        if (!snrData || snrData.length === 0) return false; // Hide unknown segments at low zoom
+        const rfSnrs = snrData.filter(d => !isMqttSnr(d.snr)).map(d => d.snr);
+        if (rfSnrs.length === 0) return false; // Hide pure MQTT at low zoom
+        const avgSnr = rfSnrs.reduce((sum, val) => sum + val, 0) / rfSnrs.length;
+        return avgSnr >= -10; // Only good + medium quality links
+      });
+    }
+
     // Render segments with weighted lines
     const segmentElements = filteredSegments.map(segment => {
-      const segmentKey = segment.nodeNums.sort().join('-');
+      const segmentKey = segment.nodeNums.slice().sort().join('-');
       const usage = segmentUsage.get(segmentKey) || 1;
       // Base weight 2, add 1 per usage, max 8
       const weight = Math.min(2 + usage, 8);
-      // Check if this segment traversed MQTT (has 0.0 dB SNR)
-      const isMqttSegment = segmentHasMqtt.get(segmentKey) || false;
-
       // Get node names for popup
       const node1 = nodesPositionDigest.find(n => n.nodeNum === segment.nodeNums[0]);
       const node2 = nodesPositionDigest.find(n => n.nodeNum === segment.nodeNums[1]);
+
+      // Check if this segment traversed MQTT: either SNR sentinel or either endpoint is an MQTT node
+      const isMqttSegment = (segmentHasMqtt.get(segmentKey) || false) ||
+        (node1?.viaMqtt === true) || (node2?.viaMqtt === true);
       const node1Name =
         segment.nodeNums[0] === BROADCAST_ADDR
           ? '(unknown)'
@@ -427,37 +561,35 @@ export function useTraceroutePaths({
         }
       }
 
-      return (
+      const segmentColor = isMqttSegment
+        ? (themeColors.mqttSegment ?? themeColors.overlay0)
+        : themeColors.snrColors
+          ? getSegmentSnrColor(snrData, themeColors.snrColors, themeColors.neighborLine ?? themeColors.mauve)
+          : (themeColors.neighborLine ?? themeColors.mauve);
+      const baseOpacity = getSegmentSnrOpacity(snrData, isMqttSegment);
+      const latestTimestamp = segmentLatestTimestamp.get(segmentKey);
+      const temporalMultiplier = getTemporalOpacityMultiplier(latestTimestamp);
+      const segmentOpacity = Math.max(0.15, baseOpacity * temporalMultiplier);
+
+      const polylineElement = (
         <Polyline
           key={segment.key}
           positions={segment.positions}
-          color={isMqttSegment ? (themeColors.mqttSegment ?? themeColors.overlay0) : (themeColors.neighborLine ?? themeColors.mauve)}
+          color={segmentColor}
           weight={weight}
-          opacity={isMqttSegment ? 0.6 : 0.7}
-          dashArray={isMqttSegment ? '8, 8' : undefined}
+          opacity={segmentOpacity}
+          dashArray={isMqttSegment ? '3,6' : undefined}
+          className={`route-segment node-${segment.nodeNums[0]} node-${segment.nodeNums[1]}`}
         >
           <Popup>
             <div className="route-popup">
               <h4>Route Segment</h4>
               {isMqttSegment && (
-                <div
-                  className="mqtt-indicator"
-                  style={{
-                    display: 'inline-block',
-                    backgroundColor: 'var(--ctp-overlay0)',
-                    color: 'var(--ctp-base)',
-                    padding: '2px 8px',
-                    borderRadius: '4px',
-                    fontSize: '0.75rem',
-                    fontWeight: 500,
-                    marginBottom: '8px',
-                  }}
-                >
-                  via MQTT
-                </div>
+                <div className="mqtt-badge">via IP</div>
               )}
               <div className="route-endpoints">
                 <strong
+                  className={node1?.user?.id ? 'route-node-link' : undefined}
                   onClick={e => {
                     e.stopPropagation();
                     const freshNode = nodesPositionDigest.find(n => n.nodeNum === segment.nodeNums[0]);
@@ -468,16 +600,13 @@ export function useTraceroutePaths({
                       ]);
                     }
                   }}
-                  style={{
-                    cursor: node1?.user?.id ? 'pointer' : 'default',
-                    color: node1?.user?.id ? 'var(--ctp-blue)' : 'inherit',
-                  }}
                   title={node1?.user?.id ? 'Click to select and center on this node' : ''}
                 >
                   {node1Name}
                 </strong>
                 {' ↔ '}
                 <strong
+                  className={node2?.user?.id ? 'route-node-link' : undefined}
                   onClick={e => {
                     e.stopPropagation();
                     const freshNode = nodesPositionDigest.find(n => n.nodeNum === segment.nodeNums[1]);
@@ -487,10 +616,6 @@ export function useTraceroutePaths({
                         freshNode.position.longitude,
                       ]);
                     }
-                  }}
-                  style={{
-                    cursor: node2?.user?.id ? 'pointer' : 'default',
-                    color: node2?.user?.id ? 'var(--ctp-blue)' : 'inherit',
                   }}
                   title={node2?.user?.id ? 'Click to select and center on this node' : ''}
                 >
@@ -561,56 +686,7 @@ export function useTraceroutePaths({
                         <span className="stat-value">{snrStats.count}</span>
                       </div>
                       {chartData && (
-                        <div className="snr-timeline-chart">
-                          <ResponsiveContainer width="100%" height={150}>
-                            <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-                              <CartesianGrid strokeDasharray="3 3" stroke="var(--ctp-surface2)" />
-                              <XAxis
-                                dataKey="timeDecimal"
-                                type="number"
-                                domain={[0, 24]}
-                                ticks={[0, 6, 12, 18, 24]}
-                                tickFormatter={value => {
-                                  const hours = Math.floor(value);
-                                  const minutes = Math.round((value - hours) * 60);
-                                  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
-                                }}
-                                tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
-                                stroke="var(--ctp-surface2)"
-                              />
-                              <YAxis
-                                tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
-                                stroke="var(--ctp-surface2)"
-                                label={{
-                                  value: 'SNR (dB)',
-                                  angle: -90,
-                                  position: 'insideLeft',
-                                  style: { fill: 'var(--ctp-subtext1)', fontSize: 10 },
-                                }}
-                              />
-                              <Tooltip
-                                contentStyle={{
-                                  backgroundColor: 'var(--ctp-surface0)',
-                                  border: '1px solid var(--ctp-surface2)',
-                                  borderRadius: '4px',
-                                  fontSize: '12px',
-                                }}
-                                labelStyle={{ color: 'var(--ctp-text)' }}
-                                labelFormatter={value => {
-                                  const item = chartData!.find(d => d.timeDecimal === value);
-                                  return item ? item.timeLabel : String(value);
-                                }}
-                              />
-                              <Line
-                                type="monotone"
-                                dataKey="snr"
-                                stroke="var(--ctp-mauve)"
-                                strokeWidth={2}
-                                dot={{ fill: 'var(--ctp-mauve)', r: 3 }}
-                              />
-                            </LineChart>
-                          </ResponsiveContainer>
-                        </div>
+                        <SegmentSnrChart chartData={chartData} />
                       )}
                     </>
                   )}
@@ -620,13 +696,14 @@ export function useTraceroutePaths({
           </Popup>
         </Polyline>
       );
+
+      return polylineElement;
     });
 
-    // Add route segments to elements
     allElements.push(...segmentElements);
 
     return allElements;
-  }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, maxNodeAgeHours, themeColors.mauve, themeColors.overlay0, themeColors.neighborLine, themeColors.mqttSegment, callbacks, visibleNodeNums]);
+  }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, maxNodeAgeHours, themeColors.mauve, themeColors.overlay0, themeColors.neighborLine, themeColors.mqttSegment, themeColors.snrColors, callbacks, visibleNodeNums, mapZoom]);
 
   // Separate memoization for selected node traceroute (showRoute)
   // This can change independently without re-rendering the base map markers
@@ -725,7 +802,7 @@ export function useTraceroutePaths({
              );
              
              const weight = getLineWeight(forwardSegmentSnrs[i]);
-             const isMqtt = forwardSegmentSnrs[i] === -32; // Check for MQTT sentinel
+             const isMqtt = isMqttSnr(forwardSegmentSnrs[i]);
 
              allElements.push(
                <Polyline
@@ -734,7 +811,8 @@ export function useTraceroutePaths({
                  color={themeColors.tracerouteForward ?? themeColors.blue}
                  weight={weight}
                  opacity={0.9}
-                 dashArray="10, 5"
+                 dashArray="3,6"
+                 className={`route-segment node-${forwardSequence[i]} node-${forwardSequence[i + 1]}`}
                >
                  <Popup>
                    <div className="route-popup">
@@ -759,7 +837,7 @@ export function useTraceroutePaths({
                      {forwardSegmentSnrs[i] !== undefined && (
                         <div className="route-usage" style={{ marginTop: '8px', borderTop: '1px solid var(--ctp-surface0)', paddingTop: '4px' }}>
                           Segment SNR: <strong>{forwardSegmentSnrs[i]?.toFixed(1)} dB</strong>
-                          {isMqtt && ' (MQTT)'}
+                          {isMqtt && ' (IP)'}
                         </div>
                      )}
                    </div>
@@ -827,7 +905,7 @@ export function useTraceroutePaths({
              );
              
              const weight = getLineWeight(backSegmentSnrs[i]);
-             const isMqtt = backSegmentSnrs[i] === -32;
+             const isMqtt = isMqttSnr(backSegmentSnrs[i]);
 
              allElements.push(
                <Polyline
@@ -836,7 +914,8 @@ export function useTraceroutePaths({
                  color={themeColors.tracerouteReturn ?? themeColors.red}
                  weight={weight}
                  opacity={0.9}
-                 dashArray="5, 10"
+                 dashArray="3,6"
+                 className={`route-segment node-${backSequence[i]} node-${backSequence[i + 1]}`}
                >
                  <Popup>
                    <div className="route-popup">
@@ -861,7 +940,7 @@ export function useTraceroutePaths({
                      {backSegmentSnrs[i] !== undefined && (
                         <div className="route-usage" style={{ marginTop: '8px', borderTop: '1px solid var(--ctp-surface0)', paddingTop: '4px' }}>
                           Segment SNR: <strong>{backSegmentSnrs[i]?.toFixed(1)} dB</strong>
-                          {isMqtt && ' (MQTT)'}
+                          {isMqtt && ' (IP)'}
                         </div>
                      )}
                    </div>

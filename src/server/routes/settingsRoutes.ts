@@ -13,6 +13,7 @@ import { Router, Request, Response } from 'express';
 import { optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
+import { securityDigestService } from '../services/securityDigestService.js';
 import { VALID_SETTINGS_KEYS } from '../constants/settings.js';
 
 // ─── Tile URL validation ─────────────────────────────────────────────────
@@ -81,12 +82,32 @@ export function validateCustomTilesets(tilesets: any[]): boolean {
   return true;
 }
 
+function normalizeIgnoredNodeIds(rawValue: string): string {
+  const tokens = rawValue
+    .split(/[\s,]+/)
+    .map(token => token.trim().toLowerCase())
+    .filter(Boolean);
+
+  const normalized = new Set<string>();
+
+  for (const token of tokens) {
+    if (!/^!?[0-9a-f]{8}$/.test(token)) {
+      throw new Error('Node ignore list entries must be 8-digit hex node IDs (example: !b29fa8d4)');
+    }
+
+    const hex = token.startsWith('!') ? token.slice(1) : token;
+    normalized.add(`!${hex}`);
+  }
+
+  return [...normalized].join(',');
+}
+
 // ─── Side-effect callbacks ───────────────────────────────────────────────
 // These are injected by server.ts so the route handler doesn't directly
 // depend on meshtasticManager / inactiveNodeNotificationService / etc.
 
 export interface SettingsCallbacks {
-  refreshTileHostnameCache?: () => void;
+  refreshTileHostnameCache?: () => void | Promise<void>;
   setTracerouteInterval?: (interval: number) => void;
   setRemoteAdminScannerInterval?: (interval: number) => void;
   setLocalStatsInterval?: (interval: number) => void;
@@ -95,6 +116,7 @@ export interface SettingsCallbacks {
     intervalMinutes: number;
     maxExchanges: number;
     autoPurge: boolean;
+    immediatePurge: boolean;
   }) => void;
   restartInactiveNodeService?: (threshold: number, check: number, cooldown: number) => void;
   stopInactiveNodeService?: () => void;
@@ -102,6 +124,9 @@ export interface SettingsCallbacks {
   restartTimerScheduler?: () => void;
   restartGeofenceEngine?: () => void;
   handleAutoWelcomeEnabled?: () => number;
+  invalidateHtmlCache?: () => void;
+  restartAutoDeleteByDistanceService?: (intervalHours: number) => void;
+  stopAutoDeleteByDistanceService?: () => void;
 }
 
 let callbacks: SettingsCallbacks = {};
@@ -115,9 +140,9 @@ export function setSettingsCallbacks(cb: SettingsCallbacks): void {
 const router = Router();
 
 // GET /settings — read all settings (public)
-router.get('/', optionalAuth(), (_req: Request, res: Response) => {
+router.get('/', optionalAuth(), async (_req: Request, res: Response) => {
   try {
-    const settings = databaseService.getAllSettings();
+    const settings = await databaseService.settings.getAllSettings();
     res.json(settings);
   } catch (error) {
     logger.error('Error fetching settings:', error);
@@ -126,12 +151,12 @@ router.get('/', optionalAuth(), (_req: Request, res: Response) => {
 });
 
 // POST /settings — save settings
-router.post('/', requirePermission('settings', 'write'), (req: Request, res: Response) => {
+router.post('/', requirePermission('settings', 'write'), async (req: Request, res: Response) => {
   try {
     const settings = req.body;
 
     // Get current settings for before/after comparison
-    const currentSettings = databaseService.getAllSettings();
+    const currentSettings = await databaseService.settings.getAllSettings();
 
     // Validate settings
     const filteredSettings: Record<string, string> = {};
@@ -168,6 +193,16 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
         .map((c) => parseInt(c.trim()))
         .filter((n) => !isNaN(n) && n >= 0 && n < 8);
       filteredSettings.autoAckChannels = validChannels.join(',');
+    }
+
+    if ('autoAckIgnoredNodes' in filteredSettings) {
+      try {
+        filteredSettings.autoAckIgnoredNodes = normalizeIgnoredNodeIds(filteredSettings.autoAckIgnoredNodes);
+      } catch (error) {
+        return res.status(400).json({
+          error: error instanceof Error ? error.message : 'Invalid node ignore list format',
+        });
+      }
     }
 
     // Validate inactive node notification settings
@@ -451,13 +486,46 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
       }
     }
 
+    if ('autoDeleteByDistanceIntervalHours' in filteredSettings) {
+      const interval = parseInt(filteredSettings.autoDeleteByDistanceIntervalHours, 10);
+      if (isNaN(interval) || ![6, 12, 24, 48].includes(interval)) {
+        return res.status(400).json({ error: 'autoDeleteByDistanceIntervalHours must be 6, 12, 24, or 48' });
+      }
+    }
+
+    if ('autoDeleteByDistanceThresholdKm' in filteredSettings) {
+      const threshold = parseFloat(filteredSettings.autoDeleteByDistanceThresholdKm);
+      if (isNaN(threshold) || threshold <= 0 || threshold > 50000) {
+        return res.status(400).json({ error: 'autoDeleteByDistanceThresholdKm must be between 0 and 50000' });
+      }
+    }
+
+    if ('autoDeleteByDistanceLat' in filteredSettings) {
+      const lat = parseFloat(filteredSettings.autoDeleteByDistanceLat);
+      if (isNaN(lat) || lat < -90 || lat > 90) {
+        return res.status(400).json({ error: 'autoDeleteByDistanceLat must be between -90 and 90' });
+      }
+    }
+
+    if ('autoDeleteByDistanceLon' in filteredSettings) {
+      const lon = parseFloat(filteredSettings.autoDeleteByDistanceLon);
+      if (isNaN(lon) || lon < -180 || lon > 180) {
+        return res.status(400).json({ error: 'autoDeleteByDistanceLon must be between -180 and 180' });
+      }
+    }
+
     // Save to database
-    databaseService.setSettings(filteredSettings);
+    await databaseService.settings.setSettings(filteredSettings);
 
     // ─── Side effects ───────────────────────────────────────────────────
     if ('customTilesets' in filteredSettings) {
       callbacks.refreshTileHostnameCache?.();
       logger.debug('🗺️ Refreshed CSP tile hostname cache after customTilesets update');
+    }
+
+    if ('analyticsProvider' in filteredSettings || 'analyticsConfig' in filteredSettings) {
+      callbacks.invalidateHtmlCache?.();
+      logger.info('📊 Analytics settings updated - HTML cache invalidated');
     }
 
     if ('autoWelcomeEnabled' in filteredSettings) {
@@ -474,7 +542,7 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
 
     if ('tracerouteIntervalMinutes' in filteredSettings) {
       const interval = parseInt(filteredSettings.tracerouteIntervalMinutes);
-      if (!isNaN(interval) && interval >= 0 && interval <= 60) {
+      if (!isNaN(interval) && (interval === 0 || (interval >= 3 && interval <= 60))) {
         callbacks.setTracerouteInterval?.(interval);
       }
     }
@@ -498,28 +566,38 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
       'autoKeyManagementIntervalMinutes',
       'autoKeyManagementMaxExchanges',
       'autoKeyManagementAutoPurge',
+      'autoKeyManagementImmediatePurge',
     ];
     const keyRepairSettingsChanged = keyRepairSettings.some((key) => key in filteredSettings);
     if (keyRepairSettingsChanged) {
+      const dbEnabled = await databaseService.settings.getSetting('autoKeyManagementEnabled');
+      const dbInterval = await databaseService.settings.getSetting('autoKeyManagementIntervalMinutes');
+      const dbMaxExchanges = await databaseService.settings.getSetting('autoKeyManagementMaxExchanges');
+      const dbAutoPurge = await databaseService.settings.getSetting('autoKeyManagementAutoPurge');
+      const dbImmediatePurge = await databaseService.settings.getSetting('autoKeyManagementImmediatePurge');
       callbacks.setKeyRepairSettings?.({
         enabled:
           filteredSettings.autoKeyManagementEnabled === 'true' ||
           (filteredSettings.autoKeyManagementEnabled === undefined &&
-            databaseService.getSetting('autoKeyManagementEnabled') === 'true'),
+            dbEnabled === 'true'),
         intervalMinutes: parseInt(
           filteredSettings.autoKeyManagementIntervalMinutes ||
-            databaseService.getSetting('autoKeyManagementIntervalMinutes') ||
+            dbInterval ||
             '5'
         ),
         maxExchanges: parseInt(
           filteredSettings.autoKeyManagementMaxExchanges ||
-            databaseService.getSetting('autoKeyManagementMaxExchanges') ||
+            dbMaxExchanges ||
             '3'
         ),
         autoPurge:
           filteredSettings.autoKeyManagementAutoPurge === 'true' ||
           (filteredSettings.autoKeyManagementAutoPurge === undefined &&
-            databaseService.getSetting('autoKeyManagementAutoPurge') === 'true'),
+            dbAutoPurge === 'true'),
+        immediatePurge:
+          filteredSettings.autoKeyManagementImmediatePurge === 'true' ||
+          (filteredSettings.autoKeyManagementImmediatePurge === undefined &&
+            dbImmediatePurge === 'true'),
       });
       logger.info('✅ Auto key repair settings updated');
     }
@@ -531,21 +609,24 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
     ];
     const inactiveNodeSettingsChanged = inactiveNodeSettings.some((key) => key in filteredSettings);
     if (inactiveNodeSettingsChanged) {
+      const dbThreshold = await databaseService.settings.getSetting('inactiveNodeThresholdHours');
+      const dbCheckInterval = await databaseService.settings.getSetting('inactiveNodeCheckIntervalMinutes');
+      const dbCooldown = await databaseService.settings.getSetting('inactiveNodeCooldownHours');
       const threshold = parseInt(
         filteredSettings.inactiveNodeThresholdHours ||
-          databaseService.getSetting('inactiveNodeThresholdHours') ||
+          dbThreshold ||
           '24',
         10
       );
       const checkInterval = parseInt(
         filteredSettings.inactiveNodeCheckIntervalMinutes ||
-          databaseService.getSetting('inactiveNodeCheckIntervalMinutes') ||
+          dbCheckInterval ||
           '60',
         10
       );
       const cooldown = parseInt(
         filteredSettings.inactiveNodeCooldownHours ||
-          databaseService.getSetting('inactiveNodeCooldownHours') ||
+          dbCooldown ||
           '24',
         10
       );
@@ -578,6 +659,37 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
       callbacks.restartGeofenceEngine?.();
     }
 
+    const distanceDeleteSettings = [
+      'autoDeleteByDistanceEnabled',
+      'autoDeleteByDistanceIntervalHours',
+      'autoDeleteByDistanceThresholdKm',
+      'autoDeleteByDistanceLat',
+      'autoDeleteByDistanceLon',
+    ];
+    const distanceDeleteSettingsChanged = distanceDeleteSettings.some((key) => key in filteredSettings);
+    if (distanceDeleteSettingsChanged) {
+      const dbDistEnabled = await databaseService.settings.getSetting('autoDeleteByDistanceEnabled');
+      const enabled =
+        filteredSettings.autoDeleteByDistanceEnabled === 'true' ||
+        (filteredSettings.autoDeleteByDistanceEnabled === undefined &&
+          dbDistEnabled === 'true');
+
+      if (enabled) {
+        const dbDistInterval = await databaseService.settings.getSetting('autoDeleteByDistanceIntervalHours');
+        const intervalHours = parseInt(
+          filteredSettings.autoDeleteByDistanceIntervalHours ||
+            dbDistInterval ||
+            '24',
+          10
+        );
+        callbacks.restartAutoDeleteByDistanceService?.(intervalHours);
+        logger.info(`✅ Auto-delete-by-distance service restarted (interval: ${intervalHours}h)`);
+      } else {
+        callbacks.stopAutoDeleteByDistanceService?.();
+        logger.info('⏹️ Auto-delete-by-distance service stopped');
+      }
+    }
+
     // Audit log with before/after values
     const changedSettings: Record<string, { before: string | undefined; after: string }> = {};
     Object.keys(filteredSettings).forEach((key) => {
@@ -590,7 +702,7 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
     });
 
     if (Object.keys(changedSettings).length > 0) {
-      databaseService.auditLog(
+      databaseService.auditLogAsync(
         req.user!.id,
         'settings_updated',
         'settings',
@@ -601,6 +713,11 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
       );
     }
 
+    // Reschedule security digest if any digest setting changed
+    if (Object.keys(filteredSettings).some(k => k.startsWith('securityDigest'))) {
+      securityDigestService.reschedule();
+    }
+
     res.json({ success: true, settings: filteredSettings });
   } catch (error) {
     logger.error('Error saving settings:', error);
@@ -609,14 +726,14 @@ router.post('/', requirePermission('settings', 'write'), (req: Request, res: Res
 });
 
 // DELETE /settings — reset to defaults
-router.delete('/', requirePermission('settings', 'write'), (req: Request, res: Response) => {
+router.delete('/', requirePermission('settings', 'write'), async (req: Request, res: Response) => {
   try {
-    const currentSettings = databaseService.getAllSettings();
+    const currentSettings = await databaseService.settings.getAllSettings();
 
-    databaseService.deleteAllSettings();
+    await databaseService.settings.deleteAllSettings();
     callbacks.setTracerouteInterval?.(0);
 
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       req.user!.id,
       'settings_reset',
       'settings',

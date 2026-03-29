@@ -23,10 +23,19 @@ import { getEnvironmentConfig } from '../config/environment.js';
 const router = Router();
 
 function regenerateSession(req: Request): Promise<void> {
+  // Preserve CSRF token across session regeneration so the frontend's
+  // cached token remains valid after login (session regeneration creates
+  // a new session ID but should not invalidate the CSRF token)
+  const csrfToken = req.session.csrfToken;
   return new Promise((resolve, reject) => {
     req.session.regenerate((err) => {
       if (err) reject(err);
-      else resolve();
+      else {
+        if (csrfToken) {
+          req.session.csrfToken = csrfToken;
+        }
+        resolve();
+      }
     });
   });
 }
@@ -239,7 +248,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
 
     if (!user) {
       // Audit log failed attempt
-      databaseService.auditLog(
+      databaseService.auditLogAsync(
         null,
         'login_failed',
         'auth',
@@ -257,7 +266,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
       // Don't create full session yet - store pending MFA verification
       req.session.pendingMfaUserId = user.id;
 
-      databaseService.auditLog(
+      databaseService.auditLogAsync(
         user.id,
         'login_mfa_required',
         'auth',
@@ -284,7 +293,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
     req.session.isAdmin = user.isAdmin;
 
     // Audit log successful login
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       user.id,
       'login_success',
       'auth',
@@ -318,7 +327,7 @@ router.post('/logout', (req: Request, res: Response) => {
 
     // Audit log
     if (userId) {
-      databaseService.auditLog(
+      databaseService.auditLogAsync(
         userId,
         'logout',
         'auth',
@@ -360,7 +369,7 @@ router.post('/verify-mfa', authLimiter, async (req: Request, res: Response) => {
       if (remaining !== null) {
         verified = true;
         await databaseService.consumeBackupCodeAsync(user.id, JSON.stringify(remaining));
-        databaseService.auditLog(
+        databaseService.auditLogAsync(
           user.id,
           'mfa_backup_code_used',
           'auth',
@@ -371,7 +380,7 @@ router.post('/verify-mfa', authLimiter, async (req: Request, res: Response) => {
     }
 
     if (!verified) {
-      databaseService.auditLog(
+      databaseService.auditLogAsync(
         user.id,
         'mfa_verify_failed',
         'auth',
@@ -394,7 +403,7 @@ router.post('/verify-mfa', authLimiter, async (req: Request, res: Response) => {
     req.session.authProvider = 'local';
     req.session.isAdmin = user.isAdmin;
 
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       user.id,
       'login_success',
       'auth',
@@ -554,7 +563,7 @@ router.get('/oidc/callback', async (req: Request, res: Response) => {
     req.session.isAdmin = user.isAdmin;
 
     // Audit log
-    databaseService.auditLog(
+    databaseService.auditLogAsync(
       user.id,
       'login_success',
       'auth',

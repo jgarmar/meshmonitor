@@ -4,8 +4,7 @@
  * Handles all node-related database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, gt, lt, isNull, or, desc, asc, and, isNotNull, ne, sql, inArray } from 'drizzle-orm';
-import { nodesSqlite, nodesPostgres, nodesMysql } from '../schema/nodes.js';
+import { eq, gt, lt, isNull, or, desc, asc, and, isNotNull, ne, sql, inArray, count } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType, DbNode } from '../types.js';
 import { logger } from '../../utils/logger.js';
@@ -32,105 +31,62 @@ export class NodesRepository extends BaseRepository {
    * Get a node by nodeNum
    */
   async getNode(nodeNum: number): Promise<DbNode | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(nodesSqlite)
-        .where(eq(nodesSqlite.nodeNum, nodeNum))
-        .limit(1);
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .where(eq(nodes.nodeNum, nodeNum))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbNode;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(nodesMysql)
-        .where(eq(nodesMysql.nodeNum, nodeNum))
-        .limit(1);
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbNode;
+  }
 
-      if (result.length === 0) return null;
-      return result[0] as DbNode;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(nodesPostgres)
-        .where(eq(nodesPostgres.nodeNum, nodeNum))
-        .limit(1);
+  /**
+   * Get multiple nodes by nodeNum in a single query
+   */
+  async getNodesByNums(nodeNums: number[]): Promise<Map<number, DbNode>> {
+    if (nodeNums.length === 0) return new Map();
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .where(inArray(nodes.nodeNum, nodeNums));
 
-      if (result.length === 0) return null;
-      return result[0] as DbNode;
+    const map = new Map<number, DbNode>();
+    for (const row of result) {
+      const node = this.normalizeBigInts(row) as DbNode;
+      map.set(node.nodeNum, node);
     }
+    return map;
   }
 
   /**
    * Get a node by nodeId
    */
   async getNodeByNodeId(nodeId: string): Promise<DbNode | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db
-        .select()
-        .from(nodesSqlite)
-        .where(eq(nodesSqlite.nodeId, nodeId))
-        .limit(1);
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .where(eq(nodes.nodeId, nodeId))
+      .limit(1);
 
-      if (result.length === 0) return null;
-      return this.normalizeBigInts(result[0]) as DbNode;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db
-        .select()
-        .from(nodesMysql)
-        .where(eq(nodesMysql.nodeId, nodeId))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbNode;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db
-        .select()
-        .from(nodesPostgres)
-        .where(eq(nodesPostgres.nodeId, nodeId))
-        .limit(1);
-
-      if (result.length === 0) return null;
-      return result[0] as DbNode;
-    }
+    if (result.length === 0) return null;
+    return this.normalizeBigInts(result[0]) as DbNode;
   }
 
   /**
    * Get all nodes ordered by update time
    */
   async getAllNodes(): Promise<DbNode[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const nodes = await db
-        .select()
-        .from(nodesSqlite)
-        .orderBy(desc(nodesSqlite.updatedAt));
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .orderBy(desc(nodes.updatedAt));
 
-      return nodes.map(n => this.normalizeBigInts(n) as DbNode);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const nodes = await db
-        .select()
-        .from(nodesMysql)
-        .orderBy(desc(nodesMysql.updatedAt));
-
-      return nodes as DbNode[];
-    } else {
-      const db = this.getPostgresDb();
-      const nodes = await db
-        .select()
-        .from(nodesPostgres)
-        .orderBy(desc(nodesPostgres.updatedAt));
-
-      return nodes as DbNode[];
-    }
+    return this.normalizeBigInts(result) as DbNode[];
   }
 
   /**
@@ -139,58 +95,31 @@ export class NodesRepository extends BaseRepository {
   async getActiveNodes(sinceDays: number = 7): Promise<DbNode[]> {
     // lastHeard is stored in seconds (Unix timestamp)
     const cutoff = Math.floor(Date.now() / 1000) - (sinceDays * 24 * 60 * 60);
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const nodes = await db
-        .select()
-        .from(nodesSqlite)
-        .where(gt(nodesSqlite.lastHeard, cutoff))
-        .orderBy(desc(nodesSqlite.lastHeard));
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .where(gt(nodes.lastHeard, cutoff))
+      .orderBy(desc(nodes.lastHeard));
 
-      return nodes.map(n => this.normalizeBigInts(n) as DbNode);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const nodes = await db
-        .select()
-        .from(nodesMysql)
-        .where(gt(nodesMysql.lastHeard, cutoff))
-        .orderBy(desc(nodesMysql.lastHeard));
-
-      return nodes as DbNode[];
-    } else {
-      const db = this.getPostgresDb();
-      const nodes = await db
-        .select()
-        .from(nodesPostgres)
-        .where(gt(nodesPostgres.lastHeard, cutoff))
-        .orderBy(desc(nodesPostgres.lastHeard));
-
-      return nodes as DbNode[];
-    }
+    return this.normalizeBigInts(result) as DbNode[];
   }
 
   /**
    * Get total node count
    */
   async getNodeCount(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const result = await db.select().from(nodesSqlite);
-      return result.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const result = await db.select().from(nodesMysql);
-      return result.length;
-    } else {
-      const db = this.getPostgresDb();
-      const result = await db.select().from(nodesPostgres);
-      return result.length;
-    }
+    const { nodes } = this.tables;
+    const result = await this.db.select({ count: count() }).from(nodes);
+    return Number(result[0].count);
   }
 
   /**
-   * Insert or update a node
+   * Insert or update a node.
+   * Keeps branching for:
+   * - Update path: coerceBigintField needed for MySQL/Postgres BIGINT timestamps (harmless for SQLite, now unified)
+   * - Insert path: MySQL uses onDuplicateKeyUpdate vs onConflictDoUpdate
    */
   async upsertNode(nodeData: Partial<DbNode>): Promise<void> {
     if (nodeData.nodeNum === undefined || nodeData.nodeNum === null || !nodeData.nodeId) {
@@ -199,142 +128,52 @@ export class NodesRepository extends BaseRepository {
     }
 
     const now = this.now();
+    const { nodes } = this.tables;
     const existingNode = await this.getNode(nodeData.nodeNum);
 
     if (existingNode) {
-      // Update existing node
-      if (this.isSQLite()) {
-        const db = this.getSqliteDb();
-        await db
-          .update(nodesSqlite)
-          .set({
-            nodeId: nodeData.nodeId ?? existingNode.nodeId,
-            longName: nodeData.longName ?? existingNode.longName,
-            shortName: nodeData.shortName ?? existingNode.shortName,
-            hwModel: nodeData.hwModel ?? existingNode.hwModel,
-            role: nodeData.role ?? existingNode.role,
-            hopsAway: nodeData.hopsAway ?? existingNode.hopsAway,
-            viaMqtt: nodeData.viaMqtt ?? existingNode.viaMqtt,
-            macaddr: nodeData.macaddr ?? existingNode.macaddr,
-            latitude: nodeData.latitude ?? existingNode.latitude,
-            longitude: nodeData.longitude ?? existingNode.longitude,
-            altitude: nodeData.altitude ?? existingNode.altitude,
-            batteryLevel: nodeData.batteryLevel ?? existingNode.batteryLevel,
-            voltage: nodeData.voltage ?? existingNode.voltage,
-            channelUtilization: nodeData.channelUtilization ?? existingNode.channelUtilization,
-            airUtilTx: nodeData.airUtilTx ?? existingNode.airUtilTx,
-            lastHeard: nodeData.lastHeard ?? existingNode.lastHeard,
-            snr: nodeData.snr ?? existingNode.snr,
-            rssi: nodeData.rssi ?? existingNode.rssi,
-            firmwareVersion: nodeData.firmwareVersion ?? existingNode.firmwareVersion,
-            channel: nodeData.channel ?? existingNode.channel,
-            isFavorite: nodeData.isFavorite ?? existingNode.isFavorite,
-            mobile: nodeData.mobile ?? existingNode.mobile,
-            rebootCount: nodeData.rebootCount ?? existingNode.rebootCount,
-            publicKey: nodeData.publicKey ?? existingNode.publicKey,
-            hasPKC: nodeData.hasPKC ?? existingNode.hasPKC,
-            lastPKIPacket: nodeData.lastPKIPacket ?? existingNode.lastPKIPacket,
-            // Don't update welcomedAt here - it's managed by markNodeAsWelcomedIfNotAlready
-            // to avoid race conditions where this upsert overwrites a concurrent welcome update
-            keyIsLowEntropy: nodeData.keyIsLowEntropy ?? existingNode.keyIsLowEntropy,
-            duplicateKeyDetected: nodeData.duplicateKeyDetected ?? existingNode.duplicateKeyDetected,
-            keyMismatchDetected: nodeData.keyMismatchDetected ?? existingNode.keyMismatchDetected,
-            keySecurityIssueDetails: nodeData.keySecurityIssueDetails ?? existingNode.keySecurityIssueDetails,
-            positionChannel: nodeData.positionChannel ?? existingNode.positionChannel,
-            positionPrecisionBits: nodeData.positionPrecisionBits ?? existingNode.positionPrecisionBits,
-            positionTimestamp: nodeData.positionTimestamp ?? existingNode.positionTimestamp,
-            updatedAt: now,
-          })
-          .where(eq(nodesSqlite.nodeNum, nodeData.nodeNum));
-      } else if (this.isMySQL()) {
-        // MySQL requires BIGINT fields to be integers (no decimals)
-        const db = this.getMysqlDb();
-        await db
-          .update(nodesMysql)
-          .set({
-            nodeId: nodeData.nodeId ?? existingNode.nodeId,
-            longName: nodeData.longName ?? existingNode.longName,
-            shortName: nodeData.shortName ?? existingNode.shortName,
-            hwModel: nodeData.hwModel ?? existingNode.hwModel,
-            role: nodeData.role ?? existingNode.role,
-            hopsAway: nodeData.hopsAway ?? existingNode.hopsAway,
-            viaMqtt: nodeData.viaMqtt ?? existingNode.viaMqtt,
-            macaddr: nodeData.macaddr ?? existingNode.macaddr,
-            latitude: nodeData.latitude ?? existingNode.latitude,
-            longitude: nodeData.longitude ?? existingNode.longitude,
-            altitude: nodeData.altitude ?? existingNode.altitude,
-            batteryLevel: nodeData.batteryLevel ?? existingNode.batteryLevel,
-            voltage: nodeData.voltage ?? existingNode.voltage,
-            channelUtilization: nodeData.channelUtilization ?? existingNode.channelUtilization,
-            airUtilTx: nodeData.airUtilTx ?? existingNode.airUtilTx,
-            lastHeard: this.coerceBigintField(nodeData.lastHeard ?? existingNode.lastHeard),
-            snr: nodeData.snr ?? existingNode.snr,
-            rssi: nodeData.rssi ?? existingNode.rssi,
-            firmwareVersion: nodeData.firmwareVersion ?? existingNode.firmwareVersion,
-            channel: nodeData.channel ?? existingNode.channel,
-            isFavorite: nodeData.isFavorite ?? existingNode.isFavorite,
-            mobile: nodeData.mobile ?? existingNode.mobile,
-            rebootCount: nodeData.rebootCount ?? existingNode.rebootCount,
-            publicKey: nodeData.publicKey ?? existingNode.publicKey,
-            hasPKC: nodeData.hasPKC ?? existingNode.hasPKC,
-            lastPKIPacket: this.coerceBigintField(nodeData.lastPKIPacket ?? existingNode.lastPKIPacket),
-            // Don't update welcomedAt here - it's managed by markNodeAsWelcomedIfNotAlready
-            // to avoid race conditions where this upsert overwrites a concurrent welcome update
-            keyIsLowEntropy: nodeData.keyIsLowEntropy ?? existingNode.keyIsLowEntropy,
-            duplicateKeyDetected: nodeData.duplicateKeyDetected ?? existingNode.duplicateKeyDetected,
-            keyMismatchDetected: nodeData.keyMismatchDetected ?? existingNode.keyMismatchDetected,
-            keySecurityIssueDetails: nodeData.keySecurityIssueDetails ?? existingNode.keySecurityIssueDetails,
-            positionChannel: nodeData.positionChannel ?? existingNode.positionChannel,
-            positionPrecisionBits: nodeData.positionPrecisionBits ?? existingNode.positionPrecisionBits,
-            positionTimestamp: this.coerceBigintField(nodeData.positionTimestamp ?? existingNode.positionTimestamp),
-            updatedAt: now,
-          })
-          .where(eq(nodesMysql.nodeNum, nodeData.nodeNum));
-      } else {
-        // PostgreSQL requires BIGINT fields to be integers (no decimals)
-        const db = this.getPostgresDb();
-        await db
-          .update(nodesPostgres)
-          .set({
-            nodeId: nodeData.nodeId ?? existingNode.nodeId,
-            longName: nodeData.longName ?? existingNode.longName,
-            shortName: nodeData.shortName ?? existingNode.shortName,
-            hwModel: nodeData.hwModel ?? existingNode.hwModel,
-            role: nodeData.role ?? existingNode.role,
-            hopsAway: nodeData.hopsAway ?? existingNode.hopsAway,
-            viaMqtt: nodeData.viaMqtt ?? existingNode.viaMqtt,
-            macaddr: nodeData.macaddr ?? existingNode.macaddr,
-            latitude: nodeData.latitude ?? existingNode.latitude,
-            longitude: nodeData.longitude ?? existingNode.longitude,
-            altitude: nodeData.altitude ?? existingNode.altitude,
-            batteryLevel: nodeData.batteryLevel ?? existingNode.batteryLevel,
-            voltage: nodeData.voltage ?? existingNode.voltage,
-            channelUtilization: nodeData.channelUtilization ?? existingNode.channelUtilization,
-            airUtilTx: nodeData.airUtilTx ?? existingNode.airUtilTx,
-            lastHeard: this.coerceBigintField(nodeData.lastHeard ?? existingNode.lastHeard),
-            snr: nodeData.snr ?? existingNode.snr,
-            rssi: nodeData.rssi ?? existingNode.rssi,
-            firmwareVersion: nodeData.firmwareVersion ?? existingNode.firmwareVersion,
-            channel: nodeData.channel ?? existingNode.channel,
-            isFavorite: nodeData.isFavorite ?? existingNode.isFavorite,
-            mobile: nodeData.mobile ?? existingNode.mobile,
-            rebootCount: nodeData.rebootCount ?? existingNode.rebootCount,
-            publicKey: nodeData.publicKey ?? existingNode.publicKey,
-            hasPKC: nodeData.hasPKC ?? existingNode.hasPKC,
-            lastPKIPacket: this.coerceBigintField(nodeData.lastPKIPacket ?? existingNode.lastPKIPacket),
-            // Don't update welcomedAt here - it's managed by markNodeAsWelcomedIfNotAlready
-            // to avoid race conditions where this upsert overwrites a concurrent welcome update
-            keyIsLowEntropy: nodeData.keyIsLowEntropy ?? existingNode.keyIsLowEntropy,
-            duplicateKeyDetected: nodeData.duplicateKeyDetected ?? existingNode.duplicateKeyDetected,
-            keyMismatchDetected: nodeData.keyMismatchDetected ?? existingNode.keyMismatchDetected,
-            keySecurityIssueDetails: nodeData.keySecurityIssueDetails ?? existingNode.keySecurityIssueDetails,
-            positionChannel: nodeData.positionChannel ?? existingNode.positionChannel,
-            positionPrecisionBits: nodeData.positionPrecisionBits ?? existingNode.positionPrecisionBits,
-            positionTimestamp: this.coerceBigintField(nodeData.positionTimestamp ?? existingNode.positionTimestamp),
-            updatedAt: now,
-          })
-          .where(eq(nodesPostgres.nodeNum, nodeData.nodeNum));
-      }
+      // Update existing node - coerceBigintField is safe for all dialects (just Math.floor)
+      await this.db
+        .update(nodes)
+        .set({
+          nodeId: nodeData.nodeId ?? existingNode.nodeId,
+          longName: nodeData.longName ?? existingNode.longName,
+          shortName: nodeData.shortName ?? existingNode.shortName,
+          hwModel: nodeData.hwModel ?? existingNode.hwModel,
+          role: nodeData.role ?? existingNode.role,
+          hopsAway: nodeData.hopsAway ?? existingNode.hopsAway,
+          viaMqtt: nodeData.viaMqtt ?? existingNode.viaMqtt,
+          macaddr: nodeData.macaddr ?? existingNode.macaddr,
+          latitude: nodeData.latitude ?? existingNode.latitude,
+          longitude: nodeData.longitude ?? existingNode.longitude,
+          altitude: nodeData.altitude ?? existingNode.altitude,
+          batteryLevel: nodeData.batteryLevel ?? existingNode.batteryLevel,
+          voltage: nodeData.voltage ?? existingNode.voltage,
+          channelUtilization: nodeData.channelUtilization ?? existingNode.channelUtilization,
+          airUtilTx: nodeData.airUtilTx ?? existingNode.airUtilTx,
+          lastHeard: this.coerceBigintField(nodeData.lastHeard ?? existingNode.lastHeard),
+          snr: nodeData.snr ?? existingNode.snr,
+          rssi: nodeData.rssi ?? existingNode.rssi,
+          firmwareVersion: nodeData.firmwareVersion ?? existingNode.firmwareVersion,
+          channel: nodeData.channel ?? existingNode.channel,
+          isFavorite: nodeData.isFavorite ?? existingNode.isFavorite,
+          mobile: nodeData.mobile ?? existingNode.mobile,
+          rebootCount: nodeData.rebootCount ?? existingNode.rebootCount,
+          publicKey: nodeData.publicKey ?? existingNode.publicKey,
+          hasPKC: nodeData.hasPKC ?? existingNode.hasPKC,
+          lastPKIPacket: this.coerceBigintField(nodeData.lastPKIPacket ?? existingNode.lastPKIPacket),
+          // Don't update welcomedAt here - it's managed by markNodeAsWelcomedIfNotAlready
+          // to avoid race conditions where this upsert overwrites a concurrent welcome update
+          keyIsLowEntropy: nodeData.keyIsLowEntropy !== undefined ? nodeData.keyIsLowEntropy : existingNode.keyIsLowEntropy,
+          duplicateKeyDetected: nodeData.duplicateKeyDetected !== undefined ? nodeData.duplicateKeyDetected : existingNode.duplicateKeyDetected,
+          keyMismatchDetected: nodeData.keyMismatchDetected !== undefined ? nodeData.keyMismatchDetected : existingNode.keyMismatchDetected,
+          keySecurityIssueDetails: nodeData.keySecurityIssueDetails !== undefined ? nodeData.keySecurityIssueDetails : existingNode.keySecurityIssueDetails,
+          positionChannel: nodeData.positionChannel ?? existingNode.positionChannel,
+          positionPrecisionBits: nodeData.positionPrecisionBits ?? existingNode.positionPrecisionBits,
+          positionTimestamp: this.coerceBigintField(nodeData.positionTimestamp ?? existingNode.positionTimestamp),
+          updatedAt: now,
+        })
+        .where(eq(nodes.nodeNum, nodeData.nodeNum));
     } else {
       // Insert new node - coerce BIGINT fields for PostgreSQL
       const newNode = {
@@ -418,24 +257,7 @@ export class NodesRepository extends BaseRepository {
         updatedAt: now,
       };
 
-      if (this.isSQLite()) {
-        const db = this.getSqliteDb();
-        await db.insert(nodesSqlite).values(newNode).onConflictDoUpdate({
-          target: nodesSqlite.nodeNum,
-          set: upsertSet,
-        });
-      } else if (this.isMySQL()) {
-        const db = this.getMysqlDb();
-        await db.insert(nodesMysql).values(newNode).onDuplicateKeyUpdate({
-          set: upsertSet,
-        });
-      } else {
-        const db = this.getPostgresDb();
-        await db.insert(nodesPostgres).values(newNode).onConflictDoUpdate({
-          target: nodesPostgres.nodeNum,
-          set: upsertSet,
-        });
-      }
+      await this.upsert(nodes, newNode, nodes.nodeNum, upsertSet);
     }
   }
 
@@ -443,25 +265,11 @@ export class NodesRepository extends BaseRepository {
    * Generic update for a node's fields
    */
   async updateNode(nodeNum: number, updates: Partial<Omit<DbNode, 'nodeNum'>>): Promise<void> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set(updates as any)
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set(updates as any)
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set(updates as any)
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set(updates as any)
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
@@ -469,26 +277,11 @@ export class NodesRepository extends BaseRepository {
    */
   async updateNodeMessageHops(nodeNum: number, hops: number): Promise<void> {
     const now = this.now();
-
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ lastMessageHops: hops, updatedAt: now })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ lastMessageHops: hops, updatedAt: now })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ lastMessageHops: hops, updatedAt: now })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ lastMessageHops: hops, updatedAt: now })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
@@ -496,50 +289,20 @@ export class NodesRepository extends BaseRepository {
    */
   async markAllNodesAsWelcomed(): Promise<number> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toUpdate = await db
-        .select({ nodeNum: nodesSqlite.nodeNum })
-        .from(nodesSqlite)
-        .where(isNull(nodesSqlite.welcomedAt));
+    const toUpdate = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(isNull(nodes.welcomedAt));
 
-      for (const node of toUpdate) {
-        await db
-          .update(nodesSqlite)
-          .set({ welcomedAt: now })
-          .where(eq(nodesSqlite.nodeNum, node.nodeNum));
-      }
-      return toUpdate.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toUpdate = await db
-        .select({ nodeNum: nodesMysql.nodeNum })
-        .from(nodesMysql)
-        .where(isNull(nodesMysql.welcomedAt));
-
-      for (const node of toUpdate) {
-        await db
-          .update(nodesMysql)
-          .set({ welcomedAt: now })
-          .where(eq(nodesMysql.nodeNum, node.nodeNum));
-      }
-      return toUpdate.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toUpdate = await db
-        .select({ nodeNum: nodesPostgres.nodeNum })
-        .from(nodesPostgres)
-        .where(isNull(nodesPostgres.welcomedAt));
-
-      for (const node of toUpdate) {
-        await db
-          .update(nodesPostgres)
-          .set({ welcomedAt: now })
-          .where(eq(nodesPostgres.nodeNum, node.nodeNum));
-      }
-      return toUpdate.length;
+    for (const node of toUpdate) {
+      await this.db
+        .update(nodes)
+        .set({ welcomedAt: now })
+        .where(eq(nodes.nodeNum, node.nodeNum));
     }
+    return toUpdate.length;
   }
 
   /**
@@ -547,166 +310,64 @@ export class NodesRepository extends BaseRepository {
    */
   async markNodeAsWelcomedIfNotAlready(nodeNum: number, nodeId: string): Promise<boolean> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toUpdate = await db
-        .select({ nodeNum: nodesSqlite.nodeNum })
-        .from(nodesSqlite)
-        .where(
-          and(
-            eq(nodesSqlite.nodeNum, nodeNum),
-            eq(nodesSqlite.nodeId, nodeId),
-            isNull(nodesSqlite.welcomedAt)
-          )
-        );
+    const toUpdate = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(
+        and(
+          eq(nodes.nodeNum, nodeNum),
+          eq(nodes.nodeId, nodeId),
+          isNull(nodes.welcomedAt)
+        )
+      );
 
-      if (toUpdate.length > 0) {
-        await db
-          .update(nodesSqlite)
-          .set({ welcomedAt: now, updatedAt: now })
-          .where(eq(nodesSqlite.nodeNum, nodeNum));
-        return true;
-      }
-      return false;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toUpdate = await db
-        .select({ nodeNum: nodesMysql.nodeNum })
-        .from(nodesMysql)
-        .where(
-          and(
-            eq(nodesMysql.nodeNum, nodeNum),
-            eq(nodesMysql.nodeId, nodeId),
-            isNull(nodesMysql.welcomedAt)
-          )
-        );
-
-      if (toUpdate.length > 0) {
-        await db
-          .update(nodesMysql)
-          .set({ welcomedAt: now, updatedAt: now })
-          .where(eq(nodesMysql.nodeNum, nodeNum));
-        return true;
-      }
-      return false;
-    } else {
-      const db = this.getPostgresDb();
-      const toUpdate = await db
-        .select({ nodeNum: nodesPostgres.nodeNum })
-        .from(nodesPostgres)
-        .where(
-          and(
-            eq(nodesPostgres.nodeNum, nodeNum),
-            eq(nodesPostgres.nodeId, nodeId),
-            isNull(nodesPostgres.welcomedAt)
-          )
-        );
-
-      if (toUpdate.length > 0) {
-        await db
-          .update(nodesPostgres)
-          .set({ welcomedAt: now, updatedAt: now })
-          .where(eq(nodesPostgres.nodeNum, nodeNum));
-        return true;
-      }
-      return false;
+    if (toUpdate.length > 0) {
+      await this.db
+        .update(nodes)
+        .set({ welcomedAt: now, updatedAt: now })
+        .where(eq(nodes.nodeNum, nodeNum));
+      return true;
     }
+    return false;
   }
 
   /**
    * Get nodes with key security issues
    */
   async getNodesWithKeySecurityIssues(): Promise<DbNode[]> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const nodes = await db
-        .select()
-        .from(nodesSqlite)
-        .where(
-          or(
-            eq(nodesSqlite.keyIsLowEntropy, true),
-            eq(nodesSqlite.duplicateKeyDetected, true)
-          )
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .where(
+        or(
+          eq(nodes.keyIsLowEntropy, true),
+          eq(nodes.duplicateKeyDetected, true)
         )
-        .orderBy(desc(nodesSqlite.lastHeard));
+      )
+      .orderBy(desc(nodes.lastHeard));
 
-      return nodes.map(n => this.normalizeBigInts(n) as DbNode);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const nodes = await db
-        .select()
-        .from(nodesMysql)
-        .where(
-          or(
-            eq(nodesMysql.keyIsLowEntropy, true),
-            eq(nodesMysql.duplicateKeyDetected, true)
-          )
-        )
-        .orderBy(desc(nodesMysql.lastHeard));
-
-      return nodes as DbNode[];
-    } else {
-      const db = this.getPostgresDb();
-      const nodes = await db
-        .select()
-        .from(nodesPostgres)
-        .where(
-          or(
-            eq(nodesPostgres.keyIsLowEntropy, true),
-            eq(nodesPostgres.duplicateKeyDetected, true)
-          )
-        )
-        .orderBy(desc(nodesPostgres.lastHeard));
-
-      return nodes as DbNode[];
-    }
+    return this.normalizeBigInts(result) as DbNode[];
   }
 
   /**
    * Get all nodes that have public keys
    */
   async getNodesWithPublicKeys(): Promise<Array<{ nodeNum: number; publicKey: string | null }>> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const nodes = await db
-        .select({ nodeNum: nodesSqlite.nodeNum, publicKey: nodesSqlite.publicKey })
-        .from(nodesSqlite)
-        .where(
-          and(
-            isNotNull(nodesSqlite.publicKey),
-            ne(nodesSqlite.publicKey, '')
-          )
-        );
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select({ nodeNum: nodes.nodeNum, publicKey: nodes.publicKey })
+      .from(nodes)
+      .where(
+        and(
+          isNotNull(nodes.publicKey),
+          ne(nodes.publicKey, '')
+        )
+      );
 
-      return nodes;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const nodes = await db
-        .select({ nodeNum: nodesMysql.nodeNum, publicKey: nodesMysql.publicKey })
-        .from(nodesMysql)
-        .where(
-          and(
-            isNotNull(nodesMysql.publicKey),
-            ne(nodesMysql.publicKey, '')
-          )
-        );
-
-      return nodes;
-    } else {
-      const db = this.getPostgresDb();
-      const nodes = await db
-        .select({ nodeNum: nodesPostgres.nodeNum, publicKey: nodesPostgres.publicKey })
-        .from(nodesPostgres)
-        .where(
-          and(
-            isNotNull(nodesPostgres.publicKey),
-            ne(nodesPostgres.publicKey, '')
-          )
-        );
-
-      return nodes;
-    }
+    return result;
   }
 
   /**
@@ -718,38 +379,16 @@ export class NodesRepository extends BaseRepository {
     keySecurityIssueDetails?: string
   ): Promise<void> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({
-          duplicateKeyDetected,
-          keySecurityIssueDetails: keySecurityIssueDetails ?? null,
-          updatedAt: now,
-        })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({
-          duplicateKeyDetected,
-          keySecurityIssueDetails: keySecurityIssueDetails ?? null,
-          updatedAt: now,
-        })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({
-          duplicateKeyDetected,
-          keySecurityIssueDetails: keySecurityIssueDetails ?? null,
-          updatedAt: now,
-        })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    await this.db
+      .update(nodes)
+      .set({
+        duplicateKeyDetected,
+        keySecurityIssueDetails: keySecurityIssueDetails ?? null,
+        updatedAt: now,
+      })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
@@ -786,78 +425,32 @@ export class NodesRepository extends BaseRepository {
     }
 
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({
-          keyIsLowEntropy,
-          keySecurityIssueDetails: combinedDetails || null,
-          updatedAt: now,
-        })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({
-          keyIsLowEntropy,
-          keySecurityIssueDetails: combinedDetails || null,
-          updatedAt: now,
-        })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({
-          keyIsLowEntropy,
-          keySecurityIssueDetails: combinedDetails || null,
-          updatedAt: now,
-        })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    await this.db
+      .update(nodes)
+      .set({
+        keyIsLowEntropy,
+        keySecurityIssueDetails: combinedDetails || null,
+        updatedAt: now,
+      })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
    * Delete a node by nodeNum
    */
   async deleteNodeRecord(nodeNum: number): Promise<boolean> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const existing = await db
-        .select({ nodeNum: nodesSqlite.nodeNum })
-        .from(nodesSqlite)
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
+    const { nodes } = this.tables;
+    const existing = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(eq(nodes.nodeNum, nodeNum));
 
-      if (existing.length === 0) return false;
+    if (existing.length === 0) return false;
 
-      await db.delete(nodesSqlite).where(eq(nodesSqlite.nodeNum, nodeNum));
-      return true;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const existing = await db
-        .select({ nodeNum: nodesMysql.nodeNum })
-        .from(nodesMysql)
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-
-      if (existing.length === 0) return false;
-
-      await db.delete(nodesMysql).where(eq(nodesMysql.nodeNum, nodeNum));
-      return true;
-    } else {
-      const db = this.getPostgresDb();
-      const existing = await db
-        .select({ nodeNum: nodesPostgres.nodeNum })
-        .from(nodesPostgres)
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-
-      if (existing.length === 0) return false;
-
-      await db.delete(nodesPostgres).where(eq(nodesPostgres.nodeNum, nodeNum));
-      return true;
-    }
+    await this.db.delete(nodes).where(eq(nodes.nodeNum, nodeNum));
+    return true;
   }
 
   /**
@@ -865,101 +458,59 @@ export class NodesRepository extends BaseRepository {
    */
   async cleanupInactiveNodes(days: number = 30): Promise<number> {
     const cutoff = this.now() - (days * 24 * 60 * 60 * 1000);
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ nodeNum: nodesSqlite.nodeNum })
-        .from(nodesSqlite)
-        .where(
-          and(
-            or(
-              lt(nodesSqlite.lastHeard, cutoff),
-              isNull(nodesSqlite.lastHeard)
-            ),
-            or(
-              eq(nodesSqlite.isIgnored, false),
-              isNull(nodesSqlite.isIgnored)
-            )
+    const toDelete = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(
+        and(
+          or(
+            lt(nodes.lastHeard, cutoff),
+            isNull(nodes.lastHeard)
+          ),
+          or(
+            eq(nodes.isIgnored, false),
+            isNull(nodes.isIgnored)
           )
-        );
+        )
+      );
 
-      for (const node of toDelete) {
-        await db.delete(nodesSqlite).where(eq(nodesSqlite.nodeNum, node.nodeNum));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ nodeNum: nodesMysql.nodeNum })
-        .from(nodesMysql)
-        .where(
-          and(
-            or(
-              lt(nodesMysql.lastHeard, cutoff),
-              isNull(nodesMysql.lastHeard)
-            ),
-            or(
-              eq(nodesMysql.isIgnored, false),
-              isNull(nodesMysql.isIgnored)
-            )
-          )
-        );
-
-      for (const node of toDelete) {
-        await db.delete(nodesMysql).where(eq(nodesMysql.nodeNum, node.nodeNum));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ nodeNum: nodesPostgres.nodeNum })
-        .from(nodesPostgres)
-        .where(
-          and(
-            or(
-              lt(nodesPostgres.lastHeard, cutoff),
-              isNull(nodesPostgres.lastHeard)
-            ),
-            or(
-              eq(nodesPostgres.isIgnored, false),
-              isNull(nodesPostgres.isIgnored)
-            )
-          )
-        );
-
-      for (const node of toDelete) {
-        await db.delete(nodesPostgres).where(eq(nodesPostgres.nodeNum, node.nodeNum));
-      }
-      return toDelete.length;
+    for (const node of toDelete) {
+      await this.db.delete(nodes).where(eq(nodes.nodeNum, node.nodeNum));
     }
+    return toDelete.length;
   }
 
   /**
    * Set node favorite status
    */
-  async setNodeFavorite(nodeNum: number, isFavorite: boolean): Promise<void> {
+  async setNodeFavorite(nodeNum: number, isFavorite: boolean, favoriteLocked?: boolean): Promise<void> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ isFavorite, updatedAt: now })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ isFavorite, updatedAt: now })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ isFavorite, updatedAt: now })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
+    const setData: Record<string, any> = { isFavorite, updatedAt: now };
+    if (favoriteLocked !== undefined) {
+      setData.favoriteLocked = favoriteLocked;
     }
+
+    await this.db
+      .update(nodes)
+      .set(setData)
+      .where(eq(nodes.nodeNum, nodeNum));
+  }
+
+  /**
+   * Set only the favoriteLocked flag (without changing isFavorite)
+   */
+  async setNodeFavoriteLocked(nodeNum: number, favoriteLocked: boolean): Promise<void> {
+    const now = this.now();
+    const { nodes } = this.tables;
+
+    await this.db
+      .update(nodes)
+      .set({ favoriteLocked, updatedAt: now })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
@@ -967,51 +518,23 @@ export class NodesRepository extends BaseRepository {
    */
   async setNodeIgnored(nodeNum: number, isIgnored: boolean): Promise<void> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ isIgnored, updatedAt: now })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ isIgnored, updatedAt: now })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ isIgnored, updatedAt: now })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    await this.db
+      .update(nodes)
+      .set({ isIgnored, updatedAt: now })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
    * Update node mobility status
    */
   async updateNodeMobility(nodeId: string, mobile: number): Promise<void> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ mobile })
-        .where(eq(nodesSqlite.nodeId, nodeId));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ mobile })
-        .where(eq(nodesMysql.nodeId, nodeId));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ mobile })
-        .where(eq(nodesPostgres.nodeId, nodeId));
-    }
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ mobile })
+      .where(eq(nodes.nodeId, nodeId));
   }
 
   /**
@@ -1019,134 +542,56 @@ export class NodesRepository extends BaseRepository {
    */
   async updateLastTracerouteRequest(nodeNum: number, timestamp: number): Promise<void> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ lastTracerouteRequest: timestamp, updatedAt: now })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ lastTracerouteRequest: timestamp, updatedAt: now })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ lastTracerouteRequest: timestamp, updatedAt: now })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    await this.db
+      .update(nodes)
+      .set({ lastTracerouteRequest: timestamp, updatedAt: now })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
    * Delete inactive nodes (not heard since cutoff timestamp)
    */
   async deleteInactiveNodes(cutoffTimestamp: number): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const toDelete = await db
-        .select({ nodeNum: nodesSqlite.nodeNum })
-        .from(nodesSqlite)
-        .where(
-          and(
-            or(lt(nodesSqlite.lastHeard, cutoffTimestamp), isNull(nodesSqlite.lastHeard)),
-            or(eq(nodesSqlite.isIgnored, false), isNull(nodesSqlite.isIgnored))
-          )
-        );
+    const { nodes } = this.tables;
+    const toDelete = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(
+        and(
+          or(lt(nodes.lastHeard, cutoffTimestamp), isNull(nodes.lastHeard)),
+          or(eq(nodes.isIgnored, false), isNull(nodes.isIgnored))
+        )
+      );
 
-      for (const node of toDelete) {
-        await db.delete(nodesSqlite).where(eq(nodesSqlite.nodeNum, node.nodeNum));
-      }
-      return toDelete.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const toDelete = await db
-        .select({ nodeNum: nodesMysql.nodeNum })
-        .from(nodesMysql)
-        .where(
-          and(
-            or(lt(nodesMysql.lastHeard, cutoffTimestamp), isNull(nodesMysql.lastHeard)),
-            or(eq(nodesMysql.isIgnored, false), isNull(nodesMysql.isIgnored))
-          )
-        );
-
-      for (const node of toDelete) {
-        await db.delete(nodesMysql).where(eq(nodesMysql.nodeNum, node.nodeNum));
-      }
-      return toDelete.length;
-    } else {
-      const db = this.getPostgresDb();
-      const toDelete = await db
-        .select({ nodeNum: nodesPostgres.nodeNum })
-        .from(nodesPostgres)
-        .where(
-          and(
-            or(lt(nodesPostgres.lastHeard, cutoffTimestamp), isNull(nodesPostgres.lastHeard)),
-            or(eq(nodesPostgres.isIgnored, false), isNull(nodesPostgres.isIgnored))
-          )
-        );
-
-      for (const node of toDelete) {
-        await db.delete(nodesPostgres).where(eq(nodesPostgres.nodeNum, node.nodeNum));
-      }
-      return toDelete.length;
+    for (const node of toDelete) {
+      await this.db.delete(nodes).where(eq(nodes.nodeNum, node.nodeNum));
     }
+    return toDelete.length;
   }
 
   /**
    * Delete all nodes
    */
   async deleteAllNodes(): Promise<number> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const count = await db
-        .select({ nodeNum: nodesSqlite.nodeNum })
-        .from(nodesSqlite);
-      await db.delete(nodesSqlite);
-      return count.length;
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const count = await db
-        .select({ nodeNum: nodesMysql.nodeNum })
-        .from(nodesMysql);
-      await db.delete(nodesMysql);
-      return count.length;
-    } else {
-      const db = this.getPostgresDb();
-      const count = await db
-        .select({ nodeNum: nodesPostgres.nodeNum })
-        .from(nodesPostgres);
-      await db.delete(nodesPostgres);
-      return count.length;
-    }
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes);
+    await this.db.delete(nodes);
+    return result.length;
   }
 
   /**
    * Update node's last traceroute request timestamp
    */
   async updateNodeLastTracerouteRequest(nodeNum: number, timestamp: number): Promise<void> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ lastTracerouteRequest: timestamp })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ lastTracerouteRequest: timestamp })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ lastTracerouteRequest: timestamp })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ lastTracerouteRequest: timestamp })
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
@@ -1154,6 +599,8 @@ export class NodesRepository extends BaseRepository {
    * Returns nodes that haven't been traced recently based on:
    * - Category 1: No traceroute exists, retry every 3 hours
    * - Category 2: Traceroute exists, retry every expirationHours
+   *
+   * Keeps branching: raw SQL with different column quoting per dialect.
    */
   async getEligibleNodesForTraceroute(
     localNodeNum: number,
@@ -1215,25 +662,30 @@ export class NodesRepository extends BaseRepository {
     } else {
       // PostgreSQL
       const db = this.getPostgresDb();
+      const nodeNum = this.col('nodeNum');
+      const lastHeard = this.col('lastHeard');
+      const fromNodeNum = this.col('fromNodeNum');
+      const toNodeNum = this.col('toNodeNum');
+      const lastTracerouteRequest = this.col('lastTracerouteRequest');
       const results = await db.execute(sql`
         SELECT n.*
         FROM nodes n
-        WHERE n."nodeNum" != ${localNodeNum}
-          AND n."lastHeard" > ${activeNodeCutoffSeconds}
+        WHERE n.${nodeNum} != ${localNodeNum}
+          AND n.${lastHeard} > ${activeNodeCutoffSeconds}
           AND (
             (
               (SELECT COUNT(*) FROM traceroutes t
-               WHERE t."fromNodeNum" = ${localNodeNum} AND t."toNodeNum" = n."nodeNum") = 0
-              AND (n."lastTracerouteRequest" IS NULL OR n."lastTracerouteRequest" < ${threeHoursAgoMs})
+               WHERE t.${fromNodeNum} = ${localNodeNum} AND t.${toNodeNum} = n.${nodeNum}) = 0
+              AND (n.${lastTracerouteRequest} IS NULL OR n.${lastTracerouteRequest} < ${threeHoursAgoMs})
             )
             OR
             (
               (SELECT COUNT(*) FROM traceroutes t
-               WHERE t."fromNodeNum" = ${localNodeNum} AND t."toNodeNum" = n."nodeNum") > 0
-              AND (n."lastTracerouteRequest" IS NULL OR n."lastTracerouteRequest" < ${expirationMsAgo})
+               WHERE t.${fromNodeNum} = ${localNodeNum} AND t.${toNodeNum} = n.${nodeNum}) > 0
+              AND (n.${lastTracerouteRequest} IS NULL OR n.${lastTracerouteRequest} < ${expirationMsAgo})
             )
           )
-        ORDER BY n."lastHeard" DESC
+        ORDER BY n.${lastHeard} DESC
       `);
       // PostgreSQL returns { rows: [...] }
       const rows = (results as unknown as { rows: unknown[] }).rows as DbNode[];
@@ -1276,74 +728,27 @@ export class NodesRepository extends BaseRepository {
     activeNodeCutoff: number,
     expirationMsAgo: number
   ): Promise<DbNode | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const results = await db
-        .select()
-        .from(nodesSqlite)
-        .where(
-          and(
-            ne(nodesSqlite.nodeNum, localNodeNum),
-            isNotNull(nodesSqlite.publicKey),
-            ne(nodesSqlite.publicKey, ''),
-            gt(nodesSqlite.lastHeard, activeNodeCutoff),
-            or(
-              isNull(nodesSqlite.lastRemoteAdminCheck),
-              lt(nodesSqlite.lastRemoteAdminCheck, expirationMsAgo)
-            )
+    const { nodes } = this.tables;
+    const results = await this.db
+      .select()
+      .from(nodes)
+      .where(
+        and(
+          ne(nodes.nodeNum, localNodeNum),
+          isNotNull(nodes.publicKey),
+          ne(nodes.publicKey, ''),
+          gt(nodes.lastHeard, activeNodeCutoff),
+          or(
+            isNull(nodes.lastRemoteAdminCheck),
+            lt(nodes.lastRemoteAdminCheck, expirationMsAgo)
           )
         )
-        .orderBy(desc(nodesSqlite.lastHeard))
-        .limit(1);
+      )
+      .orderBy(desc(nodes.lastHeard))
+      .limit(1);
 
-      if (results.length === 0) return null;
-      return this.normalizeNode(results[0] as DbNode);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const results = await db
-        .select()
-        .from(nodesMysql)
-        .where(
-          and(
-            ne(nodesMysql.nodeNum, localNodeNum),
-            isNotNull(nodesMysql.publicKey),
-            ne(nodesMysql.publicKey, ''),
-            gt(nodesMysql.lastHeard, activeNodeCutoff),
-            or(
-              isNull(nodesMysql.lastRemoteAdminCheck),
-              lt(nodesMysql.lastRemoteAdminCheck, expirationMsAgo)
-            )
-          )
-        )
-        .orderBy(desc(nodesMysql.lastHeard))
-        .limit(1);
-
-      if (results.length === 0) return null;
-      return this.normalizeNode(results[0] as DbNode);
-    } else {
-      // PostgreSQL
-      const db = this.getPostgresDb();
-      const results = await db
-        .select()
-        .from(nodesPostgres)
-        .where(
-          and(
-            ne(nodesPostgres.nodeNum, localNodeNum),
-            isNotNull(nodesPostgres.publicKey),
-            ne(nodesPostgres.publicKey, ''),
-            gt(nodesPostgres.lastHeard, activeNodeCutoff),
-            or(
-              isNull(nodesPostgres.lastRemoteAdminCheck),
-              lt(nodesPostgres.lastRemoteAdminCheck, expirationMsAgo)
-            )
-          )
-        )
-        .orderBy(desc(nodesPostgres.lastHeard))
-        .limit(1);
-
-      if (results.length === 0) return null;
-      return this.normalizeNode(results[0] as DbNode);
-    }
+    if (results.length === 0) return null;
+    return this.normalizeNode(results[0] as DbNode);
   }
 
   /**
@@ -1358,6 +763,7 @@ export class NodesRepository extends BaseRepository {
     metadata: string | null
   ): Promise<void> {
     const now = Date.now();
+    const { nodes } = this.tables;
 
     // Build update object - only include metadata if provided (not null)
     const baseUpdate = {
@@ -1366,35 +772,14 @@ export class NodesRepository extends BaseRepository {
       updatedAt: now,
     };
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const updateData = metadata !== null
-        ? { ...baseUpdate, remoteAdminMetadata: metadata }
-        : baseUpdate;
-      await db
-        .update(nodesSqlite)
-        .set(updateData as any)
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const updateData = metadata !== null
-        ? { ...baseUpdate, remoteAdminMetadata: metadata }
-        : baseUpdate;
-      await db
-        .update(nodesMysql)
-        .set(updateData as any)
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      // PostgreSQL
-      const db = this.getPostgresDb();
-      const updateData = metadata !== null
-        ? { ...baseUpdate, remoteAdminMetadata: metadata }
-        : baseUpdate;
-      await db
-        .update(nodesPostgres)
-        .set(updateData as any)
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
-    }
+    const updateData = metadata !== null
+      ? { ...baseUpdate, remoteAdminMetadata: metadata }
+      : baseUpdate;
+
+    await this.db
+      .update(nodes)
+      .set(updateData as any)
+      .where(eq(nodes.nodeNum, nodeNum));
   }
 
   /**
@@ -1409,81 +794,30 @@ export class NodesRepository extends BaseRepository {
     expirationMsAgo: number,
     filterNodeNums?: number[]
   ): Promise<DbNode | null> {
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      const baseConditions = [
-        eq(nodesSqlite.hasRemoteAdmin, true),
-        gt(nodesSqlite.lastHeard, activeNodeCutoff),
-        or(
-          isNull(nodesSqlite.lastTimeSync),
-          lt(nodesSqlite.lastTimeSync, expirationMsAgo)
-        )
-      ];
+    const { nodes } = this.tables;
+    const baseConditions = [
+      eq(nodes.hasRemoteAdmin, true),
+      gt(nodes.lastHeard, activeNodeCutoff),
+      or(
+        isNull(nodes.lastTimeSync),
+        lt(nodes.lastTimeSync, expirationMsAgo)
+      )
+    ];
 
-      // Add filter condition if specific nodes are provided
-      if (filterNodeNums && filterNodeNums.length > 0) {
-        baseConditions.push(inArray(nodesSqlite.nodeNum, filterNodeNums));
-      }
-
-      const results = await db
-        .select()
-        .from(nodesSqlite)
-        .where(and(...baseConditions))
-        .orderBy(asc(nodesSqlite.lastTimeSync))
-        .limit(1);
-
-      if (results.length === 0) return null;
-      return this.normalizeNode(results[0] as DbNode);
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      const baseConditions = [
-        eq(nodesMysql.hasRemoteAdmin, true),
-        gt(nodesMysql.lastHeard, activeNodeCutoff),
-        or(
-          isNull(nodesMysql.lastTimeSync),
-          lt(nodesMysql.lastTimeSync, expirationMsAgo)
-        )
-      ];
-
-      if (filterNodeNums && filterNodeNums.length > 0) {
-        baseConditions.push(inArray(nodesMysql.nodeNum, filterNodeNums));
-      }
-
-      const results = await db
-        .select()
-        .from(nodesMysql)
-        .where(and(...baseConditions))
-        .orderBy(asc(nodesMysql.lastTimeSync))
-        .limit(1);
-
-      if (results.length === 0) return null;
-      return this.normalizeNode(results[0] as DbNode);
-    } else {
-      // PostgreSQL
-      const db = this.getPostgresDb();
-      const baseConditions = [
-        eq(nodesPostgres.hasRemoteAdmin, true),
-        gt(nodesPostgres.lastHeard, activeNodeCutoff),
-        or(
-          isNull(nodesPostgres.lastTimeSync),
-          lt(nodesPostgres.lastTimeSync, expirationMsAgo)
-        )
-      ];
-
-      if (filterNodeNums && filterNodeNums.length > 0) {
-        baseConditions.push(inArray(nodesPostgres.nodeNum, filterNodeNums));
-      }
-
-      const results = await db
-        .select()
-        .from(nodesPostgres)
-        .where(and(...baseConditions))
-        .orderBy(asc(nodesPostgres.lastTimeSync))
-        .limit(1);
-
-      if (results.length === 0) return null;
-      return this.normalizeNode(results[0] as DbNode);
+    // Add filter condition if specific nodes are provided
+    if (filterNodeNums && filterNodeNums.length > 0) {
+      baseConditions.push(inArray(nodes.nodeNum, filterNodeNums));
     }
+
+    const results = await this.db
+      .select()
+      .from(nodes)
+      .where(and(...baseConditions))
+      .orderBy(asc(nodes.lastTimeSync))
+      .limit(1);
+
+    if (results.length === 0) return null;
+    return this.normalizeNode(results[0] as DbNode);
   }
 
   /**
@@ -1493,25 +827,38 @@ export class NodesRepository extends BaseRepository {
    */
   async updateNodeTimeSyncAsync(nodeNum: number, timestamp: number): Promise<void> {
     const now = this.now();
+    const { nodes } = this.tables;
 
-    if (this.isSQLite()) {
-      const db = this.getSqliteDb();
-      await db
-        .update(nodesSqlite)
-        .set({ lastTimeSync: timestamp, updatedAt: now })
-        .where(eq(nodesSqlite.nodeNum, nodeNum));
-    } else if (this.isMySQL()) {
-      const db = this.getMysqlDb();
-      await db
-        .update(nodesMysql)
-        .set({ lastTimeSync: timestamp, updatedAt: now })
-        .where(eq(nodesMysql.nodeNum, nodeNum));
-    } else {
-      const db = this.getPostgresDb();
-      await db
-        .update(nodesPostgres)
-        .set({ lastTimeSync: timestamp, updatedAt: now })
-        .where(eq(nodesPostgres.nodeNum, nodeNum));
+    await this.db
+      .update(nodes)
+      .set({ lastTimeSync: timestamp, updatedAt: now })
+      .where(eq(nodes.nodeNum, nodeNum));
+  }
+
+  /**
+   * Get inactive monitored nodes — nodes in the given nodeId list whose lastHeard is before the cutoff
+   */
+  async getInactiveMonitoredNodes(
+    nodeIds: string[],
+    cutoffSeconds: number
+  ): Promise<Array<{ nodeNum: number; nodeId: string; longName: string | null; shortName: string | null; lastHeard: number | null }>> {
+    if (nodeIds.length === 0) return [];
+
+    try {
+      const { nodes } = this.tables;
+      const rows = await this.db
+        .select({ nodeNum: nodes.nodeNum, nodeId: nodes.nodeId, longName: nodes.longName, shortName: nodes.shortName, lastHeard: nodes.lastHeard })
+        .from(nodes)
+        .where(and(
+          inArray(nodes.nodeId, nodeIds),
+          isNotNull(nodes.lastHeard),
+          lt(nodes.lastHeard, cutoffSeconds)
+        ))
+        .orderBy(asc(nodes.lastHeard));
+      return rows.map((r: any) => ({ ...r, nodeNum: Number(r.nodeNum) }));
+    } catch (error) {
+      logger.error('Failed to query inactive monitored nodes:', error);
+      return [];
     }
   }
 }

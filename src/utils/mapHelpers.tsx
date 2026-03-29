@@ -3,6 +3,24 @@ import L from 'leaflet';
 import { Marker, Tooltip, Popup } from 'react-leaflet';
 import { PositionHistoryItem } from '../contexts/MapContext';
 
+/**
+ * Scaled SNR sentinel for MQTT/unknown hops.
+ * Raw Meshtastic value is -128 (INT8_MIN), divided by 4 = -32.
+ * Indicates the hop used MQTT gateway or firmware too old to report SNR.
+ */
+export const MQTT_SNR_SENTINEL = -32;
+
+/**
+ * Scaled SNR zero sentinel for MQTT hops.
+ * Many MQTT gateways leave SNR at protobuf default (0) instead of setting -128.
+ * Raw 0 / 4 = 0.0 dB — treated as MQTT since real RF SNR of exactly 0 is rare.
+ */
+export const MQTT_SNR_ZERO = 0;
+
+/** Returns true if the scaled SNR value indicates an MQTT/unknown hop */
+export const isMqttSnr = (snr: number | undefined): boolean =>
+  snr === MQTT_SNR_SENTINEL || snr === MQTT_SNR_ZERO;
+
 // Constants for arrow generation
 const ARROW_DISTANCE_THRESHOLD = 0.05; // One arrow per 0.05 degrees
 const MIN_ARROWS_PER_SEGMENT = 1;
@@ -47,7 +65,9 @@ export const generateArrowMarkers = (
     const arrowsToAdd = Math.min(numArrows, MAX_TOTAL_ARROWS - (currentArrowCount + arrowsGenerated));
 
     // Calculate angle for arrow direction (pointing from start to end)
-    const angle = Math.atan2(lngDiff, latDiff) * 180 / Math.PI + ARROW_ROTATION_OFFSET;
+    // Scale longitude by cos(lat) to correct for latitude distortion
+    const latAvg = (start[0] + end[0]) / 2;
+    const angle = Math.atan2(lngDiff * Math.cos(latAvg * Math.PI / 180), latDiff) * 180 / Math.PI + ARROW_ROTATION_OFFSET;
 
     for (let j = 0; j < arrowsToAdd; j++) {
       // Distribute arrows evenly along the segment
@@ -140,6 +160,42 @@ export const generateCurvedPath = (
 };
 
 /**
+ * Get color for a route segment based on average SNR
+ * Returns the appropriate color from the SNR gradient
+ */
+export const getSegmentSnrColor = (
+  snrData: Array<{ snr: number }> | undefined,
+  snrColors: { good: string; medium: string; poor: string },
+  defaultColor: string
+): string => {
+  if (!snrData || snrData.length === 0) return defaultColor;
+  const rfSnrs = snrData.filter(d => !isMqttSnr(d.snr)).map(d => d.snr);
+  if (rfSnrs.length === 0) return defaultColor;
+  const avgSnr = rfSnrs.reduce((sum, val) => sum + val, 0) / rfSnrs.length;
+  if (avgSnr > 0) return snrColors.good;
+  if (avgSnr >= -10) return snrColors.medium;
+  return snrColors.poor;
+};
+
+/**
+ * Get opacity for a route segment based on SNR quality
+ * Better SNR = higher opacity for visual hierarchy
+ */
+export const getSegmentSnrOpacity = (
+  snrData: Array<{ snr: number }> | undefined,
+  isMqtt: boolean
+): number => {
+  if (isMqtt) return 0.5;
+  if (!snrData || snrData.length === 0) return 0.5;
+  const rfSnrs = snrData.filter(d => !isMqttSnr(d.snr)).map(d => d.snr);
+  if (rfSnrs.length === 0) return 0.5;
+  const avgSnr = rfSnrs.reduce((sum, val) => sum + val, 0) / rfSnrs.length;
+  // Map from -20..+15 to 0.4..0.85
+  const normalized = Math.max(-20, Math.min(15, avgSnr));
+  return 0.4 + ((normalized + 20) / 35) * 0.45;
+};
+
+/**
  * Calculate line weight based on SNR (-20 to +10 dB range typically)
  */
 export const getLineWeight = (snr: number | undefined): number => {
@@ -197,7 +253,7 @@ export const generateCurvedArrowMarkers = (
       <Marker key={`${pathKey}-arrow-${i}`} position={midPoint} icon={createArrowIcon(angle, color)}>
         {snr !== undefined && (
           <Tooltip permanent={false} direction="top" offset={[0, -10]}>
-            {snr.toFixed(1)} dB
+            {snr.toFixed(1)} dB{isMqttSnr(snr) ? ' (IP)' : ''}
           </Tooltip>
         )}
       </Marker>
@@ -205,6 +261,21 @@ export const generateCurvedArrowMarkers = (
   }
 
   return arrows;
+};
+
+/**
+ * Calculate opacity multiplier based on segment age
+ * Fresh segments are fully opaque, older segments fade
+ */
+export const getTemporalOpacityMultiplier = (timestamp: number | undefined): number => {
+  if (!timestamp) return 0.5; // Unknown age = moderate opacity
+  const ageHours = (Date.now() - timestamp) / (1000 * 60 * 60);
+
+  if (ageHours < 1) return 1.0;
+  if (ageHours > 24) return 0.2;
+  // Smooth sqrt decay from 1.0 to 0.2 over 1-24 hours
+  const t = (ageHours - 1) / 23;
+  return 1.0 - 0.8 * Math.sqrt(t);
 };
 
 // Position history color gradient constants
@@ -369,7 +440,9 @@ export const generatePositionHistoryArrows = (
       const latDiff = next.latitude - item.latitude;
       const lngDiff = next.longitude - item.longitude;
       // atan2 returns radians with 0 = East, we need 0 = North
-      angle = (Math.atan2(lngDiff, latDiff) * 180 / Math.PI);
+      // Scale longitude by cos(lat) to correct for latitude distortion
+      const latAvg = (item.latitude + next.latitude) / 2;
+      angle = (Math.atan2(lngDiff * Math.cos(latAvg * Math.PI / 180), latDiff) * 180 / Math.PI);
     } else {
       // Last point with no heading data - skip arrow
       continue;

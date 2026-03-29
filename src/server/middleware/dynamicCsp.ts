@@ -8,6 +8,7 @@
 import { Request, Response, NextFunction } from 'express';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
+import { AnalyticsProvider, getAnalyticsCspDomains } from '../utils/analyticsScriptGenerator.js';
 
 // Cache for custom tileset hostnames
 let cachedTileHostnames: string[] = [];
@@ -32,9 +33,10 @@ function extractHostFromUrl(url: string): string | null {
 /**
  * Load custom tileset hostnames from database
  */
-export function loadCustomTilesetHostnames(): string[] {
+export async function loadCustomTilesetHostnames(): Promise<string[]> {
   try {
-    const customTilesetsJson = databaseService.getSetting('customTilesets');
+    await databaseService.waitForReady();
+    const customTilesetsJson = await databaseService.settings.getSetting('customTilesets');
     if (!customTilesetsJson) {
       return [];
     }
@@ -66,8 +68,8 @@ export function loadCustomTilesetHostnames(): string[] {
 /**
  * Refresh the cached tile hostnames
  */
-export function refreshTileHostnameCache(): void {
-  cachedTileHostnames = loadCustomTilesetHostnames();
+export async function refreshTileHostnameCache(): Promise<void> {
+  cachedTileHostnames = await loadCustomTilesetHostnames();
   cacheTimestamp = Date.now();
   logger.debug(`[CSP] Refreshed tile hostname cache: ${cachedTileHostnames.length} entries`);
 }
@@ -75,9 +77,9 @@ export function refreshTileHostnameCache(): void {
 /**
  * Get cached tile hostnames, refreshing if stale
  */
-export function getCachedTileHostnames(): string[] {
+export async function getCachedTileHostnames(): Promise<string[]> {
   if (Date.now() - cacheTimestamp > CACHE_TTL_MS) {
-    refreshTileHostnameCache();
+    await refreshTileHostnameCache();
   }
   return cachedTileHostnames;
 }
@@ -85,7 +87,7 @@ export function getCachedTileHostnames(): string[] {
 /**
  * Build dynamic connect-src directive values
  */
-export function buildConnectSrcDirective(isProduction: boolean, cookieSecure: boolean): string[] {
+export async function buildConnectSrcDirective(isProduction: boolean, cookieSecure: boolean): Promise<string[]> {
   const connectSrc: string[] = [
     "'self'",
     // Built-in tile servers
@@ -101,7 +103,7 @@ export function buildConnectSrcDirective(isProduction: boolean, cookieSecure: bo
   }
 
   // Add custom tile server hostnames
-  const customHosts = getCachedTileHostnames();
+  const customHosts = await getCachedTileHostnames();
   for (const host of customHosts) {
     if (!connectSrc.includes(host)) {
       connectSrc.push(host);
@@ -112,16 +114,55 @@ export function buildConnectSrcDirective(isProduction: boolean, cookieSecure: bo
 }
 
 /**
+ * Load analytics CSP domains from database settings
+ */
+async function getAnalyticsCspFromSettings(): Promise<{ scriptSrc: string[]; connectSrc: string[] }> {
+  try {
+    const provider = (await databaseService.settings.getSetting('analyticsProvider') || 'none') as AnalyticsProvider;
+    if (provider === 'none' || provider === 'custom') {
+      return { scriptSrc: [], connectSrc: [] };
+    }
+    const configJson = await databaseService.settings.getSetting('analyticsConfig') || '{}';
+    const config = JSON.parse(configJson);
+    return getAnalyticsCspDomains(provider, config);
+  } catch {
+    return { scriptSrc: [], connectSrc: [] };
+  }
+}
+
+/**
  * Build the full CSP header value
  */
-export function buildCspHeader(isProduction: boolean, cookieSecure: boolean): string {
-  const connectSrc = buildConnectSrcDirective(isProduction, cookieSecure);
+export async function buildCspHeader(isProduction: boolean, cookieSecure: boolean): Promise<string> {
+  const connectSrc = await buildConnectSrcDirective(isProduction, cookieSecure);
+  const analyticsCsp = await getAnalyticsCspFromSettings();
+
+  const scriptSrc = isProduction && cookieSecure
+    ? ["'self'"]
+    : ["'self'", "'unsafe-inline'", "'unsafe-eval'"];
+
+  // Add analytics script domains and allow inline scripts for analytics snippets
+  if (analyticsCsp.scriptSrc.length > 0) {
+    if (!scriptSrc.includes("'unsafe-inline'")) {
+      scriptSrc.push("'unsafe-inline'");
+    }
+    for (const domain of analyticsCsp.scriptSrc) {
+      if (!scriptSrc.includes(domain)) {
+        scriptSrc.push(domain);
+      }
+    }
+  }
+
+  // Add analytics connect domains
+  for (const domain of analyticsCsp.connectSrc) {
+    if (!connectSrc.includes(domain)) {
+      connectSrc.push(domain);
+    }
+  }
 
   const directives: Record<string, string[]> = {
     'default-src': ["'self'"],
-    'script-src': isProduction && cookieSecure
-      ? ["'self'"]
-      : ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+    'script-src': scriptSrc,
     'style-src': ["'self'", "'unsafe-inline'"],
     'img-src': ["'self'", 'data:', 'http:', 'https:'],
     'connect-src': connectSrc,
@@ -144,14 +185,21 @@ export function buildCspHeader(isProduction: boolean, cookieSecure: boolean): st
  * This replaces helmet's static CSP with a dynamic one that includes custom tile servers
  */
 export function dynamicCspMiddleware(isProduction: boolean, cookieSecure: boolean) {
-  // Initialize cache on first call
+  // Initialize cache on first call (fire-and-forget)
   if (cacheTimestamp === 0) {
-    refreshTileHostnameCache();
+    refreshTileHostnameCache().catch(err =>
+      logger.error('[CSP] Failed to initialize tile hostname cache:', err)
+    );
   }
 
-  return (_req: Request, res: Response, next: NextFunction) => {
-    const cspHeader = buildCspHeader(isProduction, cookieSecure);
-    res.setHeader('Content-Security-Policy', cspHeader);
-    next();
+  return async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const cspHeader = await buildCspHeader(isProduction, cookieSecure);
+      res.setHeader('Content-Security-Policy', cspHeader);
+      next();
+    } catch (error) {
+      logger.error('[CSP] Failed to build CSP header:', error);
+      next();
+    }
   };
 }
