@@ -24,6 +24,7 @@ import ZoomHandler from './ZoomHandler';
 import MapResizeHandler from './MapResizeHandler';
 import MapPositionHandler from './MapPositionHandler';
 import PolarGridOverlay from './PolarGridOverlay.js';
+import GeoJsonOverlay from './GeoJsonOverlay';
 import { SpiderfierController, SpiderfierControllerRef } from './SpiderfierController';
 import { TilesetSelector } from './TilesetSelector';
 import { MapCenterController } from './MapCenterController';
@@ -35,6 +36,8 @@ import { MapNodePopupContent } from './MapNodePopupContent';
 import { useCsrfFetch } from '../hooks/useCsrfFetch';
 import api from '../services/api';
 import { mapContactsToNodes } from '../utils/meshcoreHelpers';
+import type { GeoJsonLayer } from '../server/services/geojsonService.js';
+import type { MapStyle } from '../server/services/mapStyleService.js';
 
 /**
  * Spiderfier initialization constants
@@ -535,6 +538,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Track if packet logging is enabled on the server
   const [packetLogEnabled, setPacketLogEnabled] = useState<boolean>(false);
+  const [geoJsonLayers, setGeoJsonLayers] = useState<GeoJsonLayer[]>([]);
+  const [mapStyles, setMapStyles] = useState<MapStyle[]>([]);
+  const [activeStyleId, setActiveStyleId] = useState<string | null>(() => {
+    try { return localStorage.getItem('meshmonitor-activeMapStyleId') || null; } catch { return null; }
+  });
+  const [activeStyleJson, setActiveStyleJson] = useState<Record<string, unknown> | null>(null);
 
   // Track if map controls are collapsed
   const [isMapControlsCollapsed, setIsMapControlsCollapsed] = useState(() => {
@@ -656,6 +665,65 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
     fetchPacketLogStatus();
   }, [canViewPacketMonitor]);
+
+  useEffect(() => {
+    const fetchGeoJsonLayers = async () => {
+      try {
+        const baseUrl = await api.getBaseUrl();
+        const response = await fetch(`${baseUrl}/api/geojson/layers`);
+        if (!response.ok) return;
+        const data = await response.json();
+        setGeoJsonLayers(data);
+      } catch (err) {
+        console.error('Failed to fetch GeoJSON layers:', err);
+      }
+    };
+    fetchGeoJsonLayers();
+  }, []);
+
+  useEffect(() => {
+    const fetchMapStyles = async () => {
+      try {
+        const baseUrl = await api.getBaseUrl();
+        const response = await fetch(`${baseUrl}/api/map-styles/styles`);
+        if (!response.ok) return;
+        const data = await response.json();
+        setMapStyles(data);
+
+        // Determine which style to use: localStorage > server default > none
+        let resolvedStyleId = activeStyleId;
+
+        if (!resolvedStyleId) {
+          // No localStorage value — check server default
+          try {
+            const settingsRes = await fetch(`${baseUrl}/api/settings`, { credentials: 'include' });
+            if (settingsRes.ok) {
+              const settings = await settingsRes.json();
+              if (settings.activeMapStyleId) {
+                resolvedStyleId = settings.activeMapStyleId;
+                setActiveStyleId(resolvedStyleId);
+              }
+            }
+          } catch { /* ignore settings fetch failure */ }
+        }
+
+        // Load style data if we have a resolved ID
+        if (resolvedStyleId && data.some((s: MapStyle) => s.id === resolvedStyleId)) {
+          const styleRes = await fetch(`${baseUrl}/api/map-styles/styles/${resolvedStyleId}/data`);
+          if (styleRes.ok) {
+            setActiveStyleJson(await styleRes.json());
+          }
+        } else if (resolvedStyleId) {
+          // Saved style no longer exists, clear it
+          setActiveStyleId(null);
+          try { localStorage.removeItem('meshmonitor-activeMapStyleId'); } catch { /* ignore */ }
+        }
+      } catch (err) {
+        console.error('Failed to fetch map styles:', err);
+      }
+    };
+    fetchMapStyles();
+  }, []);
 
   // Refs to access latest values without recreating listeners
   const processedNodesRef = useRef(processedNodes);
@@ -1764,6 +1832,77 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       {t('map.showPolarGrid')}
                     </span>
                   </label>
+                  {geoJsonLayers.map(layer => (
+                    <label key={layer.id} className="map-control-item">
+                      <input
+                        type="checkbox"
+                        checked={layer.visible}
+                        onChange={(e) => {
+                          const newLayers = geoJsonLayers.map(l =>
+                            l.id === layer.id ? { ...l, visible: e.target.checked } : l
+                          );
+                          setGeoJsonLayers(newLayers);
+                          api.getBaseUrl().then(baseUrl => {
+                            csrfFetch(`${baseUrl}/api/geojson/layers/${layer.id}`, {
+                              method: 'PUT',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ visible: e.target.checked }),
+                            }).catch(err => console.error('Failed to update layer visibility:', err));
+                          }).catch(err => console.error('Failed to get base URL:', err));
+                        }}
+                      />
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{
+                          display: 'inline-block', width: '8px', height: '8px',
+                          borderRadius: '50%', backgroundColor: layer.style.color,
+                        }} />
+                        {layer.name}
+                      </span>
+                    </label>
+                  ))}
+                  {getTilesetById(activeTileset, customTilesets).isVector && mapStyles.length > 0 && (
+                    <div className="map-control-item">
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85em' }}>
+                        Map Style
+                        <select
+                          value={activeStyleId ?? ''}
+                          onChange={async (e) => {
+                            const styleId = e.target.value || null;
+                            setActiveStyleId(styleId);
+                            try { localStorage.setItem('meshmonitor-activeMapStyleId', styleId ?? ''); } catch { /* ignore */ }
+                            // Save as server default so incognito/new browsers get this style
+                            api.getBaseUrl().then(baseUrl => {
+                              csrfFetch(`${baseUrl}/api/settings`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ activeMapStyleId: styleId ?? '' }),
+                              }).catch(err => console.error('Failed to save map style setting:', err));
+                            });
+                            if (styleId) {
+                              try {
+                                const baseUrl = await api.getBaseUrl();
+                                const response = await fetch(`${baseUrl}/api/map-styles/styles/${styleId}/data`);
+                                if (response.ok) {
+                                  const data = await response.json();
+                                  setActiveStyleJson(data);
+                                }
+                              } catch (err) {
+                                console.error('Failed to fetch map style data:', err);
+                              }
+                            } else {
+                              setActiveStyleJson(null);
+                            }
+                          }}
+                          style={{ padding: '2px 6px', border: '1px solid var(--border-color, #ccc)', borderRadius: '3px', background: 'var(--input-bg, #fff)', color: 'var(--text-color, #000)' }}
+                        >
+                          <option value="">Default Style</option>
+                          {mapStyles.map(s => (
+                            <option key={s.id} value={s.id}>{s.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  )}
                   {canViewPacketMonitor && packetLogEnabled && (
                     <label className="map-control-item packet-monitor-toggle">
                       <input
@@ -1794,6 +1933,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   url={getTilesetById(activeTileset, customTilesets).url}
                   attribution={getTilesetById(activeTileset, customTilesets).attribution}
                   maxZoom={getTilesetById(activeTileset, customTilesets).maxZoom}
+                  styleJson={activeStyleJson ?? undefined}
                 />
               ) : (
                 <TileLayer
@@ -2102,6 +2242,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 <PolarGridOverlay center={ownNodePosition} />
               )}
 
+              <GeoJsonOverlay layers={geoJsonLayers} />
+
               {/* Draw traceroute paths (independent layer) */}
               <TraceroutePathsLayer paths={traceroutePathsElements} enabled={showPaths} />
 
@@ -2148,8 +2290,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 const distKm = calculateDistance(ni.nodeLatitude!, ni.nodeLongitude!, ni.neighborLatitude!, ni.neighborLongitude!);
                 const distStr = formatDistance(distKm, distanceUnit);
 
+                // Normalize timestamp: old data may be in seconds, new data in milliseconds
+                const tsMs = ni.timestamp < 10_000_000_000 ? ni.timestamp * 1000 : ni.timestamp;
                 // Data age (clamped to 0 to handle clock skew)
-                const ageMs = Math.max(0, Date.now() - ni.timestamp);
+                const ageMs = Math.max(0, Date.now() - tsMs);
                 const ageMin = Math.floor(ageMs / 60000);
                 const ageStr = ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin / 60)}h ago`;
 
@@ -2201,7 +2345,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                             </div>
                           )}
                           <div className="route-usage">
-                            {t('direct_links.last_seen', 'Last seen')}: <strong>{formatDateTime(new Date(ni.timestamp), timeFormat, dateFormat)}</strong> ({ageStr})
+                            {t('direct_links.last_seen', 'Last seen')}: <strong>{formatDateTime(new Date(tsMs), timeFormat, dateFormat)}</strong> ({ageStr})
                           </div>
                         </div>
                       </Popup>

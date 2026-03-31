@@ -367,6 +367,7 @@ class MeshtasticManager {
   private isCapturingInitConfig = false;  // Flag to track when we're capturing messages
   private configCaptureComplete = false;  // Flag to track when capture is done
   private onConfigCaptureComplete: (() => void) | null = null;  // Callback for when config capture completes
+  private externalConfigCaptureCallback: (() => void) | null = null;  // External callback (e.g., virtual node server init)
   private channel0Exists = false;  // Cache for channel 0 existence check to avoid repeated DB queries
   private preConfigChannelSnapshot: { id: number; psk?: string | null; name?: string | null }[] = [];  // Channel state before config sync
 
@@ -678,11 +679,13 @@ class MeshtasticManager {
       // finishes sending its config (configComplete event). This prevents
       // flooding the device with outbound requests while it's still streaming
       // config data — the root cause of ECONNRESET on WiFi devices (#2474).
-      const previousCallback = this.onConfigCaptureComplete;
+      // Replace (not chain) the config capture callback on each reconnect.
+      // Chaining would accumulate scheduler starts across reconnects, causing
+      // duplicate cron jobs (e.g., 4 reconnects = 4x auto-welcome messages).
       this.onConfigCaptureComplete = () => {
-        // Call any previously registered callback (e.g., virtual node server init)
-        if (previousCallback) {
-          try { previousCallback(); } catch (e) { logger.error('❌ Error in previous config capture callback:', e); }
+        // Call external callback (e.g., virtual node server init) — registered once, safe to call on every reconnect
+        if (this.externalConfigCaptureCallback) {
+          try { this.externalConfigCaptureCallback(); } catch (e) { logger.error('❌ Error in external config capture callback:', e); }
         }
 
         // If localNodeInfo wasn't set during configuration, initialize it from database
@@ -930,7 +933,7 @@ class MeshtasticManager {
    * This is used to initialize the virtual node server after connection is ready
    */
   public registerConfigCaptureCompleteCallback(callback: () => void): void {
-    this.onConfigCaptureComplete = callback;
+    this.externalConfigCaptureCallback = callback;
   }
 
   private startTracerouteScheduler(): void {
@@ -3759,8 +3762,8 @@ class MeshtasticManager {
       const nodeData: any = {
         nodeNum: fromNum,
         nodeId: nodeId,
-        // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-        lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000, Date.now() / 1000),
+        // Use server time for lastHeard — rxTime from the device clock is unreliable
+        lastHeard: Date.now() / 1000,
         // Update channel from every firmware-decoded packet so outbound messages (DMs,
         // traceroutes, position requests) use the channel the node is actually communicating
         // on. Previously only set from NodeInfo, which could get stuck on a secondary channel.
@@ -3774,10 +3777,10 @@ class MeshtasticManager {
       }
 
       // Only include SNR/RSSI if they have valid values
-      if (meshPacket.rxSnr && meshPacket.rxSnr !== 0) {
+      if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
         nodeData.snr = meshPacket.rxSnr;
       }
-      if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null && meshPacket.rxRssi !== 0) {
         nodeData.rssi = meshPacket.rxRssi;
       }
       await databaseService.nodes.upsertNode(nodeData);
@@ -4276,7 +4279,7 @@ class MeshtasticManager {
           const technicalData: any = {
             nodeNum: fromNum,
             nodeId: nodeId,
-            lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000, Date.now() / 1000),
+            lastHeard: Date.now() / 1000,
           };
           if (meshPacket.rxSnr && meshPacket.rxSnr !== 0) {
             technicalData.snr = meshPacket.rxSnr;
@@ -4293,7 +4296,7 @@ class MeshtasticManager {
             longitude: coords.longitude,
             altitude: position.altitude,
             // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-            lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000, Date.now() / 1000),
+            lastHeard: Date.now() / 1000,
             positionChannel: channelIndex,
             positionPrecisionBits: precisionBits,
             positionGpsAccuracy: gpsAccuracy,
@@ -4384,8 +4387,8 @@ class MeshtasticManager {
         hwModel: user.hwModel,
         role: user.role,
         hopsAway: meshPacket.hopsAway,
-        // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-        lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : timestamp / 1000, Date.now() / 1000),
+        // Use server time for lastHeard — rxTime from the device clock is unreliable
+        lastHeard: Date.now() / 1000,
       };
 
       // Capture public key if present
@@ -4603,14 +4606,14 @@ class MeshtasticManager {
         nodeNum: fromNum,
         nodeId: nodeId,
         // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-        lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000, Date.now() / 1000)
+        lastHeard: Date.now() / 1000
       };
 
       // Only include SNR/RSSI if they have valid values
-      if (meshPacket.rxSnr && meshPacket.rxSnr !== 0) {
+      if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
         nodeData.snr = meshPacket.rxSnr;
       }
-      if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null && meshPacket.rxRssi !== 0) {
         nodeData.rssi = meshPacket.rxRssi;
       }
 
@@ -4823,14 +4826,14 @@ class MeshtasticManager {
         nodeNum: fromNum,
         nodeId: nodeId,
         // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-        lastHeard: Math.min(meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000, Date.now() / 1000)
+        lastHeard: Date.now() / 1000
       };
 
       // Only include SNR/RSSI if they have valid values
-      if (meshPacket.rxSnr && meshPacket.rxSnr !== 0) {
+      if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
         nodeData.snr = meshPacket.rxSnr;
       }
-      if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null && meshPacket.rxRssi !== 0) {
         nodeData.rssi = meshPacket.rxRssi;
       }
 
@@ -5039,7 +5042,7 @@ class MeshtasticManager {
           const node = await databaseService.nodes.getNode(nodeNum);
           const nodeName = nodeNum === BROADCAST_ADDR ? '(unknown)' : (node?.longName || nodeId);
           const rawSnr = snrTowards[index];
-          const snr = rawSnr === undefined ? 'N/A' : (rawSnr === -128 || rawSnr === 0) ? 'MQTT' : `${(rawSnr / 4).toFixed(1)}dB`;
+          const snr = rawSnr === undefined ? 'N/A' : rawSnr === -128 ? 'MQTT' : `${(rawSnr / 4).toFixed(1)}dB`;
           const dist = await calcDistance(fullPath[index], nodeNum);
           if (dist) {
             routeText += `  ${index + 2}. ${nodeName} (${nodeId}) - SNR: ${snr}, Distance: ${dist}\n`;
@@ -5115,7 +5118,7 @@ class MeshtasticManager {
           const node = await databaseService.nodes.getNode(nodeNum);
           const nodeName = nodeNum === BROADCAST_ADDR ? '(unknown)' : (node?.longName || nodeId);
           const rawSnr = snrBack[index];
-          const snr = rawSnr === undefined ? 'N/A' : (rawSnr === -128 || rawSnr === 0) ? 'MQTT' : `${(rawSnr / 4).toFixed(1)}dB`;
+          const snr = rawSnr === undefined ? 'N/A' : rawSnr === -128 ? 'MQTT' : `${(rawSnr / 4).toFixed(1)}dB`;
           const dist = await calcDistanceReturn(fullReturnPath[index], nodeNum);
           if (dist) {
             routeText += `  ${index + 2}. ${nodeName} (${nodeId}) - SNR: ${snr}, Distance: ${dist}\n`;
@@ -6171,7 +6174,7 @@ class MeshtasticManager {
       }
 
       // Save SNR as telemetry if present in NodeInfo
-      if (nodeInfo.snr !== undefined && nodeInfo.snr !== null && nodeInfo.snr !== 0) {
+      if (nodeInfo.snr != null && nodeInfo.snr !== -128) {
         const timestamp = nodeInfo.lastHeard ? Number(nodeInfo.lastHeard) * 1000 : Date.now();
         const now = Date.now();
 
@@ -11040,7 +11043,7 @@ class MeshtasticManager {
           details.push(`New channels on slots: ${newChannels.join(', ')} (default: no user permissions)`);
         }
         await databaseService.auditLogAsync(
-          0, // system user
+          null, // system operation — no user context at startup
           'channel_migration_on_startup',
           'channels',
           details.join('. '),

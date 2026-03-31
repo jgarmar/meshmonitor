@@ -26,6 +26,8 @@ import TapbackEmojiSettings from './TapbackEmojiSettings';
 import EmbedSettings from './settings/EmbedSettings';
 import { DefaultMapCenterPicker } from './configuration/DefaultMapCenterPicker';
 import { useAuth } from '../contexts/AuthContext';
+import GeoJsonLayerManager from './GeoJsonLayerManager';
+import MapStyleManager from './MapStyleManager';
 
 type DistanceUnit = 'km' | 'mi';
 type PositionHistoryLineStyle = 'linear' | 'spline';
@@ -1193,6 +1195,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               style={{ width: '100px' }}
             />
           </div>
+          <GeoJsonLayerManager />
+          <MapStyleManager />
           {isAdmin && (
             <div className="setting-item">
               <label>
