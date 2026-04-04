@@ -116,6 +116,164 @@ export async function filterNodesByChannelPermission<T>(
 }
 
 /**
+ * Mask location fields on nodes where the user lacks access to the positionChannel.
+ *
+ * A node's GPS position may arrive on a different (private) channel than the channel
+ * the node is generally heard on. This function strips latitude/longitude and related
+ * position fields for any node whose positionChannel is inaccessible to the user,
+ * preventing private-channel location data from leaking via the nodes API.
+ *
+ * Nodes with no positionChannel recorded are left unchanged (no position to protect).
+ * Admins always see full data.
+ *
+ * @param nodes - Array of nodes (any type that may have location/positionChannel fields)
+ * @param user  - The user making the request, or null/undefined for anonymous
+ * @returns Array with location fields stripped where positionChannel is inaccessible
+ */
+export async function maskNodeLocationByChannel<T>(
+  nodes: T[],
+  user: User | null | undefined
+): Promise<T[]> {
+  if (user?.isAdmin) return nodes;
+
+  // Get user's device channel permission set
+  const permissions: PermissionSet = user
+    ? await databaseService.getUserPermissionSetAsync(user.id)
+    : {};
+
+  // Get user's virtual channel (channel database) permissions
+  const channelDbPermissions = user
+    ? await databaseService.getChannelDatabasePermissionsForUserAsSetAsync(user.id)
+    : {};
+
+  return nodes.map(node => {
+    const nodeWithPos = node as { positionChannel?: number };
+    const posChannel = nodeWithPos.positionChannel;
+
+    // No positionChannel recorded — nothing to mask
+    if (posChannel === undefined || posChannel === null) {
+      return node;
+    }
+
+    // Check if the user can see data from this position channel
+    let hasPositionChannelAccess: boolean;
+    if (posChannel < CHANNEL_DB_OFFSET) {
+      const channelResource = `channel_${posChannel}` as ResourceType;
+      hasPositionChannelAccess = permissions[channelResource]?.viewOnMap === true;
+    } else {
+      const channelDbId = posChannel - CHANNEL_DB_OFFSET;
+      hasPositionChannelAccess = channelDbPermissions[channelDbId]?.viewOnMap === true;
+    }
+
+    if (hasPositionChannelAccess) {
+      return node;
+    }
+
+    // Strip location fields — user cannot access the channel this position came from
+    const masked = { ...node } as Record<string, unknown>;
+    delete masked.latitude;
+    delete masked.longitude;
+    delete masked.altitude;
+    delete masked.positionChannel;
+    delete masked.positionTimestamp;
+    delete masked.positionPrecisionBits;
+    delete masked.positionGpsAccuracy;
+    delete masked.positionHdop;
+    return masked as T;
+  });
+}
+
+/**
+ * Filter telemetry records where the user lacks access to the source channel.
+ *
+ * Each telemetry record carries an optional `channel` field indicating which mesh
+ * channel the packet was received on. Records from a private (inaccessible) channel
+ * are removed entirely — the individual values would leak channel-private sensor data.
+ *
+ * Records with no channel recorded are left unchanged (channel unknown / pre-migration).
+ * Admins always see all records.
+ *
+ * @param records - Array of telemetry records (any type with an optional channel field)
+ * @param user    - The user making the request, or null/undefined for anonymous
+ * @returns Array with records from inaccessible channels removed
+ */
+export async function maskTelemetryByChannel<T>(
+  records: T[],
+  user: User | null | undefined
+): Promise<T[]> {
+  if (user?.isAdmin) return records;
+
+  const permissions: PermissionSet = user
+    ? await databaseService.getUserPermissionSetAsync(user.id)
+    : {};
+
+  const channelDbPermissions = user
+    ? await databaseService.getChannelDatabasePermissionsForUserAsSetAsync(user.id)
+    : {};
+
+  return records.filter(record => {
+    const r = record as { channel?: number | null };
+    const ch = r.channel;
+
+    // No channel recorded — no channel restriction
+    if (ch === undefined || ch === null) return true;
+
+    if (ch < CHANNEL_DB_OFFSET) {
+      const channelResource = `channel_${ch}` as ResourceType;
+      return permissions[channelResource]?.viewOnMap === true;
+    }
+
+    const channelDbId = ch - CHANNEL_DB_OFFSET;
+    return channelDbPermissions[channelDbId]?.viewOnMap === true;
+  });
+}
+
+/**
+ * Filter traceroute records where the user lacks access to the source channel.
+ *
+ * Traceroutes carry a `channel` field set when the response packet was received on
+ * a specific mesh channel. Traceroutes from a private (inaccessible) channel are
+ * removed so the route topology doesn't leak private-channel network data.
+ *
+ * Records with no channel recorded (null/pre-migration) are left unchanged.
+ * Admins always see all records.
+ *
+ * @param records - Array of traceroute records (any type with an optional channel field)
+ * @param user    - The user making the request, or null/undefined for anonymous
+ * @returns Array with records from inaccessible channels removed
+ */
+export async function maskTraceroutesByChannel<T>(
+  records: T[],
+  user: User | null | undefined
+): Promise<T[]> {
+  if (user?.isAdmin) return records;
+
+  const permissions: PermissionSet = user
+    ? await databaseService.getUserPermissionSetAsync(user.id)
+    : {};
+
+  const channelDbPermissions = user
+    ? await databaseService.getChannelDatabasePermissionsForUserAsSetAsync(user.id)
+    : {};
+
+  return records.filter(record => {
+    const r = record as { channel?: number | null };
+    const ch = r.channel;
+
+    // No channel recorded — no channel restriction
+    if (ch === undefined || ch === null) return true;
+
+    if (ch < CHANNEL_DB_OFFSET) {
+      const channelResource = `channel_${ch}` as ResourceType;
+      return permissions[channelResource]?.viewOnMap === true;
+    }
+
+    const channelDbId = ch - CHANNEL_DB_OFFSET;
+    return channelDbPermissions[channelDbId]?.viewOnMap === true;
+  });
+}
+
+/**
  * Check if a user has viewOnMap permission for the channel that a specific node belongs to.
  * Used to enforce per-node channel-based access control on telemetry/position endpoints.
  */

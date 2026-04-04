@@ -5004,6 +5004,13 @@ class DatabaseService {
     const filterHwModelsEnabled = this.isTracerouteFilterHwModelsEnabled();
     const filterRegexEnabled = this.isTracerouteFilterRegexEnabled();
 
+    // Last heard and hop range filters (AND logic, applied before OR union filters)
+    const filterLastHeardEnabled = this.isTracerouteFilterLastHeardEnabled();
+    const filterLastHeardHours = this.getTracerouteFilterLastHeardHours();
+    const filterHopsEnabled = this.isTracerouteFilterHopsEnabled();
+    const filterHopsMin = this.getTracerouteFilterHopsMin();
+    const filterHopsMax = this.getTracerouteFilterHopsMax();
+
     // Get all nodes that are eligible for traceroute based on their status
     // Only consider nodes that have been heard within maxNodeAgeHours (active nodes)
     // Two categories:
@@ -5043,6 +5050,24 @@ class DatabaseService {
       localNodeNum,
       now - EXPIRATION_MS
     ) as DbNode[];
+
+    // Apply last-heard filter (AND logic — applied before OR union filters)
+    if (filterLastHeardEnabled) {
+      const lastHeardCutoff = Math.floor(Date.now() / 1000) - (filterLastHeardHours * 3600);
+      eligibleNodes = eligibleNodes.filter(node => {
+        // Exclude nodes with no lastHeard or lastHeard older than cutoff
+        return node.lastHeard != null && node.lastHeard >= lastHeardCutoff;
+      });
+    }
+
+    // Apply hop range filter (AND logic)
+    if (filterHopsEnabled) {
+      eligibleNodes = eligibleNodes.filter(node => {
+        // Treat NULL hopsAway as 1 (direct neighbor)
+        const hops = node.hopsAway ?? 1;
+        return hops >= filterHopsMin && hops <= filterHopsMax;
+      });
+    }
 
     // Apply filters using UNION logic (node is eligible if it matches ANY enabled filter)
     // If filterEnabled is true but no individual filters are enabled, all nodes pass
@@ -5163,6 +5188,31 @@ class DatabaseService {
         now - THREE_HOURS_MS,
         now - EXPIRATION_MS
       );
+
+      // Last heard and hop range filters (AND logic, applied before OR union filters)
+      const filterLastHeardEnabled = this.isTracerouteFilterLastHeardEnabled();
+      const filterLastHeardHours = this.getTracerouteFilterLastHeardHours();
+      const filterHopsEnabled = this.isTracerouteFilterHopsEnabled();
+      const filterHopsMin = this.getTracerouteFilterHopsMin();
+      const filterHopsMax = this.getTracerouteFilterHopsMax();
+
+      // Apply last-heard filter (AND logic — applied before OR union filters)
+      if (filterLastHeardEnabled) {
+        const lastHeardCutoff = Math.floor(Date.now() / 1000) - (filterLastHeardHours * 3600);
+        eligibleNodes = eligibleNodes.filter(node => {
+          // Exclude nodes with no lastHeard or lastHeard older than cutoff
+          return node.lastHeard != null && node.lastHeard >= lastHeardCutoff;
+        });
+      }
+
+      // Apply hop range filter (AND logic)
+      if (filterHopsEnabled) {
+        eligibleNodes = eligibleNodes.filter(node => {
+          // Treat NULL hopsAway as 1 (direct neighbor)
+          const hops = node.hopsAway ?? 1;
+          return hops >= filterHopsMin && hops <= filterHopsMax;
+        });
+      }
 
       // Check if node filter is enabled
       const filterEnabled = this.isAutoTracerouteNodeFilterEnabled();
@@ -5605,6 +5655,66 @@ class DatabaseService {
     logger.debug(`✅ Set traceroute filter regex enabled: ${enabled}`);
   }
 
+  // Last Heard filter
+  isTracerouteFilterLastHeardEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterLastHeardEnabled');
+    // Default to true — skip stale nodes by default
+    return value !== 'false';
+  }
+
+  setTracerouteFilterLastHeardEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterLastHeardEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter last heard enabled: ${enabled}`);
+  }
+
+  getTracerouteFilterLastHeardHours(): number {
+    const value = this.getSetting('tracerouteFilterLastHeardHours');
+    if (!value) return 168; // Default: 7 days
+    const parsed = parseInt(value, 10);
+    return isNaN(parsed) ? 168 : parsed;
+  }
+
+  setTracerouteFilterLastHeardHours(hours: number): void {
+    this.setSetting('tracerouteFilterLastHeardHours', hours.toString());
+    logger.debug(`✅ Set traceroute filter last heard hours: ${hours}`);
+  }
+
+  // Hop range filter
+  isTracerouteFilterHopsEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterHopsEnabled');
+    // Default to false — disabled by default
+    return value === 'true';
+  }
+
+  setTracerouteFilterHopsEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterHopsEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter hops enabled: ${enabled}`);
+  }
+
+  getTracerouteFilterHopsMin(): number {
+    const value = this.getSetting('tracerouteFilterHopsMin');
+    if (!value) return 0;
+    const parsed = parseInt(value, 10);
+    return isNaN(parsed) ? 0 : parsed;
+  }
+
+  setTracerouteFilterHopsMin(min: number): void {
+    this.setSetting('tracerouteFilterHopsMin', min.toString());
+    logger.debug(`✅ Set traceroute filter hops min: ${min}`);
+  }
+
+  getTracerouteFilterHopsMax(): number {
+    const value = this.getSetting('tracerouteFilterHopsMax');
+    if (!value) return 10;
+    const parsed = parseInt(value, 10);
+    return isNaN(parsed) ? 10 : parsed;
+  }
+
+  setTracerouteFilterHopsMax(max: number): void {
+    this.setSetting('tracerouteFilterHopsMax', max.toString());
+    logger.debug(`✅ Set traceroute filter hops max: ${max}`);
+  }
+
   // Get the traceroute expiration hours (how long to wait before re-tracerouting a node)
   getTracerouteExpirationHours(): number {
     const value = this.getSetting('tracerouteExpirationHours');
@@ -5655,6 +5765,11 @@ class DatabaseService {
     filterRegexEnabled: boolean;
     expirationHours: number;
     sortByHops: boolean;
+    filterLastHeardEnabled: boolean;
+    filterLastHeardHours: number;
+    filterHopsEnabled: boolean;
+    filterHopsMin: number;
+    filterHopsMax: number;
   } {
     return {
       enabled: this.isAutoTracerouteNodeFilterEnabled(),
@@ -5670,6 +5785,11 @@ class DatabaseService {
       filterRegexEnabled: this.isTracerouteFilterRegexEnabled(),
       expirationHours: this.getTracerouteExpirationHours(),
       sortByHops: this.isTracerouteSortByHopsEnabled(),
+      filterLastHeardEnabled: this.isTracerouteFilterLastHeardEnabled(),
+      filterLastHeardHours: this.getTracerouteFilterLastHeardHours(),
+      filterHopsEnabled: this.isTracerouteFilterHopsEnabled(),
+      filterHopsMin: this.getTracerouteFilterHopsMin(),
+      filterHopsMax: this.getTracerouteFilterHopsMax(),
     };
   }
 
@@ -5688,6 +5808,11 @@ class DatabaseService {
     filterRegexEnabled?: boolean;
     expirationHours?: number;
     sortByHops?: boolean;
+    filterLastHeardEnabled?: boolean;
+    filterLastHeardHours?: number;
+    filterHopsEnabled?: boolean;
+    filterHopsMin?: number;
+    filterHopsMax?: number;
   }): void {
     this.setAutoTracerouteNodeFilterEnabled(settings.enabled);
     this.setAutoTracerouteNodes(settings.nodeNums);
@@ -5717,6 +5842,21 @@ class DatabaseService {
     if (settings.sortByHops !== undefined) {
       this.setTracerouteSortByHopsEnabled(settings.sortByHops);
     }
+    if (settings.filterLastHeardEnabled !== undefined) {
+      this.setTracerouteFilterLastHeardEnabled(settings.filterLastHeardEnabled);
+    }
+    if (settings.filterLastHeardHours !== undefined) {
+      this.setTracerouteFilterLastHeardHours(settings.filterLastHeardHours);
+    }
+    if (settings.filterHopsEnabled !== undefined) {
+      this.setTracerouteFilterHopsEnabled(settings.filterHopsEnabled);
+    }
+    if (settings.filterHopsMin !== undefined) {
+      this.setTracerouteFilterHopsMin(settings.filterHopsMin);
+    }
+    if (settings.filterHopsMax !== undefined) {
+      this.setTracerouteFilterHopsMax(settings.filterHopsMax);
+    }
     logger.debug('✅ Updated all traceroute filter settings');
   }
 
@@ -5735,6 +5875,11 @@ class DatabaseService {
     filterRegexEnabled: boolean;
     expirationHours: number;
     sortByHops: boolean;
+    filterLastHeardEnabled: boolean;
+    filterLastHeardHours: number;
+    filterHopsEnabled: boolean;
+    filterHopsMin: number;
+    filterHopsMax: number;
   }> {
     const nodeNums = await this.misc.getAutoTracerouteNodes();
     return {
@@ -5751,6 +5896,11 @@ class DatabaseService {
       filterRegexEnabled: this.isTracerouteFilterRegexEnabled(),
       expirationHours: this.getTracerouteExpirationHours(),
       sortByHops: this.isTracerouteSortByHopsEnabled(),
+      filterLastHeardEnabled: this.isTracerouteFilterLastHeardEnabled(),
+      filterLastHeardHours: this.getTracerouteFilterLastHeardHours(),
+      filterHopsEnabled: this.isTracerouteFilterHopsEnabled(),
+      filterHopsMin: this.getTracerouteFilterHopsMin(),
+      filterHopsMax: this.getTracerouteFilterHopsMax(),
     };
   }
 
@@ -5768,6 +5918,11 @@ class DatabaseService {
     filterRegexEnabled?: boolean;
     expirationHours?: number;
     sortByHops?: boolean;
+    filterLastHeardEnabled?: boolean;
+    filterLastHeardHours?: number;
+    filterHopsEnabled?: boolean;
+    filterHopsMin?: number;
+    filterHopsMax?: number;
   }): Promise<void> {
     this.setAutoTracerouteNodeFilterEnabled(settings.enabled);
     await this.misc.setAutoTracerouteNodes(settings.nodeNums);
@@ -5795,6 +5950,21 @@ class DatabaseService {
     }
     if (settings.sortByHops !== undefined) {
       this.setTracerouteSortByHopsEnabled(settings.sortByHops);
+    }
+    if (settings.filterLastHeardEnabled !== undefined) {
+      this.setTracerouteFilterLastHeardEnabled(settings.filterLastHeardEnabled);
+    }
+    if (settings.filterLastHeardHours !== undefined) {
+      this.setTracerouteFilterLastHeardHours(settings.filterLastHeardHours);
+    }
+    if (settings.filterHopsEnabled !== undefined) {
+      this.setTracerouteFilterHopsEnabled(settings.filterHopsEnabled);
+    }
+    if (settings.filterHopsMin !== undefined) {
+      this.setTracerouteFilterHopsMin(settings.filterHopsMin);
+    }
+    if (settings.filterHopsMax !== undefined) {
+      this.setTracerouteFilterHopsMax(settings.filterHopsMax);
     }
     logger.debug('✅ Updated all traceroute filter settings');
   }
@@ -9567,6 +9737,17 @@ class DatabaseService {
   }
 
   /**
+   * Find user by email (async).
+   * Note: Email is NOT unique in the schema. Returns first match if multiple users share email.
+   * Works with all database backends (SQLite, PostgreSQL, MySQL).
+   */
+  async findUserByEmailAsync(email: string): Promise<any | null> {
+    const dbUser = await this.auth.getUserByEmail(email);
+    if (!dbUser) return null;
+    return this.mapDbUserToUser(dbUser);
+  }
+
+  /**
    * Async method to authenticate a user with username and password.
    * Works with all database backends (SQLite, PostgreSQL, MySQL).
    * Returns the user if authentication succeeds, null otherwise.
@@ -10005,55 +10186,14 @@ class DatabaseService {
   }
 
   /**
-   * Get user's map preferences - works with all database backends
+   * Get user's map preferences - delegates to MiscRepository (Drizzle ORM)
    */
   async getMapPreferencesAsync(userId: number): Promise<Record<string, any> | null> {
-    if (this.drizzleDbType === 'sqlite') {
-      return this.userModel.getMapPreferences(userId);
-    }
-
-    try {
-      const columns = `map_tileset, show_paths, show_neighbor_info, show_route, show_motion,
-        show_mqtt_nodes, show_meshcore_nodes, show_animations, show_accuracy_regions,
-        show_estimated_positions, position_history_hours`;
-
-      let row: any = null;
-
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const result = await this.postgresPool.query(
-          `SELECT ${columns} FROM user_map_preferences WHERE "userId" = $1`, [userId]
-        );
-        row = result.rows[0] || null;
-      } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const [rows] = await this.mysqlPool.query(
-          `SELECT ${columns} FROM user_map_preferences WHERE userId = ?`, [userId]
-        );
-        row = (rows as any[])[0] || null;
-      }
-
-      if (!row) return null;
-
-      return {
-        mapTileset: row.map_tileset || null,
-        showPaths: Boolean(row.show_paths),
-        showNeighborInfo: Boolean(row.show_neighbor_info),
-        showRoute: Boolean(row.show_route),
-        showMotion: Boolean(row.show_motion),
-        showMqttNodes: Boolean(row.show_mqtt_nodes),
-        showMeshCoreNodes: Boolean(row.show_meshcore_nodes),
-        showAnimations: Boolean(row.show_animations),
-        showAccuracyRegions: Boolean(row.show_accuracy_regions),
-        showEstimatedPositions: Boolean(row.show_estimated_positions),
-        positionHistoryHours: row.position_history_hours ?? null,
-      };
-    } catch (error) {
-      logger.error(`[DatabaseService] Failed to get map preferences async: ${error}`);
-      return null;
-    }
+    return this.miscRepo!.getMapPreferences(userId);
   }
 
   /**
-   * Save user's map preferences - works with all database backends
+   * Save user's map preferences - delegates to MiscRepository (Drizzle ORM)
    */
   async saveMapPreferencesAsync(userId: number, preferences: {
     mapTileset?: string;
@@ -10068,124 +10208,7 @@ class DatabaseService {
     showEstimatedPositions?: boolean;
     positionHistoryHours?: number | null;
   }): Promise<void> {
-    if (this.drizzleDbType === 'sqlite') {
-      this.userModel.saveMapPreferences(userId, preferences);
-      return;
-    }
-
-    const now = Date.now();
-
-    try {
-      // Check if row exists
-      let exists = false;
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const result = await this.postgresPool.query(
-          'SELECT "userId" FROM user_map_preferences WHERE "userId" = $1', [userId]
-        );
-        exists = (result.rows.length > 0);
-      } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const [rows] = await this.mysqlPool.query(
-          'SELECT userId FROM user_map_preferences WHERE userId = ?', [userId]
-        );
-        exists = ((rows as any[]).length > 0);
-      }
-
-      if (exists) {
-        // Build dynamic UPDATE
-        const updates: string[] = [];
-        const params: any[] = [];
-        let paramIdx = 1; // For Postgres $N placeholders
-
-        const fieldMap: Record<string, string> = {
-          mapTileset: 'map_tileset',
-          showPaths: 'show_paths',
-          showNeighborInfo: 'show_neighbor_info',
-          showRoute: 'show_route',
-          showMotion: 'show_motion',
-          showMqttNodes: 'show_mqtt_nodes',
-          showMeshCoreNodes: 'show_meshcore_nodes',
-          showAnimations: 'show_animations',
-          showAccuracyRegions: 'show_accuracy_regions',
-          showEstimatedPositions: 'show_estimated_positions',
-          positionHistoryHours: 'position_history_hours',
-        };
-
-        for (const [key, col] of Object.entries(fieldMap)) {
-          const value = (preferences as any)[key];
-          if (value !== undefined) {
-            if (this.drizzleDbType === 'postgres') {
-              updates.push(`${col} = $${paramIdx++}`);
-            } else {
-              updates.push(`${col} = ?`);
-            }
-            // Convert booleans for storage
-            if (typeof value === 'boolean') {
-              params.push(value);
-            } else {
-              params.push(value);
-            }
-          }
-        }
-
-        if (updates.length > 0) {
-          if (this.drizzleDbType === 'postgres') {
-            updates.push(`"updatedAt" = $${paramIdx++}`);
-            params.push(now);
-            const sql = `UPDATE user_map_preferences SET ${updates.join(', ')} WHERE "userId" = $${paramIdx}`;
-            params.push(userId);
-            await this.postgresPool!.query(sql, params);
-          } else if (this.drizzleDbType === 'mysql') {
-            updates.push('updatedAt = ?');
-            params.push(now);
-            const sql = `UPDATE user_map_preferences SET ${updates.join(', ')} WHERE userId = ?`;
-            params.push(userId);
-            await this.mysqlPool!.query(sql, params);
-          }
-        }
-      } else {
-        // INSERT new row
-        const boolVal = (v: boolean | undefined, def: boolean) => v !== undefined ? v : def;
-
-        if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-          await this.postgresPool.query(
-            `INSERT INTO user_map_preferences (
-              "userId", map_tileset, show_paths, show_neighbor_info, show_route, show_motion,
-              show_mqtt_nodes, show_meshcore_nodes, show_animations, show_accuracy_regions,
-              show_estimated_positions, position_history_hours, created_at, "updatedAt"
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-            [
-              userId, preferences.mapTileset || null,
-              boolVal(preferences.showPaths, false), boolVal(preferences.showNeighborInfo, false),
-              boolVal(preferences.showRoute, true), boolVal(preferences.showMotion, true),
-              boolVal(preferences.showMqttNodes, true), boolVal(preferences.showMeshCoreNodes, true),
-              boolVal(preferences.showAnimations, true), boolVal(preferences.showAccuracyRegions, false),
-              boolVal(preferences.showEstimatedPositions, true), preferences.positionHistoryHours ?? null,
-              now, now,
-            ]
-          );
-        } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-          await this.mysqlPool.query(
-            `INSERT INTO user_map_preferences (
-              userId, map_tileset, show_paths, show_neighbor_info, show_route, show_motion,
-              show_mqtt_nodes, show_meshcore_nodes, show_animations, show_accuracy_regions,
-              show_estimated_positions, position_history_hours, created_at, updatedAt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              userId, preferences.mapTileset || null,
-              boolVal(preferences.showPaths, false), boolVal(preferences.showNeighborInfo, false),
-              boolVal(preferences.showRoute, true), boolVal(preferences.showMotion, true),
-              boolVal(preferences.showMqttNodes, true), boolVal(preferences.showMeshCoreNodes, true),
-              boolVal(preferences.showAnimations, true), boolVal(preferences.showAccuracyRegions, false),
-              boolVal(preferences.showEstimatedPositions, true), preferences.positionHistoryHours ?? null,
-              now, now,
-            ]
-          );
-        }
-      }
-    } catch (error) {
-      logger.error(`[DatabaseService] Failed to save map preferences async: ${error}`);
-      throw error;
-    }
+    return this.miscRepo!.saveMapPreferences(userId, preferences);
   }
   // ============================================================
   // Async wrappers for sync methods (Phase 4 migration)

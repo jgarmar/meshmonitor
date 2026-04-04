@@ -10,7 +10,7 @@ export default defineConfig({
     }
   },
   title: "MeshMonitor",
-  description: "Web application for monitoring Meshtastic nodes over IP",
+  description: "Self-hosted web dashboard for Meshtastic networks. Real-time maps, messaging, telemetry, automation, and alerts. Runs on Docker, desktop, or Kubernetes.",
   base: '/',  // Custom domain: meshmonitor.org
 
   themeConfig: {
@@ -41,6 +41,7 @@ export default defineConfig({
           items: [
             { text: 'Settings', link: '/features/settings' },
             { text: 'Automation', link: '/features/automation' },
+            { text: 'Auto Heap Management', link: '/features/auto-heap-management' },
             { text: 'Device Configuration', link: '/features/device' },
             { text: 'Admin Commands', link: '/features/admin-commands' },
             { text: 'Push Notifications', link: '/features/notifications' },

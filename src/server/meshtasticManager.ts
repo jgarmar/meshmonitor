@@ -229,11 +229,12 @@ type TextMessage = {
 interface AutoResponderTrigger {
   trigger: string | string[];
   response: string;
-  responseType?: 'text' | 'http' | 'script';
+  responseType?: 'text' | 'http' | 'script' | 'traceroute';
   channel?: number | 'dm' | 'none';
   verifyResponse?: boolean;
   multiline?: boolean;
   scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
+  cooldownSeconds?: number; // Per-node cooldown in seconds (0 = disabled, default)
 }
 
 /**
@@ -299,6 +300,13 @@ class MeshtasticManager {
   private geofenceWhileInsideTimers: Map<string, NodeJS.Timeout> = new Map(); // geofenceId -> interval timer
   private geofenceCooldowns: Map<string, number> = new Map(); // "triggerId:nodeNum" -> firedAt timestamp
   private pendingAutoTraceroutes: Set<number> = new Set(); // Track auto-traceroute targets for logging
+  private pendingAutoresponderTraceroutes: Map<number, {
+    replyToNodeNum: number;
+    isDM: boolean;
+    replyChannel: number;
+    packetId?: number;
+    timeoutHandle: NodeJS.Timeout;
+  }> = new Map(); // Track user-initiated traceroutes from the autoresponder
   private pendingTracerouteTimestamps: Map<number, number> = new Map(); // Track when traceroutes were initiated for timeout detection
   private nodeLinkQuality: Map<number, { quality: number; lastHops: number }> = new Map(); // Track link quality per node
   private remoteAdminScannerInterval: NodeJS.Timeout | null = null;
@@ -352,6 +360,9 @@ class MeshtasticManager {
   private favoritesSupportCache: boolean | null = null;  // Cache firmware support check result
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
 
+  private autoAckCooldowns: Map<number, number> = new Map(); // nodeNum -> lastResponseTimestamp
+  private autoResponderCooldowns: Map<string, number> = new Map(); // "triggerIndex:nodeNum" -> lastResponseTimestamp
+
   // Auto-ping session tracking
   private autoPingSessions: Map<number, AutoPingSession> = new Map(); // keyed by requester nodeNum
 
@@ -361,6 +372,7 @@ class MeshtasticManager {
   private deviceNodeNums: Set<number> = new Set();  // Nodes in the connected radio's local database
   private autoFavoriteSweepRunning = false;  // Prevent concurrent sweep operations
   private rebootMergeInProgress = false;  // Guard against broadcasts during node identity merge
+  private lastHeapPurgeAt: number | null = null;  // Timestamp of last auto heap purge
 
   // Virtual Node Server - Message capture for initialization sequence
   private initConfigCache: Array<{ type: string; data: Uint8Array }> = [];  // Store raw FromRadio messages with type metadata during init
@@ -3599,8 +3611,12 @@ class MeshtasticManager {
         const fromNodeId = fromNum ? `!${fromNum.toString(16).padStart(8, '0')}` : null;
         const toNodeId = toNum ? `!${toNum.toString(16).padStart(8, '0')}` : null;
 
-        // Check if packet is encrypted (no decoded field or empty payload)
-        const isEncrypted = !meshPacket.decoded || !meshPacket.decoded.payload;
+        // Check if packet is encrypted — a packet is encrypted when neither the node nor the
+        // server successfully decoded it. Using `decryptedBy` (set above) is more reliable than
+        // checking `decoded.payload` because server-side decryption can succeed while returning
+        // an undefined payload (e.g. a packet whose inner Data.payload bytes are absent), and
+        // we don't want to re-label those as encrypted after a successful decrypt.
+        const isEncrypted = decryptedBy === null;
         const portnum = meshPacket.decoded?.portnum ?? 0;
         const portnumName = meshtasticProtobufService.getPortNumName(portnum);
 
@@ -4780,6 +4796,7 @@ class MeshtasticManager {
           { type: 'heapFreeBytes', value: localStats.heapFreeBytes, unit: 'bytes' },
           { type: 'numTxDropped', value: localStats.numTxDropped, unit: 'packets' }
         ], nodeId, fromNum, timestamp, packetTimestamp, packetId);
+        await this.checkAutoHeapManagement(localStats.heapFreeBytes, fromNum);
       } else if (telemetry.hostMetrics) {
         const hostMetrics = telemetry.hostMetrics;
         logger.debug(`🖥️ HostMetrics telemetry: uptime=${hostMetrics.uptimeSeconds}s, freemem=${hostMetrics.freememBytes}B`);
@@ -5231,6 +5248,7 @@ class MeshtasticManager {
         snrTowards: JSON.stringify(snrTowards),
         snrBack: JSON.stringify(snrBack),
         routePositions: JSON.stringify(routePositions),
+        channel: channelIndex >= 0 ? channelIndex : null,
         timestamp: timestamp,
         createdAt: Date.now()
       };
@@ -5264,6 +5282,39 @@ class MeshtasticManager {
         this.pendingAutoTraceroutes.delete(fromNum);
         this.pendingTracerouteTimestamps.delete(fromNum); // Clear timeout tracking
         logger.debug(`🗺️ Auto-traceroute to ${fromNodeId} marked as successful`);
+      }
+
+      // If this was an autoresponder-initiated traceroute, send a compact reply
+      if (this.pendingAutoresponderTraceroutes.has(fromNum)) {
+        const pending = this.pendingAutoresponderTraceroutes.get(fromNum)!;
+        clearTimeout(pending.timeoutHandle);
+        this.pendingAutoresponderTraceroutes.delete(fromNum);
+
+        // Build compact route string using short names (must fit within 200 bytes)
+        const fromNode = await databaseService.nodes.getNode(fromNum);
+        const fromShort = fromNode?.shortName || fromNodeId.slice(-4);
+        const localShort = this.localNodeInfo?.shortName || 'ME';
+
+        let compactPath = localShort;
+        for (const hopNum of route) {
+          const hopNode = await databaseService.nodes.getNode(hopNum);
+          compactPath += '>' + (hopNode?.shortName || `!${hopNum.toString(16).slice(-4)}`);
+        }
+        compactPath += '>' + fromShort;
+
+        const hopCount = route.length + 1;
+        const compactMsg = `Trace to ${fromShort}: ${compactPath} (${hopCount} hop${hopCount !== 1 ? 's' : ''})`;
+
+        messageQueueService.enqueue(
+          this.truncateMessageForMeshtastic(compactMsg, 200),
+          pending.isDM ? pending.replyToNodeNum : 0,
+          undefined,
+          () => { logger.info(`✅ Autoresponder traceroute result reply delivered`); },
+          (reason: string) => { logger.warn(`❌ Autoresponder traceroute result reply failed: ${reason}`); },
+          pending.isDM ? undefined : pending.replyChannel,
+          1
+        );
+        logger.info(`🔍 Autoresponder traceroute result for ${fromNodeId} replied to !${pending.replyToNodeNum.toString(16).padStart(8, '0')}`);
       }
 
       // Send notification for successful traceroute
@@ -7070,6 +7121,17 @@ class MeshtasticManager {
         }
       }
 
+      // Per-node cooldown rate limiting
+      const cooldownSetting = await databaseService.settings.getSetting('autoAckCooldownSeconds');
+      const cooldownSeconds = cooldownSetting ? parseInt(cooldownSetting, 10) : 60;
+      if (cooldownSeconds > 0) {
+        const lastResponse = this.autoAckCooldowns.get(fromNum);
+        if (lastResponse && Date.now() - lastResponse < cooldownSeconds * 1000) {
+          logger.debug(`⏭️  Skipping auto-acknowledge for node ${fromNum}: cooldown active (${cooldownSeconds}s)`);
+          return;
+        }
+      }
+
       // Use default regex if not set
       const regexPattern = autoAckRegex || '^(test|ping)';
 
@@ -7214,6 +7276,9 @@ class MeshtasticManager {
           (alwaysUseDM || isDirectMessage) ? undefined : channelIndex // channel: undefined for DM, channel number for channel
         );
       }
+
+      // Record cooldown timestamp after successful response
+      this.autoAckCooldowns.set(fromNum, Date.now());
     } catch (error) {
       logger.error('❌ Error in auto-acknowledge:', error);
     }
@@ -7679,7 +7744,8 @@ class MeshtasticManager {
       logger.info(`🤖 Auto-responder checking message on ${isDirectMessage ? 'DM' : `channel ${message.channel}`}: "${message.text}"`);
 
       // Try to match message against triggers
-      for (const trigger of triggers) {
+      for (let triggerIdx = 0; triggerIdx < triggers.length; triggerIdx++) {
+        const trigger = triggers[triggerIdx];
         // Normalize trigger channels (handles legacy single channel and new multi-channel array format)
         const triggerChannels = normalizeTriggerChannels(trigger);
 
@@ -7839,6 +7905,17 @@ class MeshtasticManager {
         }
 
         if (matchedPattern) {
+          // Per-node cooldown rate limiting
+          const cooldownSeconds = trigger.cooldownSeconds || 0;
+          if (cooldownSeconds > 0) {
+            const cooldownKey = `${triggerIdx}:${message.fromNodeNum}`;
+            const lastResponse = this.autoResponderCooldowns.get(cooldownKey);
+            if (lastResponse && Date.now() - lastResponse < cooldownSeconds * 1000) {
+              logger.debug(`⏭️  Skipping auto-responder trigger ${triggerIdx} for node ${message.fromNodeNum}: cooldown active (${cooldownSeconds}s)`);
+              continue; // Try next trigger
+            }
+          }
+
           logger.debug(`🤖 Auto-responder triggered by: "${message.text}" matching pattern: "${matchedPattern}" (from trigger: "${trigger.trigger}")`);
 
           let responseText: string;
@@ -8032,6 +8109,13 @@ class MeshtasticManager {
               if (scriptTriggerChannels.includes('none')) {
                 const scriptDuration = Date.now() - scriptStartTime;
                 logger.info(`🔧 Auto-responder script for "${triggerPattern}" completed in ${scriptDuration}ms (channel=none, no mesh output)`);
+
+                // Record cooldown timestamp
+                const triggerCooldownNone = trigger.cooldownSeconds || 0;
+                if (triggerCooldownNone > 0) {
+                  this.autoResponderCooldowns.set(`${triggerIdx}:${message.fromNodeNum}`, Date.now());
+                }
+
                 return;
               }
 
@@ -8064,6 +8148,13 @@ class MeshtasticManager {
               // Script responses queued
               const scriptDuration = Date.now() - scriptStartTime;
               logger.info(`🔧 Auto-responder script for "${triggerPattern}" completed in ${scriptDuration}ms, ${scriptResponses.length} response(s) queued to ${target}`);
+
+              // Record cooldown timestamp
+              const triggerCooldownScript = trigger.cooldownSeconds || 0;
+              if (triggerCooldownScript > 0) {
+                this.autoResponderCooldowns.set(`${triggerIdx}:${message.fromNodeNum}`, Date.now());
+              }
+
               return;
 
             } catch (error: any) {
@@ -8079,6 +8170,125 @@ class MeshtasticManager {
               if (error.stdout) logger.warn(`🔧 Script stdout before failure: ${error.stdout.substring(0, 200)}`);
               return;
             }
+
+          } else if (trigger.responseType === 'traceroute') {
+            // Traceroute trigger - resolve target node and send traceroute
+            let resolvedTarget = trigger.response;
+            Object.entries(extractedParams).forEach(([key, value]) => {
+              resolvedTarget = resolvedTarget.replace(new RegExp(`\\{${key}\\}`, 'g'), value);
+            });
+            resolvedTarget = resolvedTarget.trim();
+
+            // Look up target node by long name, short name, or node ID
+            const allNodes = await databaseService.nodes.getAllNodes();
+            const searchLower = resolvedTarget.toLowerCase();
+            const targetNode = allNodes.find(n => {
+              const nid = n.nodeId?.toLowerCase() || '';
+              return (n.longName?.toLowerCase() === searchLower) ||
+                     (n.shortName?.toLowerCase() === searchLower) ||
+                     (nid === searchLower) ||
+                     (nid === `!${searchLower}`) ||
+                     (n.nodeNum.toString() === resolvedTarget);
+            });
+
+            if (!targetNode) {
+              const errMsg = `Unknown node: ${resolvedTarget.substring(0, 20)}`;
+              messageQueueService.enqueue(
+                this.truncateMessageForMeshtastic(errMsg, 200),
+                isDirectMessage ? message.fromNodeNum : 0,
+                packetId,
+                () => { logger.info('✅ Traceroute unknown-node reply delivered'); },
+                (reason: string) => { logger.warn(`❌ Traceroute unknown-node reply failed: ${reason}`); },
+                isDirectMessage ? undefined : message.channel as number,
+                1
+              );
+              return;
+            }
+
+            const targetNodeNum = targetNode.nodeNum;
+            const targetName = targetNode.longName || targetNode.nodeId || targetNode.nodeNum.toString();
+
+            // Deduplicate: if a traceroute to this node is already pending, tell the user
+            if (this.pendingAutoresponderTraceroutes.has(targetNodeNum)) {
+              const dupMsg = `Traceroute to ${targetName.substring(0, 15)} already queued`;
+              messageQueueService.enqueue(
+                this.truncateMessageForMeshtastic(dupMsg, 200),
+                isDirectMessage ? message.fromNodeNum : 0,
+                packetId,
+                () => {},
+                () => {},
+                isDirectMessage ? undefined : message.channel as number,
+                1
+              );
+              return;
+            }
+
+            // Send immediate ACK to the requesting node
+            const ackMsg = `Tracerouting to ${targetName.substring(0, 15)}...`;
+            messageQueueService.enqueue(
+              this.truncateMessageForMeshtastic(ackMsg, 200),
+              isDirectMessage ? message.fromNodeNum : 0,
+              packetId,
+              () => { logger.info(`✅ Traceroute ACK delivered to ${nodeId}`); },
+              (reason: string) => { logger.warn(`❌ Traceroute ACK failed to ${nodeId}: ${reason}`); },
+              isDirectMessage ? undefined : message.channel as number,
+              1
+            );
+
+            // Set up 75-second timeout to reply if no response arrives
+            const TRACEROUTE_TIMEOUT_MS = 75000;
+            const timeoutHandle = setTimeout(() => {
+              const pending = this.pendingAutoresponderTraceroutes.get(targetNodeNum);
+              if (!pending) return;
+              this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
+              const timeoutMsg = `${targetName.substring(0, 15)} did not respond within timeout`;
+              messageQueueService.enqueue(
+                this.truncateMessageForMeshtastic(timeoutMsg, 200),
+                pending.isDM ? pending.replyToNodeNum : 0,
+                undefined,
+                () => { logger.info('✅ Traceroute timeout reply delivered'); },
+                (reason: string) => { logger.warn(`❌ Traceroute timeout reply failed: ${reason}`); },
+                pending.isDM ? undefined : pending.replyChannel,
+                1
+              );
+            }, TRACEROUTE_TIMEOUT_MS);
+
+            // Register the pending traceroute so the result handler can reply
+            this.pendingAutoresponderTraceroutes.set(targetNodeNum, {
+              replyToNodeNum: message.fromNodeNum,
+              isDM: isDirectMessage,
+              replyChannel: isDirectMessage ? -1 : (message.channel as number),
+              packetId,
+              timeoutHandle,
+            });
+
+            // Send the actual traceroute packet
+            try {
+              const channel = targetNode.channel ?? 0;
+              await this.sendTraceroute(targetNodeNum, channel);
+              logger.info(`🔍 Auto-responder traceroute to ${targetName} (${targetNode.nodeId}) initiated by ${nodeId}`);
+
+              // Record cooldown timestamp
+              const triggerCooldownTrace = trigger.cooldownSeconds || 0;
+              if (triggerCooldownTrace > 0) {
+                this.autoResponderCooldowns.set(`${triggerIdx}:${message.fromNodeNum}`, Date.now());
+              }
+            } catch (error: any) {
+              logger.error(`❌ Auto-responder traceroute to ${targetName} failed: ${error.message}`);
+              clearTimeout(timeoutHandle);
+              this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
+              const errMsg = `Failed to traceroute: ${error.message?.substring(0, 30)}`;
+              messageQueueService.enqueue(
+                this.truncateMessageForMeshtastic(errMsg, 200),
+                isDirectMessage ? message.fromNodeNum : 0,
+                undefined,
+                () => {},
+                () => {},
+                isDirectMessage ? undefined : message.channel as number,
+                1
+              );
+            }
+            return;
 
           } else {
             // Text trigger - use static response
@@ -8136,6 +8346,12 @@ class MeshtasticManager {
               maxAttempts
             );
           });
+
+          // Record cooldown timestamp
+          const triggerCooldownText = trigger.cooldownSeconds || 0;
+          if (triggerCooldownText > 0) {
+            this.autoResponderCooldowns.set(`${triggerIdx}:${message.fromNodeNum}`, Date.now());
+          }
 
           // Only respond to first matching trigger
           return;
@@ -8707,6 +8923,65 @@ class MeshtasticManager {
       logger.error('❌ Error in auto-favorite sweep:', error);
     } finally {
       this.autoFavoriteSweepRunning = false;
+    }
+  }
+
+  /**
+   * Check if auto heap management should be triggered and purge oldest nodes if heap is low.
+   * Called after each LocalStats telemetry packet from the local node.
+   */
+  private async checkAutoHeapManagement(heapFreeBytes: number | undefined, fromNum: number): Promise<void> {
+    const enabled = await databaseService.settings.getSetting('autoHeapManagementEnabled');
+    if (enabled !== 'true') return;
+
+    const thresholdStr = await databaseService.settings.getSetting('autoHeapManagementThresholdBytes');
+    const threshold = parseInt(thresholdStr || '20000');
+
+    if (heapFreeBytes === undefined || heapFreeBytes >= threshold) return;
+
+    // Cooldown: skip if a purge happened within the last 30 minutes
+    const cooldownMs = 30 * 60 * 1000;
+    if (this.lastHeapPurgeAt !== null && (Date.now() - this.lastHeapPurgeAt) < cooldownMs) {
+      logger.debug(`🧹 Auto heap management: skipping purge (cooldown active, last purge ${Math.round((Date.now() - this.lastHeapPurgeAt) / 60000)}m ago)`);
+      return;
+    }
+
+    try {
+      // Get all nodes ordered by lastHeard ascending (oldest first), excluding local node
+      const allNodes = await databaseService.nodes.getAllNodes();
+      const localNodeNum = this.localNodeInfo?.nodeNum ?? fromNum;
+      const candidates = allNodes
+        .filter(n => Number(n.nodeNum) !== localNodeNum)
+        .sort((a, b) => (a.lastHeard ?? 0) - (b.lastHeard ?? 0))
+        .slice(0, 10);
+
+      if (candidates.length === 0) {
+        logger.warn('🧹 Auto heap management: no candidate nodes to purge');
+        return;
+      }
+
+      logger.info(`🧹 Auto heap management triggered: heap=${heapFreeBytes}B free (threshold=${threshold}B), purging ${candidates.length} oldest nodes`);
+
+      for (const node of candidates) {
+        await this.sendRemoveNode(Number(node.nodeNum));
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+
+      await databaseService.auditLogAsync(
+        null,
+        'auto_heap_management_purge',
+        'nodes',
+        `Auto heap management: purged ${candidates.length} nodes (heap was ${heapFreeBytes} bytes free, threshold ${threshold} bytes)`,
+        'system'
+      );
+
+      // Wait 3 seconds then reboot the local node
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      await this.sendRebootCommand(this.localNodeInfo!.nodeNum, 10);
+
+      this.lastHeapPurgeAt = Date.now();
+    } catch (error) {
+      logger.error('❌ Error in auto heap management:', error);
     }
   }
 
@@ -10611,6 +10886,7 @@ class MeshtasticManager {
       const adminPacket = protobufService.createAdminPacket(setConfigMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
 
       await this.transport.send(adminPacket);
+      this.updateCachedDeviceConfig('lora', config);
       logger.debug('⚙️ Sent set_lora_config admin message');
     } catch (error) {
       logger.error('❌ Error sending LoRa config:', error);
@@ -10632,6 +10908,7 @@ class MeshtasticManager {
       const adminPacket = protobufService.createAdminPacket(setConfigMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
 
       await this.transport.send(adminPacket);
+      this.updateCachedDeviceConfig('network', config);
       logger.debug('⚙️ Sent set_network_config admin message');
     } catch (error) {
       logger.error('❌ Error sending network config:', error);
@@ -10724,6 +11001,7 @@ class MeshtasticManager {
       const adminPacket = protobufService.createAdminPacket(setConfigMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
 
       await this.transport.send(adminPacket);
+      this.updateCachedDeviceConfig('position', positionConfig);
       logger.debug('⚙️ Sent set_position_config admin message');
     } catch (error) {
       logger.error('❌ Error sending position config:', error);
@@ -10745,6 +11023,7 @@ class MeshtasticManager {
       const adminPacket = protobufService.createAdminPacket(setConfigMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
 
       await this.transport.send(adminPacket);
+      this.updateCachedDeviceConfig('mqtt', config);
       logger.debug('⚙️ Sent set_mqtt_config admin message (direct, no transaction)');
     } catch (error) {
       logger.error('❌ Error sending MQTT config:', error);
@@ -10766,6 +11045,7 @@ class MeshtasticManager {
       const adminPacket = protobufService.createAdminPacket(setConfigMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
 
       await this.transport.send(adminPacket);
+      this.updateCachedDeviceConfig('neighborinfo', config);
       logger.debug('⚙️ Sent set_neighborinfo_config admin message (direct, no transaction)');
     } catch (error) {
       logger.error('❌ Error sending NeighborInfo config:', error);

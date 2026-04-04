@@ -35,6 +35,7 @@ export const VALID_SETTINGS_KEYS = [
   'autoAckMultihopTapbackEnabled',
   'autoAckMultihopReplyEnabled',
   'autoAckTestMessages',
+  'autoAckCooldownSeconds',
   'customTapbackEmojis',
   'autoAnnounceEnabled',
   'autoAnnounceIntervalHours',
@@ -130,6 +131,15 @@ export const VALID_SETTINGS_KEYS = [
   'securityDigestSuppressEmpty',
   'securityDigestFormat',
   'activeMapStyleId',
+  'telemetryWidgetModes',
+  'telemetryWidgetRanges',
+  'autoHeapManagementEnabled',
+  'autoHeapManagementThresholdBytes',
+  'tracerouteFilterLastHeardEnabled',
+  'tracerouteFilterLastHeardHours',
+  'tracerouteFilterHopsEnabled',
+  'tracerouteFilterHopsMin',
+  'tracerouteFilterHopsMax',
 ] as const;
 
 export type ValidSettingKey = typeof VALID_SETTINGS_KEYS[number];

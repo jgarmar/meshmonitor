@@ -34,6 +34,7 @@ import RemoteAdminScannerSection from './components/RemoteAdminScannerSection';
 import AutoTimeSyncSection from './components/AutoTimeSyncSection';
 import AutoPingSection from './components/AutoPingSection';
 import AutoFavoriteSection from './components/AutoFavoriteSection';
+import AutoHeapManagementSection from './components/AutoHeapManagementSection';
 import IgnoredNodesSection from './components/IgnoredNodesSection';
 import SectionNav from './components/SectionNav';
 import { ToastProvider, useToast } from './components/ToastContainer';
@@ -63,7 +64,7 @@ import { isNodeComplete, getEffectivePosition } from './utils/nodeHelpers';
 import { applyHomoglyphOptimization } from './utils/homoglyph';
 import Sidebar from './components/Sidebar';
 import { SearchModal } from './components/SearchModal/SearchModal.js';
-import { SettingsProvider, useSettings } from './contexts/SettingsContext';
+import { SettingsProvider, useSettings, useNotificationMuteSettings } from './contexts/SettingsContext';
 import { MapProvider, useMapContext } from './contexts/MapContext';
 import { DataProvider, useData } from './contexts/DataContext';
 import { MessagingProvider, useMessaging } from './contexts/MessagingContext';
@@ -317,6 +318,8 @@ function App() {
     overlayColors: schemeColors,
   } = useSettings();
 
+  const { isChannelMuted, isDMMuted } = useNotificationMuteSettings();
+
   // Map context
   const {
     showPaths,
@@ -543,6 +546,7 @@ function App() {
     autoAckMultihopEnabled, setAutoAckMultihopEnabled,
     autoAckMultihopTapbackEnabled, setAutoAckMultihopTapbackEnabled,
     autoAckMultihopReplyEnabled, setAutoAckMultihopReplyEnabled,
+    autoAckCooldownSeconds, setAutoAckCooldownSeconds,
     autoAckTestMessages, setAutoAckTestMessages,
     autoAnnounceEnabled, setAutoAnnounceEnabled,
     autoAnnounceIntervalHours, setAutoAnnounceIntervalHours,
@@ -873,7 +877,9 @@ function App() {
         } catch (error) {
           logger.error('Failed to load config:', error);
           setNodeAddress('192.168.1.100');
-          setBaseUrl('');
+          // Keep initialBaseUrl detected from pathname — resetting to '' would break
+          // API calls when BASE_URL is configured on the server.
+          configBaseUrl = initialBaseUrl;
         }
 
         // Load settings from server
@@ -1006,6 +1012,10 @@ function App() {
           }
           if (settings.autoAckMultihopReplyEnabled !== undefined) {
             setAutoAckMultihopReplyEnabled(settings.autoAckMultihopReplyEnabled !== 'false');
+          }
+
+          if (settings.autoAckCooldownSeconds !== undefined) {
+            setAutoAckCooldownSeconds(parseInt(settings.autoAckCooldownSeconds) || 60);
           }
 
           if (settings.autoAckTestMessages) {
@@ -2382,7 +2392,15 @@ function App() {
 
             if (isFromOther && isTextMessage) {
               logger.debug('New message arrived from other user:', currentNewestMessage.fromNodeId);
-              playNotificationSound();
+              const isDM = currentNewestMessage.channel === -1;
+              const muted = isDM
+                ? isDMMuted(currentNewestMessage.fromNodeId)
+                : isChannelMuted(currentNewestMessage.channel);
+              if (!muted) {
+                playNotificationSound();
+              } else {
+                logger.debug('🔇 Notification sound suppressed (muted):', isDM ? `DM from ${currentNewestMessage.fromNodeId}` : `channel ${currentNewestMessage.channel}`);
+              }
             }
           }
 
@@ -2583,7 +2601,7 @@ function App() {
         setTraceroutes(data.traceroutes);
       }
     },
-    [currentNodeId, playNotificationSound, setTraceroutes]
+    [currentNodeId, playNotificationSound, setTraceroutes, isChannelMuted, isDMMuted]
   );
 
   // Process poll data when it changes (from usePoll hook)
@@ -4854,6 +4872,7 @@ function App() {
                 { id: 'auto-favorite', label: t('automation.auto_favorite.title', 'Auto Favorite') },
                 { id: 'auto-traceroute', label: t('automation.traceroute.title', 'Auto Traceroute') },
                 { id: 'auto-ping', label: t('automation.auto_ping.title', 'Auto Ping') },
+                { id: 'auto-heap-management', label: t('automation.auto_heap.title', 'Auto Heap Management') },
                 { id: 'remote-admin-scanner', label: t('automation.remote_admin_scanner.title', 'Remote Admin Scanner') },
                 { id: 'auto-time-sync', label: t('automation.time_sync.title', 'Auto Time Sync') },
                 { id: 'auto-acknowledge', label: t('automation.acknowledge.title', 'Auto Acknowledge') },
@@ -4898,6 +4917,9 @@ function App() {
                   baseUrl={baseUrl}
                 />
               </div>
+              <div id="auto-heap-management">
+                <AutoHeapManagementSection baseUrl={baseUrl} />
+              </div>
               <div id="remote-admin-scanner">
                 <RemoteAdminScannerSection
                   baseUrl={baseUrl}
@@ -4929,6 +4951,8 @@ function App() {
                   multihopTapbackEnabled={autoAckMultihopTapbackEnabled}
                   multihopReplyEnabled={autoAckMultihopReplyEnabled}
                   testMessages={autoAckTestMessages}
+                  cooldownSeconds={autoAckCooldownSeconds}
+                  onCooldownSecondsChange={setAutoAckCooldownSeconds}
                   baseUrl={baseUrl}
                   onEnabledChange={setAutoAckEnabled}
                   onRegexChange={setAutoAckRegex}

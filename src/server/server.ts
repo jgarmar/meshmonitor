@@ -496,6 +496,22 @@ setTimeout(async () => {
     await meshtasticManager.connect();
     logger.debug('Meshtastic manager connected successfully');
 
+    // Auto-connect MeshCore if enabled via environment variables
+    if (process.env.MESHCORE_ENABLED === 'true') {
+      const meshcoreConfig = meshcoreManager.getEnvConfig();
+      if (meshcoreConfig) {
+        logger.info('[MeshCore] Auto-connecting on startup...');
+        const connected = await meshcoreManager.connect();
+        if (connected) {
+          logger.info('[MeshCore] Auto-connected successfully on startup');
+        } else {
+          logger.warn('[MeshCore] Auto-connect on startup failed — use the MeshCore tab to retry');
+        }
+      } else {
+        logger.warn('[MeshCore] MESHCORE_ENABLED=true but no serial port or TCP host configured');
+      }
+    }
+
     // Initialize backup scheduler
     backupSchedulerService.initialize(meshtasticManager);
     logger.debug('Backup scheduler initialized');
@@ -733,6 +749,7 @@ import newsRoutes from './routes/newsRoutes.js';
 import tileServerRoutes from './routes/tileServerTest.js';
 import v1Router from './routes/v1/index.js';
 import meshcoreRoutes from './routes/meshcoreRoutes.js';
+import meshcoreManager from './meshcoreManager.js';
 import embedProfileRoutes from './routes/embedProfileRoutes.js';
 import { createEmbedCspMiddleware } from './middleware/embedMiddleware.js';
 import embedPublicRoutes from './routes/embedPublicRoutes.js';
@@ -2189,10 +2206,39 @@ apiRouter.get('/messages/unread-counts', optionalAuth(), async (req, res) => {
       directMessages?: { [nodeId: string]: number };
     } = {};
 
+    // Load mute preferences for the current user (if authenticated)
+    let mutedChannelIds: Set<number> = new Set();
+    let mutedDMNodeIds: Set<string> = new Set();
+    if (userId) {
+      const { getUserNotificationPreferencesAsync } = await import('./utils/notificationFiltering.js');
+      const prefs = await getUserNotificationPreferencesAsync(userId);
+      if (prefs) {
+        const now = Date.now();
+        for (const rule of (prefs.mutedChannels ?? [])) {
+          if (rule.muteUntil === null || rule.muteUntil > now) {
+            mutedChannelIds.add(rule.channelId);
+          }
+        }
+        for (const rule of (prefs.mutedDMs ?? [])) {
+          if (rule.muteUntil === null || rule.muteUntil > now) {
+            mutedDMNodeIds.add(rule.nodeUuid);
+          }
+        }
+      }
+    }
+
     // Get channel unread counts if user has channels permission
     // Only count incoming messages (exclude messages sent by our node)
     if (hasChannelsRead) {
-      result.channels = await databaseService.getUnreadCountsByChannelAsync(userId, localNodeInfo?.nodeId);
+      const rawCounts = await databaseService.getUnreadCountsByChannelAsync(userId, localNodeInfo?.nodeId);
+      // Filter out muted channels
+      const channels: { [channelId: number]: number } = {};
+      for (const [channelId, count] of Object.entries(rawCounts)) {
+        if (!mutedChannelIds.has(Number(channelId))) {
+          channels[Number(channelId)] = count as number;
+        }
+      }
+      result.channels = channels;
     }
 
     // Get DM unread counts if user has messages permission (batch query)
@@ -2203,7 +2249,8 @@ apiRouter.get('/messages/unread-counts', optionalAuth(), async (req, res) => {
       const visibleNodeIds = new Set(visibleNodes.map(n => n.user?.id).filter(Boolean));
       const directMessages: { [nodeId: string]: number } = {};
       for (const [nodeId, count] of Object.entries(allUnreadDMs)) {
-        if (visibleNodeIds.has(nodeId) && count > 0) {
+        // Filter out muted DMs
+        if (visibleNodeIds.has(nodeId) && count > 0 && !mutedDMNodeIds.has(nodeId)) {
           directMessages[nodeId] = count;
         }
       }
@@ -2524,6 +2571,30 @@ apiRouter.put('/channels/:id', requirePermission('channel_0', 'write'), async (r
   } catch (error) {
     logger.error('Error updating channel:', error);
     res.status(500).json({ error: 'Failed to update channel' });
+  }
+});
+
+// Delete a channel's messages and database record
+apiRouter.delete('/channels/:id', requirePermission('channel_0', 'write'), async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.id);
+    if (isNaN(channelId) || channelId < 0 || channelId > 7) {
+      return res.status(400).json({ error: 'Invalid channel ID (0-7)' });
+    }
+    if (channelId === 0) {
+      return res.status(400).json({ error: 'Cannot delete primary channel' });
+    }
+
+    // Purge messages for this channel
+    const deletedCount = await databaseService.messages.purgeChannelMessages(channelId);
+    // Delete the channel record
+    await databaseService.channels.deleteChannel(channelId);
+
+    logger.info(`🗑️ Deleted channel ${channelId}: ${deletedCount} messages purged`);
+    res.json({ success: true, message: `Channel ${channelId} deleted`, messagesDeleted: deletedCount });
+  } catch (error) {
+    logger.error('Error deleting channel:', error);
+    res.status(500).json({ error: 'Failed to delete channel' });
   }
 });
 
@@ -5027,7 +5098,9 @@ apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'writ
     const {
       enabled, nodeNums, filterChannels, filterRoles, filterHwModels, filterNameRegex,
       filterNodesEnabled, filterChannelsEnabled, filterRolesEnabled, filterHwModelsEnabled, filterRegexEnabled,
-      expirationHours, sortByHops
+      expirationHours, sortByHops,
+      filterLastHeardEnabled, filterLastHeardHours,
+      filterHopsEnabled, filterHopsMin, filterHopsMax,
     } = req.body;
 
     // Validate input
@@ -5121,6 +5194,50 @@ apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'writ
       validatedExpirationHours = expirationHours;
     }
 
+    // Validate filterLastHeardEnabled (optional boolean)
+    let validatedFilterLastHeardEnabled: boolean | undefined;
+    try {
+      validatedFilterLastHeardEnabled = validateOptionalBoolean(filterLastHeardEnabled, 'filterLastHeardEnabled');
+    } catch (error) {
+      return res.status(400).json({ error: (error as Error).message });
+    }
+
+    // Validate filterLastHeardHours (optional, must be integer >= 1)
+    let validatedFilterLastHeardHours: number | undefined;
+    if (filterLastHeardHours !== undefined) {
+      if (!Number.isInteger(filterLastHeardHours) || filterLastHeardHours < 1) {
+        return res.status(400).json({ error: 'Invalid filterLastHeardHours value. Must be an integer >= 1.' });
+      }
+      validatedFilterLastHeardHours = filterLastHeardHours;
+    }
+
+    // Validate filterHopsEnabled (optional boolean)
+    let validatedFilterHopsEnabled: boolean | undefined;
+    try {
+      validatedFilterHopsEnabled = validateOptionalBoolean(filterHopsEnabled, 'filterHopsEnabled');
+    } catch (error) {
+      return res.status(400).json({ error: (error as Error).message });
+    }
+
+    // Validate filterHopsMin/Max (optional, must be integers >= 0, min <= max)
+    let validatedFilterHopsMin: number | undefined;
+    let validatedFilterHopsMax: number | undefined;
+    if (filterHopsMin !== undefined) {
+      if (!Number.isInteger(filterHopsMin) || filterHopsMin < 0) {
+        return res.status(400).json({ error: 'Invalid filterHopsMin value. Must be a non-negative integer.' });
+      }
+      validatedFilterHopsMin = filterHopsMin;
+    }
+    if (filterHopsMax !== undefined) {
+      if (!Number.isInteger(filterHopsMax) || filterHopsMax < 0) {
+        return res.status(400).json({ error: 'Invalid filterHopsMax value. Must be a non-negative integer.' });
+      }
+      validatedFilterHopsMax = filterHopsMax;
+    }
+    if (validatedFilterHopsMin !== undefined && validatedFilterHopsMax !== undefined && validatedFilterHopsMin > validatedFilterHopsMax) {
+      return res.status(400).json({ error: 'filterHopsMin cannot be greater than filterHopsMax.' });
+    }
+
     // Update all settings
     await databaseService.setTracerouteFilterSettingsAsync({
       enabled,
@@ -5136,6 +5253,11 @@ apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'writ
       filterRegexEnabled: validatedFilterRegexEnabled,
       expirationHours: validatedExpirationHours,
       sortByHops: validatedSortByHops,
+      filterLastHeardEnabled: validatedFilterLastHeardEnabled,
+      filterLastHeardHours: validatedFilterLastHeardHours,
+      filterHopsEnabled: validatedFilterHopsEnabled,
+      filterHopsMin: validatedFilterHopsMin,
+      filterHopsMax: validatedFilterHopsMax,
     });
 
     // Get the updated settings to return (includes resolved default values)
@@ -7833,6 +7955,8 @@ apiRouter.get('/push/preferences', requireAuth(), async (req, res) => {
         whitelist: ['Hi', 'Help'],
         blacklist: ['Test', 'Copy'],
         appriseUrls: [],
+        mutedChannels: [],
+        mutedDMs: [],
       });
     }
   } catch (error: any) {
@@ -7865,6 +7989,8 @@ apiRouter.post('/push/preferences', requireAuth(), async (req, res) => {
       whitelist,
       blacklist,
       appriseUrls,
+      mutedChannels,
+      mutedDMs,
     } = req.body;
 
     // Validate input
@@ -7904,6 +8030,30 @@ apiRouter.post('/push/preferences', requireAuth(), async (req, res) => {
       return res.status(400).json({ error: 'appriseUrls must be an array of strings' });
     }
 
+    // Validate mutedChannels
+    if (mutedChannels !== undefined && !Array.isArray(mutedChannels)) {
+      return res.status(400).json({ error: 'mutedChannels must be an array' });
+    }
+    if (mutedChannels && mutedChannels.some((r: any) =>
+      typeof r !== 'object' || r === null ||
+      typeof r.channelId !== 'number' ||
+      (r.muteUntil !== null && typeof r.muteUntil !== 'number')
+    )) {
+      return res.status(400).json({ error: 'mutedChannels entries must have channelId (number) and muteUntil (number|null)' });
+    }
+
+    // Validate mutedDMs
+    if (mutedDMs !== undefined && !Array.isArray(mutedDMs)) {
+      return res.status(400).json({ error: 'mutedDMs must be an array' });
+    }
+    if (mutedDMs && mutedDMs.some((r: any) =>
+      typeof r !== 'object' || r === null ||
+      typeof r.nodeUuid !== 'string' ||
+      (r.muteUntil !== null && typeof r.muteUntil !== 'number')
+    )) {
+      return res.status(400).json({ error: 'mutedDMs entries must have nodeUuid (string) and muteUntil (number|null)' });
+    }
+
     const prefs = {
       enableWebPush,
       enableApprise,
@@ -7920,6 +8070,8 @@ apiRouter.post('/push/preferences', requireAuth(), async (req, res) => {
       whitelist,
       blacklist,
       appriseUrls: appriseUrls ?? [],
+      mutedChannels: mutedChannels ?? [],
+      mutedDMs: mutedDMs ?? [],
     };
 
     const success = await saveUserNotificationPreferencesAsync(userId, prefs);
