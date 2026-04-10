@@ -15,6 +15,9 @@ vi.mock('../services/database.js', () => ({
     settings: {
       getSetting: vi.fn(),
       setSetting: vi.fn(),
+      getSettingForSource: vi.fn((_sourceId: string | null | undefined, key: string) =>
+        (databaseService.settings.getSetting as any)(key)
+      ),
     },
     nodes: {
       getNode: vi.fn(),
@@ -80,14 +83,26 @@ vi.mock('../services/database.js', () => ({
   },
 }));
 
-// Mock the message queue service
-vi.mock('./messageQueueService.js', () => ({
-  messageQueueService: {
+// Mock the message queue service — unify the singleton and per-instance
+// constructor return value so assertions on `messageQueueService.enqueue`
+// still work for code that now routes through `new MessageQueueService()`.
+vi.mock('./messageQueueService.js', () => {
+  const mockInstance = {
     enqueue: vi.fn(),
     setSendCallback: vi.fn(),
+    handleAck: vi.fn(),
+    handleFailure: vi.fn(),
     recordExternalSend: vi.fn(),
-  },
-}));
+    clear: vi.fn(),
+    getStatus: vi.fn(() => ({ queueLength: 0, pendingAcks: 0, processing: false })),
+  };
+  // Regular function — arrow functions can't be called with `new`.
+  function MessageQueueService() { return mockInstance as any; }
+  return {
+    messageQueueService: mockInstance,
+    MessageQueueService,
+  };
+});
 
 // Mock the meshtasticProtobufService
 vi.mock('../services/meshtasticProtobufService.js', () => ({
@@ -262,7 +277,7 @@ describe('MeshtasticManager - Auto Welcome Integration', () => {
       // Welcome now goes through message queue
       expect(messageQueueService.enqueue).toHaveBeenCalledTimes(1);
       // markNodeAsWelcomedIfNotAlready is called immediately after enqueue (not in callback)
-      expect(databaseService.nodes.markNodeAsWelcomedIfNotAlready).toHaveBeenCalledWith(999999, '!000f423f');
+      expect(databaseService.nodes.markNodeAsWelcomedIfNotAlready).toHaveBeenCalledWith(999999, '!000f423f', 'default');
       // maxAttemptsOverride=1 to prevent DM retries on missing remote ACK
       const enqueueCall = vi.mocked(messageQueueService.enqueue).mock.calls[0];
       expect(enqueueCall[6]).toBe(1);
@@ -434,7 +449,7 @@ describe('MeshtasticManager - Auto Welcome Integration', () => {
 
       // Should enqueue the message and call markNodeAsWelcomedIfNotAlready immediately after
       expect(messageQueueService.enqueue).toHaveBeenCalledTimes(1);
-      expect(databaseService.nodes.markNodeAsWelcomedIfNotAlready).toHaveBeenCalledWith(999999, '!000f423f');
+      expect(databaseService.nodes.markNodeAsWelcomedIfNotAlready).toHaveBeenCalledWith(999999, '!000f423f', 'default');
     });
   });
 
