@@ -111,6 +111,20 @@ router.post('/', requirePermission('sources', 'write'), async (req: Request, res
       return res.status(vnErr.status).json({ error: vnErr.error });
     }
 
+    // Prevent duplicate host:port combinations
+    if (type === 'meshtastic_tcp' && config.host && config.port) {
+      const existing = await databaseService.sources.getAllSources();
+      const duplicate = existing.find((s) => {
+        const cfg = s.config as any;
+        return cfg?.host === config.host && cfg?.port === config.port;
+      });
+      if (duplicate) {
+        return res.status(409).json({
+          error: `A source already exists with host ${config.host}:${config.port} ("${duplicate.name}")`,
+        });
+      }
+    }
+
     const source = await databaseService.sources.createSource({
       id: uuidv4(),
       name: name.trim(),
@@ -162,6 +176,21 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
       const vnErr = await validateVirtualNodeConfig(existing.type, config, existing.id);
       if (vnErr) {
         return res.status(vnErr.status).json({ error: vnErr.error });
+      }
+
+      // Prevent duplicate host:port combinations (exclude self)
+      if (existing.type === 'meshtastic_tcp' && config.host && config.port) {
+        const allSources = await databaseService.sources.getAllSources();
+        const duplicate = allSources.find((s) => {
+          if (s.id === req.params.id) return false;
+          const cfg = s.config as any;
+          return cfg?.host === config.host && cfg?.port === config.port;
+        });
+        if (duplicate) {
+          return res.status(409).json({
+            error: `A source already exists with host ${config.host}:${config.port} ("${duplicate.name}")`,
+          });
+        }
       }
     }
 
@@ -327,8 +356,8 @@ router.get('/:id/nodes', requirePermission('nodes', 'read', { sourceIdFrom: 'par
     const user = (req as any).user ?? null;
 
     // Filter by channel viewOnMap permissions and mask private position channels
-    const filtered = await filterNodesByChannelPermission(nodes, user);
-    const masked = await maskNodeLocationByChannel(filtered, user);
+    const filtered = await filterNodesByChannelPermission(nodes, user, source.id);
+    const masked = await maskNodeLocationByChannel(filtered, user, source.id);
     res.json(masked);
   } catch (error) {
     logger.error('Error fetching nodes for source:', error);

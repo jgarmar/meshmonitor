@@ -51,9 +51,6 @@ export class ChannelsRepository extends BaseRepository {
     if (result.length === 0) return null;
 
     const channel = result[0];
-    if (id === 0) {
-      logger.info(`getChannelById(0) - RAW from DB: ${channel ? `name="${channel.name}" (length: ${channel.name?.length || 0})` : 'null'}`);
-    }
     return this.normalizeBigInts(channel) as DbChannel;
   }
 
@@ -109,18 +106,17 @@ export class ChannelsRepository extends BaseRepository {
       data.role = 2;
     }
 
-    logger.info(`upsertChannel called with ID: ${data.id}, name: "${data.name}" (length: ${data.name.length})`);
+    logger.debug(`upsertChannel called with ID: ${data.id}, name: "${data.name}"`);
 
     // Look up existing channel using composite key when sourceId is available
     const existingChannel = await this.getChannelById(data.id, sourceId);
-    logger.info(`getChannelById(${data.id}, sourceId=${sourceId ?? 'none'}) returned: ${existingChannel ? `"${existingChannel.name}"` : 'null'}`);
 
     if (existingChannel) {
       // Update existing channel
       // Preserve existing non-empty name if incoming name is empty (fixes #1567)
       // This prevents device reconnections from wiping channel names
       const effectiveName = data.name || existingChannel.name;
-      logger.info(`Updating channel ${existingChannel.id}: name "${existingChannel.name}" -> "${effectiveName}" (incoming: "${data.name}")`);
+      logger.debug(`Updating channel ${existingChannel.id}: name "${existingChannel.name}" -> "${effectiveName}"`);
 
       const updateSet: any = {
         name: effectiveName,
@@ -151,7 +147,7 @@ export class ChannelsRepository extends BaseRepository {
         await this.db.update(channels).set(updateSet).where(updateWhere);
       }
 
-      logger.info(`Updated channel ${existingChannel.id}`);
+      logger.debug(`Updated channel ${existingChannel.id}`);
     } else {
       // Create new channel
       logger.debug(`Creating new channel with ID: ${data.id}`);
@@ -188,6 +184,29 @@ export class ChannelsRepository extends BaseRepository {
   }
 
   /**
+   * Clean up channels scoped to a source that have no name and no psk.
+   * Used by `cleanupInvalidChannelsAsync(sourceId)` — narrower semantics than
+   * `cleanupInvalidChannels()` (which uses id range 0–7).
+   */
+  async cleanupEmptyChannelsForSource(sourceId: string): Promise<number> {
+    const { channels } = this.tables;
+    const whereClause = and(
+      or(isNull(channels.name), eq(channels.name, '')),
+      or(isNull(channels.psk), eq(channels.psk, '')),
+      eq(channels.sourceId, sourceId)
+    );
+    const countRows = await this.db
+      .select({ count: count() })
+      .from(channels)
+      .where(whereClause);
+    const deleteCount = Number(countRows[0].count);
+    if (deleteCount > 0) {
+      await this.db.delete(channels).where(whereClause);
+    }
+    return deleteCount;
+  }
+
+  /**
    * Clean up invalid channels that shouldn't have been created
    * Meshtastic supports channels 0-7 (8 total channels)
    */
@@ -221,6 +240,139 @@ export class ChannelsRepository extends BaseRepository {
       await this.db.delete(channels).where(whereClause);
     }
     logger.debug(`Cleaned up ${deleteCount} empty channels (ID > 1, no PSK/role)`);
+    return deleteCount;
+  }
+
+  // ========== SYNC METHODS (SQLite only) ==========
+  // Used by legacy sync callers of DatabaseService. Throws on PG/MySQL.
+
+  /**
+   * Synchronously get a channel by id (SQLite only).
+   */
+  getChannelByIdSync(id: number): DbChannel | null {
+    const db = this.getSqliteDb();
+    const { channels } = this.tables;
+    const rows = db
+      .select()
+      .from(channels)
+      .where(eq(channels.id, id))
+      .limit(1)
+      .all();
+    if (rows.length === 0) return null;
+    return this.normalizeBigInts(rows[0]) as DbChannel;
+  }
+
+  /**
+   * Synchronously get all channels (SQLite only).
+   */
+  getAllChannelsSync(): DbChannel[] {
+    const db = this.getSqliteDb();
+    const { channels } = this.tables;
+    const rows = db
+      .select()
+      .from(channels)
+      .orderBy(channels.id)
+      .all();
+    return (rows as any[]).map((row) => this.normalizeBigInts(row)) as DbChannel[];
+  }
+
+  /**
+   * Synchronously count channels (SQLite only).
+   */
+  getChannelCountSync(): number {
+    const db = this.getSqliteDb();
+    const { channels } = this.tables;
+    const rows = db.select({ count: count() }).from(channels).all();
+    return Number((rows[0] as any).count);
+  }
+
+  /**
+   * Synchronously upsert a channel (SQLite only).
+   * Matches the legacy DatabaseService.upsertChannel semantics:
+   * - Does NOT preserve non-empty names across updates (overwrites with incoming)
+   * - Uses COALESCE-like behavior for nullable fields
+   * - Role rules already validated at call site
+   */
+  upsertChannelSync(channelData: ChannelInput): void {
+    const db = this.getSqliteDb();
+    const { channels } = this.tables;
+    const now = this.now();
+
+    // Look up existing row by id
+    const existingRows = db
+      .select()
+      .from(channels)
+      .where(eq(channels.id, channelData.id))
+      .limit(1)
+      .all();
+    const existing = existingRows.length > 0 ? (existingRows[0] as any) : null;
+
+    if (existing) {
+      // Update existing — COALESCE(new, old) semantics for nullable fields
+      const updateSet: any = {
+        name: channelData.name,
+        psk: channelData.psk ?? existing.psk,
+        role: channelData.role ?? existing.role,
+        uplinkEnabled: channelData.uplinkEnabled ?? existing.uplinkEnabled,
+        downlinkEnabled: channelData.downlinkEnabled ?? existing.downlinkEnabled,
+        positionPrecision: channelData.positionPrecision ?? existing.positionPrecision,
+        updatedAt: now,
+      };
+      db.update(channels).set(updateSet).where(eq(channels.id, existing.id)).run();
+      logger.info(`Updated channel ${existing.id} (sync)`);
+    } else {
+      // Insert new row
+      const newRow: any = {
+        id: channelData.id,
+        name: channelData.name,
+        psk: channelData.psk ?? null,
+        role: channelData.role ?? null,
+        uplinkEnabled: channelData.uplinkEnabled ?? true,
+        downlinkEnabled: channelData.downlinkEnabled ?? true,
+        positionPrecision: channelData.positionPrecision ?? null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.insert(channels).values(newRow).run();
+      logger.debug(`Created channel: ${channelData.name} (ID: ${channelData.id}) (sync)`);
+    }
+  }
+
+  /**
+   * Synchronously delete invalid channels (id < 0 or id > 7). (SQLite only).
+   * Returns the number of rows deleted.
+   */
+  cleanupInvalidChannelsSync(): number {
+    const db = this.getSqliteDb();
+    const { channels } = this.tables;
+    const whereClause = or(lt(channels.id, 0), gt(channels.id, 7));
+    const countRows = db.select({ count: count() }).from(channels).where(whereClause).all();
+    const deleteCount = Number((countRows[0] as any).count);
+    if (deleteCount > 0) {
+      db.delete(channels).where(whereClause).run();
+    }
+    logger.debug(`Cleaned up ${deleteCount} invalid channels (sync)`);
+    return deleteCount;
+  }
+
+  /**
+   * Synchronously delete empty channels (id > 1, no PSK, no role). (SQLite only).
+   * Returns the number of rows deleted.
+   */
+  cleanupEmptyChannelsSync(): number {
+    const db = this.getSqliteDb();
+    const { channels } = this.tables;
+    const whereClause = and(
+      gt(channels.id, 1),
+      isNull(channels.psk),
+      isNull(channels.role)
+    );
+    const countRows = db.select({ count: count() }).from(channels).where(whereClause).all();
+    const deleteCount = Number((countRows[0] as any).count);
+    if (deleteCount > 0) {
+      db.delete(channels).where(whereClause).run();
+    }
+    logger.debug(`Cleaned up ${deleteCount} empty channels (sync)`);
     return deleteCount;
   }
 }

@@ -74,6 +74,9 @@ const mockAuthRepo = vi.hoisted(() => ({
   findUserByUsername: vi.fn().mockResolvedValue(null),
   createAuditLogEntry: vi.fn().mockResolvedValue(undefined),
   getAuditLogs: vi.fn().mockResolvedValue([]),
+  getAuditLogsFiltered: vi.fn().mockResolvedValue({ logs: [], total: 0 }),
+  getAuditStats: vi.fn().mockResolvedValue({ actionStats: [], userStats: [], dailyStats: [], totalEvents: 0 }),
+  cleanupOldAuditLogs: vi.fn().mockResolvedValue(0),
   getUserPreferences: vi.fn().mockResolvedValue(null),
   setUserPreferences: vi.fn().mockResolvedValue(undefined),
 }));
@@ -112,12 +115,22 @@ const mockTelemetryRepo = vi.hoisted(() => ({
   getLatestTelemetryValueForAllNodes: vi.fn().mockResolvedValue([]),
 }));
 
-const mockSettingsRepo = vi.hoisted(() => ({
-  getSetting: vi.fn().mockResolvedValue(null),
-  setSetting: vi.fn().mockResolvedValue(undefined),
-  deleteSetting: vi.fn().mockResolvedValue(undefined),
-  getAllSettings: vi.fn().mockResolvedValue([]),
-}));
+const mockSettingsRepo = vi.hoisted(() => {
+  const store = new Map<string, string>();
+  return {
+    getSetting: vi.fn().mockImplementation(async (key: string) => store.get(key) ?? null),
+    setSetting: vi.fn().mockImplementation(async (key: string, value: string) => { store.set(key, value); }),
+    deleteSetting: vi.fn().mockImplementation(async (key: string) => { store.delete(key); }),
+    getAllSettings: vi.fn().mockImplementation(async () => Object.fromEntries(store)),
+    getSettingSync: vi.fn().mockImplementation((key: string) => store.get(key) ?? null),
+    setSettingSync: vi.fn().mockImplementation((key: string, value: string) => { store.set(key, value); }),
+    setSettingsSync: vi.fn().mockImplementation((settings: Record<string, string>) => {
+      for (const [k, v] of Object.entries(settings)) store.set(k, v);
+    }),
+    getAllSettingsSync: vi.fn().mockImplementation(() => Object.fromEntries(store)),
+    deleteAllSettingsSync: vi.fn().mockImplementation(() => { store.clear(); }),
+  };
+});
 
 const mockChannelsRepo = vi.hoisted(() => ({
   getChannels: vi.fn().mockResolvedValue([]),
@@ -164,12 +177,12 @@ const mockEmbedProfileRepo = vi.hoisted(() => ({
 
 // Use classes (not mockReturnValue) since they're called with `new`
 vi.mock('../db/repositories/index.js', () => ({
-  SettingsRepository: class { getSetting = mockSettingsRepo.getSetting; setSetting = mockSettingsRepo.setSetting; deleteSetting = mockSettingsRepo.deleteSetting; getAllSettings = mockSettingsRepo.getAllSettings; },
+  SettingsRepository: class { getSetting = mockSettingsRepo.getSetting; setSetting = mockSettingsRepo.setSetting; deleteSetting = mockSettingsRepo.deleteSetting; getAllSettings = mockSettingsRepo.getAllSettings; getSettingSync = mockSettingsRepo.getSettingSync; setSettingSync = mockSettingsRepo.setSettingSync; setSettingsSync = mockSettingsRepo.setSettingsSync; getAllSettingsSync = mockSettingsRepo.getAllSettingsSync; deleteAllSettingsSync = mockSettingsRepo.deleteAllSettingsSync; },
   ChannelsRepository: class { getChannels = mockChannelsRepo.getChannels; getChannelById = mockChannelsRepo.getChannelById; upsertChannel = mockChannelsRepo.upsertChannel; },
   NodesRepository: class { getAllNodes = mockNodesRepo.getAllNodes; getNodeByNum = mockNodesRepo.getNodeByNum; upsertNode = mockNodesRepo.upsertNode; deleteNode = mockNodesRepo.deleteNode; getNodesWithKeySecurityIssues = mockNodesRepo.getNodesWithKeySecurityIssues; },
   MessagesRepository: class { getMessage = mockMessagesRepo.getMessage; getMessages = mockMessagesRepo.getMessages; searchMessages = mockMessagesRepo.searchMessages; insertMessage = mockMessagesRepo.insertMessage; deleteMessage = mockMessagesRepo.deleteMessage; },
   TelemetryRepository: class { getTelemetryCount = mockTelemetryRepo.getTelemetryCount; getTelemetryCountByNode = mockTelemetryRepo.getTelemetryCountByNode; insertTelemetry = mockTelemetryRepo.insertTelemetry; getTelemetryByNode = mockTelemetryRepo.getTelemetryByNode; getPositionTelemetryByNode = mockTelemetryRepo.getPositionTelemetryByNode; getRecentEstimatedPositions = mockTelemetryRepo.getRecentEstimatedPositions; getSmartHopsStats = mockTelemetryRepo.getSmartHopsStats; getLinkQualityHistory = mockTelemetryRepo.getLinkQualityHistory; getAllNodesTelemetryTypes = mockTelemetryRepo.getAllNodesTelemetryTypes; deleteAllTelemetry = mockTelemetryRepo.deleteAllTelemetry; deleteOldTelemetry = mockTelemetryRepo.deleteOldTelemetry; deleteOldTelemetryWithFavorites = mockTelemetryRepo.deleteOldTelemetryWithFavorites; getLatestTelemetryForType = mockTelemetryRepo.getLatestTelemetryForType; getTelemetryByType = mockTelemetryRepo.getTelemetryByType; getLatestTelemetryValueForAllNodes = mockTelemetryRepo.getLatestTelemetryValueForAllNodes; },
-  AuthRepository: class { getAllUsers = mockAuthRepo.getAllUsers; createUser = mockAuthRepo.createUser; findUserById = mockAuthRepo.findUserById; findUserByUsername = mockAuthRepo.findUserByUsername; createAuditLogEntry = mockAuthRepo.createAuditLogEntry; getAuditLogs = mockAuthRepo.getAuditLogs; getUserPreferences = mockAuthRepo.getUserPreferences; setUserPreferences = mockAuthRepo.setUserPreferences; },
+  AuthRepository: class { getAllUsers = mockAuthRepo.getAllUsers; createUser = mockAuthRepo.createUser; findUserById = mockAuthRepo.findUserById; findUserByUsername = mockAuthRepo.findUserByUsername; createAuditLogEntry = mockAuthRepo.createAuditLogEntry; getAuditLogs = mockAuthRepo.getAuditLogs; getAuditLogsFiltered = mockAuthRepo.getAuditLogsFiltered; getAuditStats = mockAuthRepo.getAuditStats; cleanupOldAuditLogs = mockAuthRepo.cleanupOldAuditLogs; getUserPreferences = mockAuthRepo.getUserPreferences; setUserPreferences = mockAuthRepo.setUserPreferences; },
   TraceroutesRepository: class { getTraceroutes = mockTraceroutesRepo.getTraceroutes; insertTraceroute = mockTraceroutesRepo.insertTraceroute; },
   NeighborsRepository: class { getNeighbors = mockNeighborsRepo.getNeighbors; upsertNeighbor = mockNeighborsRepo.upsertNeighbor; },
   NotificationsRepository: class { getUserPreferences = mockNotificationsRepo.getUserPreferences; saveUserPreferences = mockNotificationsRepo.saveUserPreferences; getUsersWithServiceEnabled = mockNotificationsRepo.getUsersWithServiceEnabled; },
@@ -180,47 +193,6 @@ vi.mock('../db/repositories/index.js', () => ({
 }));
 
 // ─── Mock models ──────────────────────────────────────────────────────────────
-
-vi.mock('../server/models/User.js', () => ({
-  UserModel: class {
-    getUser = vi.fn().mockReturnValue(null);
-    getAllUsers = vi.fn().mockReturnValue([]);
-    createUser = vi.fn().mockReturnValue(1);
-    updateUser = vi.fn().mockReturnValue(true);
-    deleteUser = vi.fn().mockReturnValue(true);
-    validatePassword = vi.fn().mockReturnValue(false);
-    findByUsername = vi.fn().mockReturnValue(null);
-    findById = vi.fn().mockReturnValue(null);
-  },
-}));
-
-vi.mock('../server/models/Permission.js', () => ({
-  PermissionModel: class {
-    getPermissions = vi.fn().mockReturnValue([]);
-    setPermission = vi.fn().mockReturnValue(true);
-  },
-}));
-
-vi.mock('../server/models/APIToken.js', () => ({
-  APITokenModel: class {
-    getTokens = vi.fn().mockReturnValue([]);
-    createToken = vi.fn().mockReturnValue('token');
-    validateToken = vi.fn().mockReturnValue(null);
-  },
-}));
-
-// ─── Mock migrations ──────────────────────────────────────────────────────────
-
-vi.mock('../db/migrations.js', () => ({
-  registry: {
-    migrate: vi.fn(),
-    getAll: vi.fn().mockReturnValue([]),
-    getAppliedMigrations: vi.fn().mockReturnValue([]),
-  },
-}));
-
-// ─── Mock utilities ───────────────────────────────────────────────────────────
-
 vi.mock('../utils/logger.js', () => ({
   logger: {
     debug: vi.fn(),
@@ -509,12 +481,187 @@ describe('DatabaseService — getAuditLogsAsync', () => {
     (databaseService as any).authRepo = mockAuthRepo;
   });
 
-  it('returns result from getAuditLogsAsync (SQLite falls back to sync)', async () => {
-    // SQLite path calls getAuditLogs() which uses raw SQLite
+  it('returns result from getAuditLogsAsync via authRepo.getAuditLogsFiltered', async () => {
+    // Delegates unconditionally to authRepo.getAuditLogsFiltered across all backends
     const result = await databaseService.getAuditLogsAsync();
     // Result should be an object with logs array
     expect(result).toBeDefined();
     expect(result).toHaveProperty('logs');
     expect(Array.isArray(result.logs)).toBe(true);
+  });
+});
+
+// ─── checkPermissionAsync ─────────────────────────────────────────────────────
+
+describe('DatabaseService — checkPermissionAsync', () => {
+  // Custom auth mock with the methods checkPermissionAsync depends on
+  const permsAuthMock = {
+    getUserById: vi.fn(),
+    getPermissionsForUser: vi.fn(),
+  };
+
+  beforeEach(() => {
+    permsAuthMock.getUserById.mockReset();
+    permsAuthMock.getPermissionsForUser.mockReset();
+    (databaseService as any).authRepo = permsAuthMock;
+  });
+
+  describe('admin bypass', () => {
+    beforeEach(() => {
+      permsAuthMock.getUserById.mockResolvedValue({ id: 1, isAdmin: true });
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([]);
+    });
+
+    it('returns true for admin even with no perm rows', async () => {
+      const result = await databaseService.checkPermissionAsync(1, 'messages', 'read', 'src-A');
+      expect(result).toBe(true);
+      expect(permsAuthMock.getPermissionsForUser).not.toHaveBeenCalled();
+    });
+
+    it('returns true for admin on any sourceId', async () => {
+      const r1 = await databaseService.checkPermissionAsync(1, 'messages', 'read', 'src-A');
+      const r2 = await databaseService.checkPermissionAsync(1, 'messages', 'read', 'src-B');
+      const r3 = await databaseService.checkPermissionAsync(1, 'nodes', 'write', 'src-Z');
+      expect(r1).toBe(true);
+      expect(r2).toBe(true);
+      expect(r3).toBe(true);
+    });
+
+    it('returns true for admin without sourceId', async () => {
+      const result = await databaseService.checkPermissionAsync(1, 'messages', 'read');
+      expect(result).toBe(true);
+    });
+
+    it('returns true for admin even when perm rows have NULL sourceId (legacy)', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: null, canRead: true, canWrite: true },
+      ]);
+      const result = await databaseService.checkPermissionAsync(1, 'messages', 'read', 'src-X');
+      expect(result).toBe(true);
+    });
+  });
+
+  describe('non-admin per-source matching', () => {
+    beforeEach(() => {
+      permsAuthMock.getUserById.mockResolvedValue({ id: 5, isAdmin: false });
+    });
+
+    it('returns true when user has matching per-source canRead', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: 'src-A', canRead: true, canWrite: false, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-A');
+      expect(result).toBe(true);
+    });
+
+    it('returns false when matching row exists but action flag is false', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: 'src-A', canRead: false, canWrite: true, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-A');
+      expect(result).toBe(false);
+    });
+
+    it('returns false when only NULL-sourceId row exists (no fallback for non-admins)', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: null, canRead: true, canWrite: true, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-A');
+      expect(result).toBe(false);
+    });
+
+    it('returns false when user has perm on src-A but query is for src-B', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: 'src-A', canRead: true, canWrite: true, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-B');
+      expect(result).toBe(false);
+    });
+
+    it('returns false for unrelated resource', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'nodes', sourceId: 'src-A', canRead: true, canWrite: true, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-A');
+      expect(result).toBe(false);
+    });
+
+    it('correctly maps action=write to canWrite', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: 'src-A', canRead: false, canWrite: true, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'write', 'src-A');
+      expect(result).toBe(true);
+    });
+
+    it('correctly maps action=viewOnMap to canViewOnMap', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'nodes', sourceId: 'src-A', canRead: false, canWrite: false, canViewOnMap: true },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'nodes', 'viewOnMap', 'src-A');
+      expect(result).toBe(true);
+    });
+
+    it('returns false for unknown action', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: 'src-A', canRead: true, canWrite: true, canViewOnMap: true },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'delete' as any, 'src-A');
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('non-admin without sourceId argument', () => {
+    beforeEach(() => {
+      permsAuthMock.getUserById.mockResolvedValue({ id: 5, isAdmin: false });
+    });
+
+    it('returns true if user has the permission on ANY source', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: 'src-A', canRead: false, canWrite: false, canViewOnMap: false },
+        { resource: 'messages', sourceId: 'src-B', canRead: true, canWrite: false, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read');
+      expect(result).toBe(true);
+    });
+
+    it('returns false if user only has NULL-source rows (legacy non-admin)', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([
+        { resource: 'messages', sourceId: null, canRead: true, canWrite: true, canViewOnMap: false },
+      ]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read');
+      expect(result).toBe(false);
+    });
+
+    it('returns false if user has no rows at all', async () => {
+      permsAuthMock.getPermissionsForUser.mockResolvedValue([]);
+      const result = await databaseService.checkPermissionAsync(5, 'messages', 'read');
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('cross-user isolation', () => {
+    it('different users get independent results', async () => {
+      permsAuthMock.getUserById.mockImplementation(async (id: number) =>
+        id === 1 ? { id: 1, isAdmin: true } : { id, isAdmin: false }
+      );
+      permsAuthMock.getPermissionsForUser.mockImplementation(async (id: number) => {
+        if (id === 5) return [{ resource: 'messages', sourceId: 'src-A', canRead: true, canWrite: false, canViewOnMap: false }];
+        if (id === 6) return [{ resource: 'messages', sourceId: 'src-B', canRead: true, canWrite: false, canViewOnMap: false }];
+        return [];
+      });
+
+      // Admin: always true
+      expect(await databaseService.checkPermissionAsync(1, 'messages', 'read', 'src-A')).toBe(true);
+      expect(await databaseService.checkPermissionAsync(1, 'messages', 'read', 'src-B')).toBe(true);
+      // User 5: only src-A
+      expect(await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-A')).toBe(true);
+      expect(await databaseService.checkPermissionAsync(5, 'messages', 'read', 'src-B')).toBe(false);
+      // User 6: only src-B
+      expect(await databaseService.checkPermissionAsync(6, 'messages', 'read', 'src-A')).toBe(false);
+      expect(await databaseService.checkPermissionAsync(6, 'messages', 'read', 'src-B')).toBe(true);
+      // User 7: nothing
+      expect(await databaseService.checkPermissionAsync(7, 'messages', 'read', 'src-A')).toBe(false);
+    });
   });
 });

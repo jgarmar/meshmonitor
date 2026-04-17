@@ -4,7 +4,7 @@
  * Handles solar estimates and auto-traceroute nodes database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, desc, asc, and, gte, lte, lt, inArray, sql, isNull } from 'drizzle-orm';
+import { eq, desc, asc, and, gte, lte, lt, inArray, notInArray, sql, isNull } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType, DbCustomTheme, DbPacketLog, DbPacketCountByNode, DbPacketCountByPortnum, DbDistinctRelayNode } from '../types.js';
 import { logger } from '../../utils/logger.js';
@@ -868,24 +868,25 @@ export class MiscRepository extends BaseRepository {
    */
   private buildPacketLogWhere(options: PacketLogFilterOptions): { conditions: any[]; } {
     const conditions: any[] = [];
-    const { portnum, from_node, to_node, channel, encrypted, since, relay_node } = options;
+    const { portnum, from_node, to_node, channel, encrypted, since, relay_node, sourceId } = options;
 
-    if (portnum !== undefined) conditions.push(sql`portnum = ${portnum}`);
-    if (from_node !== undefined) conditions.push(sql`from_node = ${from_node}`);
-    if (to_node !== undefined) conditions.push(sql`to_node = ${to_node}`);
-    if (channel !== undefined) conditions.push(sql`channel = ${channel}`);
+    if (sourceId !== undefined) conditions.push(sql`pl.${sql.identifier('sourceId')} = ${sourceId}`);
+    if (portnum !== undefined) conditions.push(sql`pl.portnum = ${portnum}`);
+    if (from_node !== undefined) conditions.push(sql`pl.from_node = ${from_node}`);
+    if (to_node !== undefined) conditions.push(sql`pl.to_node = ${to_node}`);
+    if (channel !== undefined) conditions.push(sql`pl.channel = ${channel}`);
     if (encrypted !== undefined) {
       if (this.isSQLite()) {
-        conditions.push(sql`encrypted = ${encrypted ? 1 : 0}`);
+        conditions.push(sql`pl.encrypted = ${encrypted ? 1 : 0}`);
       } else {
-        conditions.push(sql`encrypted = ${encrypted}`);
+        conditions.push(sql`pl.encrypted = ${encrypted}`);
       }
     }
-    if (since !== undefined) conditions.push(sql`timestamp >= ${since}`);
+    if (since !== undefined) conditions.push(sql`pl.timestamp >= ${since}`);
     if (relay_node === 'unknown') {
-      conditions.push(sql`relay_node IS NULL`);
+      conditions.push(sql`pl.relay_node IS NULL`);
     } else if (relay_node !== undefined) {
-      conditions.push(sql`relay_node = ${relay_node}`);
+      conditions.push(sql`pl.relay_node = ${relay_node}`);
     }
 
     return { conditions };
@@ -1050,7 +1051,7 @@ export class MiscRepository extends BaseRepository {
 
     try {
       const rows = await this.executeQuery(
-        sql`SELECT COUNT(*) as count FROM packet_log WHERE ${whereClause}`
+        sql`SELECT COUNT(*) as count FROM packet_log pl WHERE ${whereClause}`
       );
       return Number(rows[0]?.count ?? 0);
     } catch (error) {
@@ -1100,14 +1101,16 @@ export class MiscRepository extends BaseRepository {
    * relay_node is only the last byte of the node ID per the Meshtastic protobuf spec.
    * We match by (nodeNum & 0xFF) to find candidate node names.
    */
-  async getDistinctRelayNodes(): Promise<DbDistinctRelayNode[]> {
-    const distinctQuery = 'SELECT DISTINCT relay_node FROM packet_log WHERE relay_node IS NOT NULL';
+  async getDistinctRelayNodes(sourceId?: string): Promise<DbDistinctRelayNode[]> {
     const longName = this.col('longName');
     const shortName = this.col('shortName');
     const nodeNum = this.col('nodeNum');
 
     try {
-      const distinctRows = await this.executeQuery(sql.raw(distinctQuery));
+      const conditions: any[] = [sql`relay_node IS NOT NULL`];
+      if (sourceId !== undefined) conditions.push(sql`${sql.identifier('sourceId')} = ${sourceId}`);
+      const whereClause = this.combineConditions(conditions);
+      const distinctRows = await this.executeQuery(sql`SELECT DISTINCT relay_node FROM packet_log WHERE ${whereClause}`);
       const relayValues = (distinctRows as any[]).map((r: any) => Number(r.relay_node));
 
       const results: DbDistinctRelayNode[] = [];
@@ -1168,14 +1171,411 @@ export class MiscRepository extends BaseRepository {
   }
 
   /**
+   * Synchronously clear all packet log rows (SQLite only).
+   * Returns number of rows deleted.
+   */
+  clearPacketLogsSync(): number {
+    const db = this.getSqliteDb();
+    const result = db.run(sql`DELETE FROM packet_log`) as any;
+    const changes = Number(result?.changes ?? 0);
+    logger.debug(`[MiscRepository] Cleared ${changes} packet log entries (sync)`);
+    return changes;
+  }
+
+  /**
+   * Synchronously cleanup packet logs older than cutoffTimestamp (SQLite only).
+   * Returns number of rows deleted.
+   */
+  cleanupOldPacketLogsSync(cutoffTimestamp: number): number {
+    const db = this.getSqliteDb();
+    const result = db.run(sql`DELETE FROM packet_log WHERE timestamp < ${cutoffTimestamp}`) as any;
+    return Number(result?.changes ?? 0);
+  }
+
+  /**
+   * Synchronously get packet counts per from_node since a given timestamp,
+   * excluding internal traffic. (SQLite only.)
+   */
+  getPacketCountsPerNodeSinceSync(options: {
+    since: number;
+    localNodeNum: number | null;
+  }): Array<{ nodeNum: number; packetCount: number }> {
+    const db = this.getSqliteDb();
+    const { since, localNodeNum } = options;
+    const ln = localNodeNum ?? -1;
+    const rows = db.all(sql`
+      SELECT from_node as nodeNum, COUNT(*) as packetCount
+      FROM packet_log
+      WHERE timestamp >= ${since}
+        AND NOT (from_node = ${ln} AND to_node = ${ln})
+      GROUP BY from_node
+    `) as any[];
+    return rows.map((r: any) => ({
+      nodeNum: Number(r.nodeNum),
+      packetCount: Number(r.packetCount),
+    }));
+  }
+
+  // ============ auto_traceroute_log async methods (all backends) ============
+
+  /**
+   * Get the most recent auto-traceroute log rows (all backends).
+   * Boolean success is returned (null preserved).
+   */
+  async getAutoTracerouteLog(limit: number = 10, sourceId?: string): Promise<Array<{
+    id: number;
+    timestamp: number;
+    toNodeNum: number;
+    toNodeName: string | null;
+    success: boolean | null;
+  }>> {
+    try {
+      const { autoTracerouteLog } = this.tables;
+      const query = this.db
+        .select({
+          id: autoTracerouteLog.id,
+          timestamp: autoTracerouteLog.timestamp,
+          toNodeNum: autoTracerouteLog.toNodeNum,
+          toNodeName: autoTracerouteLog.toNodeName,
+          success: autoTracerouteLog.success,
+        })
+        .from(autoTracerouteLog);
+      const scoped = sourceId !== undefined
+        ? query.where(eq(autoTracerouteLog.sourceId, sourceId))
+        : query;
+      const rows = await scoped
+        .orderBy(desc(autoTracerouteLog.timestamp))
+        .limit(limit);
+      return (rows as any[]).map((r: any) => ({
+        id: Number(r.id),
+        timestamp: Number(r.timestamp),
+        toNodeNum: Number(r.toNodeNum),
+        toNodeName: r.toNodeName ?? null,
+        success: r.success === null || r.success === undefined ? null : Boolean(r.success),
+      }));
+    } catch (error) {
+      logger.error(`[MiscRepository] Failed to get auto traceroute log: ${error}`);
+      return [];
+    }
+  }
+
+  /**
+   * Insert an auto-traceroute attempt row and prune to the last 100 entries.
+   * Returns the inserted row id. Works for SQLite/Postgres/MySQL.
+   */
+  async logAutoTracerouteAttempt(toNodeNum: number, toNodeName: string | null, sourceId?: string): Promise<number> {
+    try {
+      const { autoTracerouteLog } = this.tables;
+      const now = Date.now();
+      const values: any = {
+        timestamp: now,
+        toNodeNum,
+        toNodeName,
+        success: null,
+        createdAt: now,
+        sourceId: sourceId ?? null,
+      };
+
+      let insertedId = 0;
+      if (this.isPostgres()) {
+        const result = await (this.db.insert(autoTracerouteLog).values(values) as any).returning({ id: autoTracerouteLog.id });
+        insertedId = Number((result as any[])[0]?.id ?? 0);
+      } else if (this.isMySQL()) {
+        const result = await this.db.insert(autoTracerouteLog).values(values);
+        insertedId = Number((result as any)?.[0]?.insertId ?? 0);
+      } else {
+        const result = await this.db.insert(autoTracerouteLog).values(values);
+        insertedId = Number((result as any)?.lastInsertRowid ?? 0);
+      }
+
+      // Prune older rows beyond the 100 most recent.
+      const keepRows = await this.db
+        .select({ id: autoTracerouteLog.id })
+        .from(autoTracerouteLog)
+        .orderBy(desc(autoTracerouteLog.timestamp))
+        .limit(100);
+      const keepIds = (keepRows as any[]).map((r) => Number(r.id));
+      if (keepIds.length > 0) {
+        await this.db
+          .delete(autoTracerouteLog)
+          .where(notInArray(autoTracerouteLog.id, keepIds));
+      }
+
+      return insertedId;
+    } catch (error) {
+      logger.error(`[MiscRepository] Failed to log auto traceroute attempt: ${error}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Update the most recent pending auto-traceroute log row for a given
+   * destination node across all backends.
+   */
+  async updateAutoTracerouteResultByNode(toNodeNum: number, success: boolean): Promise<void> {
+    try {
+      const { autoTracerouteLog } = this.tables;
+      const rows = await this.db
+        .select({ id: autoTracerouteLog.id })
+        .from(autoTracerouteLog)
+        .where(and(eq(autoTracerouteLog.toNodeNum, toNodeNum), isNull(autoTracerouteLog.success))!)
+        .orderBy(desc(autoTracerouteLog.timestamp))
+        .limit(1);
+      if ((rows as any[]).length > 0) {
+        const id = Number(((rows as any[])[0]).id);
+        await this.db
+          .update(autoTracerouteLog)
+          .set({ success: success ? 1 : 0 } as any)
+          .where(eq(autoTracerouteLog.id, id));
+      }
+    } catch (error) {
+      logger.error(`[MiscRepository] Failed to update auto traceroute result: ${error}`);
+    }
+  }
+
+  // ============ auto_traceroute_nodes sync methods (SQLite only) ============
+
+  /**
+   * Synchronously get the list of auto-traceroute node nums ordered by
+   * creation time ascending (SQLite only).
+   */
+  getAutoTracerouteNodesSync(): number[] {
+    const db = this.getSqliteDb();
+    const { autoTracerouteNodes } = this.tables;
+    const rows = db
+      .select({ nodeNum: autoTracerouteNodes.nodeNum })
+      .from(autoTracerouteNodes)
+      .orderBy(asc(autoTracerouteNodes.createdAt))
+      .all();
+    return (rows as any[]).map((r) => Number(r.nodeNum));
+  }
+
+  /**
+   * Synchronously replace the auto-traceroute nodes set in a single
+   * transaction (SQLite only). Bad nodeNums are skipped.
+   */
+  setAutoTracerouteNodesSync(nodeNums: number[]): void {
+    const db = this.getSqliteDb();
+    const { autoTracerouteNodes } = this.tables;
+    const now = Date.now();
+    db.transaction((tx) => {
+      tx.delete(autoTracerouteNodes).run();
+      for (const nodeNum of nodeNums) {
+        try {
+          tx.insert(autoTracerouteNodes)
+            .values({ nodeNum, createdAt: now } as any)
+            .run();
+        } catch (error) {
+          logger.debug(`Skipping invalid nodeNum: ${nodeNum}`, error);
+        }
+      }
+    });
+  }
+
+  // ============ auto_traceroute_log sync methods (SQLite only) ============
+
+  /**
+   * Synchronously insert an auto-traceroute attempt row and prune to the last
+   * 100 entries (SQLite only). Returns the inserted row id.
+   */
+  logAutoTracerouteAttemptSync(toNodeNum: number, toNodeName: string | null, sourceId?: string): number {
+    const db = this.getSqliteDb();
+    const { autoTracerouteLog } = this.tables;
+    const now = Date.now();
+    const result = db
+      .insert(autoTracerouteLog)
+      .values({
+        timestamp: now,
+        toNodeNum,
+        toNodeName,
+        success: null,
+        createdAt: now,
+        sourceId: sourceId ?? null,
+      } as any)
+      .run() as any;
+
+    // Prune older rows beyond the 100 most recent.
+    const keepRows = db
+      .select({ id: autoTracerouteLog.id })
+      .from(autoTracerouteLog)
+      .orderBy(desc(autoTracerouteLog.timestamp))
+      .limit(100)
+      .all();
+    const keepIds = (keepRows as any[]).map((r) => Number(r.id));
+    if (keepIds.length > 0) {
+      db.delete(autoTracerouteLog)
+        .where(sql`id NOT IN (${sql.join(keepIds.map((id) => sql`${id}`), sql`, `)})`)
+        .run();
+    }
+
+    return Number(result?.lastInsertRowid ?? 0);
+  }
+
+  /**
+   * Synchronously mark an auto-traceroute log row's success flag (SQLite only).
+   */
+  updateAutoTracerouteResultSync(logId: number, success: boolean): void {
+    const db = this.getSqliteDb();
+    const { autoTracerouteLog } = this.tables;
+    db.update(autoTracerouteLog)
+      .set({ success: success ? 1 : 0 } as any)
+      .where(eq(autoTracerouteLog.id, logId))
+      .run();
+  }
+
+  /**
+   * Synchronously update the most recent pending auto-traceroute log row for
+   * a given destination node (SQLite only).
+   */
+  updateAutoTracerouteResultByNodeSync(toNodeNum: number, success: boolean): void {
+    const db = this.getSqliteDb();
+    const { autoTracerouteLog } = this.tables;
+    const rows = db
+      .select({ id: autoTracerouteLog.id })
+      .from(autoTracerouteLog)
+      .where(and(eq(autoTracerouteLog.toNodeNum, toNodeNum), isNull(autoTracerouteLog.success))!)
+      .orderBy(desc(autoTracerouteLog.timestamp))
+      .limit(1)
+      .all();
+    if (rows.length > 0) {
+      const id = Number((rows[0] as any).id);
+      db.update(autoTracerouteLog)
+        .set({ success: success ? 1 : 0 } as any)
+        .where(eq(autoTracerouteLog.id, id))
+        .run();
+    }
+  }
+
+  /**
+   * Synchronously fetch the most recent auto-traceroute log rows (SQLite only).
+   * Boolean success is returned (null preserved).
+   */
+  getAutoTracerouteLogSync(limit: number = 10, sourceId?: string): Array<{
+    id: number;
+    timestamp: number;
+    toNodeNum: number;
+    toNodeName: string | null;
+    success: boolean | null;
+  }> {
+    const db = this.getSqliteDb();
+    const { autoTracerouteLog } = this.tables;
+    const query = db
+      .select({
+        id: autoTracerouteLog.id,
+        timestamp: autoTracerouteLog.timestamp,
+        toNodeNum: autoTracerouteLog.toNodeNum,
+        toNodeName: autoTracerouteLog.toNodeName,
+        success: autoTracerouteLog.success,
+      })
+      .from(autoTracerouteLog);
+    const rows = (sourceId !== undefined
+      ? query.where(eq(autoTracerouteLog.sourceId, sourceId))
+      : query)
+      .orderBy(desc(autoTracerouteLog.timestamp))
+      .limit(limit)
+      .all();
+    return (rows as any[]).map((r: any) => ({
+      id: Number(r.id),
+      timestamp: Number(r.timestamp),
+      toNodeNum: Number(r.toNodeNum),
+      toNodeName: r.toNodeName ?? null,
+      success: r.success === null || r.success === undefined ? null : r.success === 1,
+    }));
+  }
+
+  /**
+   * Get packet counts per from_node since a given timestamp, excluding internal
+   * traffic (packets where both ends are the local node). Used for spam
+   * detection / last-hour broadcaster stats.
+   */
+  async getPacketCountsPerNodeSince(options: {
+    since: number;
+    localNodeNum: number | null;
+    sourceId?: string;
+  }): Promise<Array<{ nodeNum: number; packetCount: number }>> {
+    const { since, localNodeNum, sourceId } = options;
+    const ln = localNodeNum ?? -1;
+    try {
+      const conditions: any[] = [
+        sql`timestamp >= ${since}`,
+        sql`NOT (from_node = ${ln} AND to_node = ${ln})`,
+      ];
+      if (sourceId !== undefined) conditions.push(sql`${sql.identifier('sourceId')} = ${sourceId}`);
+      const whereClause = this.combineConditions(conditions);
+
+      const rows = await this.executeQuery(sql`
+        SELECT from_node as "nodeNum", COUNT(*) as "packetCount"
+        FROM packet_log
+        WHERE ${whereClause}
+        GROUP BY from_node
+      `);
+
+      return (rows as any[]).map((r: any) => ({
+        nodeNum: Number(r.nodeNum ?? r.nodenum),
+        packetCount: Number(r.packetCount ?? r.packetcount),
+      }));
+    } catch (error) {
+      logger.error('[MiscRepository] Failed to get packet counts per node since:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get top N broadcasters by packet count since a given timestamp, excluding
+   * internal traffic (packets where both ends are the local node).
+   */
+  async getTopBroadcastersSince(options: {
+    since: number;
+    limit: number;
+    localNodeNum: number | null;
+    sourceId?: string;
+  }): Promise<Array<{ nodeNum: number; shortName: string | null; longName: string | null; packetCount: number }>> {
+    const { since, limit, localNodeNum, sourceId } = options;
+    const ln = localNodeNum ?? -1;
+    try {
+      const longName = this.col('longName');
+      const shortName = this.col('shortName');
+      const nodeNum = this.col('nodeNum');
+
+      const conditions: any[] = [
+        sql`p.timestamp >= ${since}`,
+        sql`NOT (p.from_node = ${ln} AND p.to_node = ${ln})`,
+      ];
+      if (sourceId !== undefined) conditions.push(sql`p.${sql.identifier('sourceId')} = ${sourceId}`);
+      const whereClause = this.combineConditions(conditions);
+
+      const rows = await this.executeQuery(sql`
+        SELECT p.from_node as "nodeNum", n.${shortName} as "shortName", n.${longName} as "longName", COUNT(*) as "packetCount"
+        FROM packet_log p
+        LEFT JOIN nodes n ON p.from_node = n.${nodeNum}
+        WHERE ${whereClause}
+        GROUP BY p.from_node, n.${shortName}, n.${longName}
+        ORDER BY "packetCount" DESC
+        LIMIT ${limit}
+      `);
+
+      return (rows as any[]).map((r: any) => ({
+        nodeNum: Number(r.nodeNum ?? r.nodenum),
+        shortName: r.shortName ?? r.shortname ?? null,
+        longName: r.longName ?? r.longname ?? null,
+        packetCount: Number(r.packetCount ?? r.packetcount),
+      }));
+    } catch (error) {
+      logger.error('[MiscRepository] Failed to get top broadcasters since:', error);
+      return [];
+    }
+  }
+
+  /**
    * Get packet counts grouped by from_node (for distribution charts).
    * Returns top N nodes by packet count.
    */
-  async getPacketCountsByNode(options?: { since?: number; limit?: number; portnum?: number }): Promise<DbPacketCountByNode[]> {
-    const { since, limit = 10, portnum } = options || {};
+  async getPacketCountsByNode(options?: { since?: number; limit?: number; portnum?: number; sourceId?: string }): Promise<DbPacketCountByNode[]> {
+    const { since, limit = 10, portnum, sourceId } = options || {};
 
     try {
       const conditions: any[] = [];
+      if (sourceId !== undefined) conditions.push(sql`pl.${sql.identifier('sourceId')} = ${sourceId}`);
       if (since !== undefined) conditions.push(sql`pl.timestamp >= ${since}`);
       if (portnum !== undefined) conditions.push(sql`pl.portnum = ${portnum}`);
       const whereClause = conditions.length > 0 ? this.combineConditions(conditions) : sql`1=1`;
@@ -1210,11 +1610,12 @@ export class MiscRepository extends BaseRepository {
    * Get packet counts grouped by portnum (for distribution charts).
    * Includes port name from meshtastic constants.
    */
-  async getPacketCountsByPortnum(options?: { since?: number; from_node?: number }): Promise<DbPacketCountByPortnum[]> {
-    const { since, from_node } = options || {};
+  async getPacketCountsByPortnum(options?: { since?: number; from_node?: number; sourceId?: string }): Promise<DbPacketCountByPortnum[]> {
+    const { since, from_node, sourceId } = options || {};
 
     try {
       const conditions: any[] = [];
+      if (sourceId !== undefined) conditions.push(sql`${sql.identifier('sourceId')} = ${sourceId}`);
       if (since !== undefined) conditions.push(sql`timestamp >= ${since}`);
       if (from_node !== undefined) conditions.push(sql`from_node = ${from_node}`);
       const whereClause = conditions.length > 0 ? this.combineConditions(conditions) : sql`1=1`;
@@ -1245,26 +1646,28 @@ export class MiscRepository extends BaseRepository {
    */
   async getMapPreferences(userId: number): Promise<Record<string, any> | null> {
     try {
-      const userIdCol = this.dbType === 'postgres' ? '"userId"' : 'userId';
-      const rows = await this.executeQuery(
-        sql.raw(`SELECT * FROM user_map_preferences WHERE ${userIdCol} = ${userId} LIMIT 1`)
-      );
+      const table = this.tables.userMapPreferences;
+      const rows = await this.db
+        .select()
+        .from(table)
+        .where(eq(table.userId, userId))
+        .limit(1);
 
       if (rows.length === 0) return null;
       const row = rows[0] as any;
 
       return {
-        mapTileset: row.map_tileset ?? row.mapTileset ?? null,
-        showPaths: Boolean(row.show_paths ?? row.showPaths ?? false),
-        showNeighborInfo: Boolean(row.show_neighbor_info ?? row.showNeighborInfo ?? false),
-        showRoute: Boolean(row.show_route ?? row.showRoute ?? true),
-        showMotion: Boolean(row.show_motion ?? row.showMotion ?? true),
-        showMqttNodes: Boolean(row.show_mqtt_nodes ?? row.showMqttNodes ?? true),
-        showMeshCoreNodes: Boolean(row.show_meshcore_nodes ?? row.showMeshCoreNodes ?? true),
-        showAnimations: Boolean(row.show_animations ?? row.showAnimations ?? false),
-        showAccuracyRegions: Boolean(row.show_accuracy_regions ?? row.showAccuracyRegions ?? false),
-        showEstimatedPositions: Boolean(row.show_estimated_positions ?? row.showEstimatedPositions ?? false),
-        positionHistoryHours: row.position_history_hours ?? row.positionHistoryHours ?? null,
+        mapTileset: row.mapTileset ?? null,
+        showPaths: row.showPaths ?? false,
+        showNeighborInfo: row.showNeighborInfo ?? false,
+        showRoute: row.showRoute ?? true,
+        showMotion: row.showMotion ?? true,
+        showMqttNodes: row.showMqttNodes ?? true,
+        showMeshCoreNodes: row.showMeshcoreNodes ?? true,
+        showAnimations: row.showAnimations ?? false,
+        showAccuracyRegions: row.showAccuracyRegions ?? false,
+        showEstimatedPositions: row.showEstimatedPositions ?? false,
+        positionHistoryHours: row.positionHistoryHours ?? null,
       };
     } catch (error) {
       logger.error('[MiscRepository] Failed to get map preferences:', error);
@@ -1274,8 +1677,6 @@ export class MiscRepository extends BaseRepository {
 
   /**
    * Save map preferences for a user (upsert).
-   * Uses raw SQL via Drizzle's sql template to avoid referencing columns that
-   * may not exist across all upgrade paths (the schema varies by migration state).
    */
   async saveMapPreferences(userId: number, preferences: {
     mapTileset?: string;
@@ -1291,68 +1692,282 @@ export class MiscRepository extends BaseRepository {
     positionHistoryHours?: number | null;
   }): Promise<void> {
     try {
-      // Use the userId column name based on database type
-      // SQLite baseline uses userId (camelCase), PG/MySQL also use userId
-      const userIdCol = this.dbType === 'postgres' ? '"userId"' : 'userId';
+      const table = this.tables.userMapPreferences;
+      const existing = await this.db
+        .select({ id: table.id })
+        .from(table)
+        .where(eq(table.userId, userId))
+        .limit(1);
 
-      // Check if preferences exist
-      const existing = await this.executeQuery(
-        sql.raw(`SELECT id FROM user_map_preferences WHERE ${userIdCol} = ${userId} LIMIT 1`)
-      );
-      const hasExisting = existing.length > 0;
+      if (existing.length > 0) {
+        const set: Record<string, any> = {};
+        if (preferences.mapTileset !== undefined) set.mapTileset = preferences.mapTileset;
+        if (preferences.showPaths !== undefined) set.showPaths = preferences.showPaths;
+        if (preferences.showNeighborInfo !== undefined) set.showNeighborInfo = preferences.showNeighborInfo;
+        if (preferences.showRoute !== undefined) set.showRoute = preferences.showRoute;
+        if (preferences.showMotion !== undefined) set.showMotion = preferences.showMotion;
+        if (preferences.showMqttNodes !== undefined) set.showMqttNodes = preferences.showMqttNodes;
+        if (preferences.showMeshCoreNodes !== undefined) set.showMeshcoreNodes = preferences.showMeshCoreNodes;
+        if (preferences.showAnimations !== undefined) set.showAnimations = preferences.showAnimations;
+        if (preferences.showAccuracyRegions !== undefined) set.showAccuracyRegions = preferences.showAccuracyRegions;
+        if (preferences.showEstimatedPositions !== undefined) set.showEstimatedPositions = preferences.showEstimatedPositions;
+        if (preferences.positionHistoryHours !== undefined) set.positionHistoryHours = preferences.positionHistoryHours;
 
-      if (hasExisting) {
-        // Build dynamic UPDATE — only set columns that were provided
-        // PG uses boolean type (true/false), SQLite/MySQL use integer (1/0)
-        const bv = (v: boolean) => this.dbType === 'postgres' ? String(v) : (v ? '1' : '0');
-        const sets: string[] = [];
-        if (preferences.mapTileset !== undefined) sets.push(`map_tileset = '${preferences.mapTileset.replace(/'/g, "''")}'`);
-        if (preferences.showPaths !== undefined) sets.push(`show_paths = ${bv(preferences.showPaths)}`);
-        if (preferences.showNeighborInfo !== undefined) sets.push(`show_neighbor_info = ${bv(preferences.showNeighborInfo)}`);
-        if (preferences.showRoute !== undefined) sets.push(`show_route = ${bv(preferences.showRoute)}`);
-        if (preferences.showMotion !== undefined) sets.push(`show_motion = ${bv(preferences.showMotion)}`);
-        if (preferences.showMqttNodes !== undefined) sets.push(`show_mqtt_nodes = ${bv(preferences.showMqttNodes)}`);
-        if (preferences.showMeshCoreNodes !== undefined) sets.push(`show_meshcore_nodes = ${bv(preferences.showMeshCoreNodes)}`);
-        if (preferences.showAnimations !== undefined) sets.push(`show_animations = ${bv(preferences.showAnimations)}`);
-        if (preferences.showAccuracyRegions !== undefined) sets.push(`show_accuracy_regions = ${bv(preferences.showAccuracyRegions)}`);
-        if (preferences.showEstimatedPositions !== undefined) sets.push(`show_estimated_positions = ${bv(preferences.showEstimatedPositions)}`);
-        if (preferences.positionHistoryHours !== undefined) sets.push(`position_history_hours = ${preferences.positionHistoryHours ?? 'NULL'}`);
-
-        if (sets.length > 0) {
-          await this.executeRun(
-            sql.raw(`UPDATE user_map_preferences SET ${sets.join(', ')} WHERE ${userIdCol} = ${userId}`)
-          );
+        if (Object.keys(set).length > 0) {
+          await this.db.update(table).set(set).where(eq(table.userId, userId));
         }
       } else {
-        // INSERT — reference feature columns + createdAt/updatedAt (NOT NULL in all baselines)
-        // Quote createdAt/updatedAt for Postgres (case-sensitive identifiers)
-        // PG uses boolean type (true/false), SQLite/MySQL use integer (1/0)
-        const boolVal = (v: boolean | undefined, def: boolean) => {
-          const val = v !== undefined ? v : def;
-          return this.dbType === 'postgres' ? String(val) : (val ? '1' : '0');
-        };
         const now = Date.now();
-        const q = this.dbType === 'postgres' ? '"' : '';
-        await this.executeRun(
-          sql.raw(`INSERT INTO user_map_preferences (
-            ${userIdCol}, map_tileset, show_paths, show_neighbor_info, show_route, show_motion,
-            show_mqtt_nodes, show_meshcore_nodes, show_animations, show_accuracy_regions,
-            show_estimated_positions, position_history_hours, ${q}createdAt${q}, ${q}updatedAt${q}
-          ) VALUES (
-            ${userId}, ${preferences.mapTileset ? `'${preferences.mapTileset.replace(/'/g, "''")}'` : 'NULL'},
-            ${boolVal(preferences.showPaths, false)}, ${boolVal(preferences.showNeighborInfo, false)},
-            ${boolVal(preferences.showRoute, true)}, ${boolVal(preferences.showMotion, true)},
-            ${boolVal(preferences.showMqttNodes, true)}, ${boolVal(preferences.showMeshCoreNodes, true)},
-            ${boolVal(preferences.showAnimations, false)}, ${boolVal(preferences.showAccuracyRegions, false)},
-            ${boolVal(preferences.showEstimatedPositions, true)}, ${preferences.positionHistoryHours ?? 'NULL'},
-            ${now}, ${now}
-          )`)
-        );
+        await this.db.insert(table).values({
+          userId,
+          mapTileset: preferences.mapTileset ?? null,
+          showPaths: preferences.showPaths ?? false,
+          showNeighborInfo: preferences.showNeighborInfo ?? false,
+          showRoute: preferences.showRoute ?? true,
+          showMotion: preferences.showMotion ?? true,
+          showMqttNodes: preferences.showMqttNodes ?? true,
+          showMeshcoreNodes: preferences.showMeshCoreNodes ?? true,
+          showAnimations: preferences.showAnimations ?? false,
+          showAccuracyRegions: preferences.showAccuracyRegions ?? false,
+          showEstimatedPositions: preferences.showEstimatedPositions ?? true,
+          positionHistoryHours: preferences.positionHistoryHours ?? null,
+          createdAt: now,
+          updatedAt: now,
+        });
       }
     } catch (error) {
       logger.error('[MiscRepository] Failed to save map preferences:', error);
       throw error;
     }
+  }
+
+  // =============================================================================
+  // Key Repair State / Log — SQLite sync variants
+  // (async multi-dialect versions still live on DatabaseService for now)
+  // =============================================================================
+
+  /**
+   * SQLite-only sync fetch of key repair state.
+   */
+  getKeyRepairStateSqlite(nodeNum: number): {
+    nodeNum: number;
+    attemptCount: number;
+    lastAttemptTime: number | null;
+    exhausted: boolean;
+    startedAt: number;
+  } | null {
+    if (!this.sqliteDb) throw new Error('getKeyRepairStateSqlite is SQLite-only');
+    const db = this.sqliteDb;
+    const t = (this.tables as any).autoKeyRepairState;
+    const rows = db
+      .select({
+        nodeNum: t.nodeNum,
+        attemptCount: t.attemptCount,
+        lastAttemptTime: t.lastAttemptTime,
+        exhausted: t.exhausted,
+        startedAt: t.startedAt,
+      })
+      .from(t)
+      .where(eq(t.nodeNum, nodeNum))
+      .limit(1)
+      .all() as Array<{
+        nodeNum: number;
+        attemptCount: number;
+        lastAttemptTime: number | null;
+        exhausted: number;
+        startedAt: number;
+      }>;
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      nodeNum: Number(r.nodeNum),
+      attemptCount: Number(r.attemptCount ?? 0),
+      lastAttemptTime: r.lastAttemptTime != null ? Number(r.lastAttemptTime) : null,
+      exhausted: Number(r.exhausted) === 1,
+      startedAt: Number(r.startedAt),
+    };
+  }
+
+  /**
+   * SQLite-only sync upsert of key repair state (mirrors legacy facade logic).
+   */
+  setKeyRepairStateSqlite(
+    nodeNum: number,
+    state: { attemptCount?: number; lastAttemptTime?: number; exhausted?: boolean; startedAt?: number },
+    existing: { attemptCount: number; lastAttemptTime: number | null; exhausted: boolean } | null,
+  ): void {
+    if (!this.sqliteDb) throw new Error('setKeyRepairStateSqlite is SQLite-only');
+    const db = this.sqliteDb;
+    const t = (this.tables as any).autoKeyRepairState;
+    const now = Date.now();
+
+    if (existing) {
+      db.update(t)
+        .set({
+          attemptCount: state.attemptCount ?? existing.attemptCount,
+          lastAttemptTime: state.lastAttemptTime ?? existing.lastAttemptTime,
+          exhausted: (state.exhausted ?? existing.exhausted) ? 1 : 0,
+        })
+        .where(eq(t.nodeNum, nodeNum))
+        .run();
+    } else {
+      db.insert(t).values({
+        nodeNum,
+        attemptCount: state.attemptCount ?? 0,
+        lastAttemptTime: state.lastAttemptTime ?? null,
+        exhausted: (state.exhausted ?? false) ? 1 : 0,
+        startedAt: state.startedAt ?? now,
+      }).run();
+    }
+  }
+
+  /**
+   * SQLite-only sync delete of key repair state.
+   */
+  clearKeyRepairStateSqlite(nodeNum: number): void {
+    if (!this.sqliteDb) throw new Error('clearKeyRepairStateSqlite is SQLite-only');
+    const db = this.sqliteDb;
+    const t = (this.tables as any).autoKeyRepairState;
+    db.delete(t).where(eq(t.nodeNum, nodeNum)).run();
+  }
+
+  /**
+   * SQLite-only sync list of nodes needing key repair — joins the nodes table
+   * to pick up nodeId/longName/shortName.
+   */
+  getNodesNeedingKeyRepairSqlite(): Array<{
+    nodeNum: number;
+    nodeId: string;
+    longName: string | null;
+    shortName: string | null;
+    attemptCount: number;
+    lastAttemptTime: number | null;
+    startedAt: number | null;
+  }> {
+    if (!this.sqliteDb) throw new Error('getNodesNeedingKeyRepairSqlite is SQLite-only');
+    const db = this.sqliteDb;
+    const n = (this.tables as any).nodes;
+    const s = (this.tables as any).autoKeyRepairState;
+    // Drizzle's leftJoin sugar
+    const rows = db
+      .select({
+        nodeNum: n.nodeNum,
+        nodeId: n.nodeId,
+        longName: n.longName,
+        shortName: n.shortName,
+        attemptCount: s.attemptCount,
+        lastAttemptTime: s.lastAttemptTime,
+        startedAt: s.startedAt,
+        exhausted: s.exhausted,
+      })
+      .from(n)
+      .leftJoin(s, eq(n.nodeNum, s.nodeNum))
+      .where(eq(n.keyMismatchDetected, true))
+      .all() as any[];
+    return rows
+      .filter(r => r.exhausted == null || Number(r.exhausted) === 0)
+      .map(r => ({
+        nodeNum: Number(r.nodeNum),
+        nodeId: r.nodeId,
+        longName: r.longName ?? null,
+        shortName: r.shortName ?? null,
+        attemptCount: Number(r.attemptCount ?? 0),
+        lastAttemptTime: r.lastAttemptTime != null ? Number(r.lastAttemptTime) : null,
+        startedAt: r.startedAt != null ? Number(r.startedAt) : null,
+      }));
+  }
+
+  /**
+   * SQLite-only sync append to key repair log + cleanup.
+   * Uses the full v084 column set (oldKeyFragment, newKeyFragment, sourceId).
+   * The schema's SQLite table only includes timestamp/nodeNum/nodeName/action/success
+   * etc.; for the extended columns we drop down to raw SQL at a tagged site
+   * (this repo doesn't know about columns added via migrations at runtime).
+   */
+  logKeyRepairAttemptSqlite(
+    nodeNum: number,
+    nodeName: string | null,
+    action: string,
+    success: boolean | null,
+    oldKeyFragment: string | null,
+    newKeyFragment: string | null,
+    sourceId: string | null,
+  ): number {
+    if (!this.sqliteDb) throw new Error('logKeyRepairAttemptSqlite is SQLite-only');
+    const betterSqlite = (this.sqliteDb as any).$client as import('better-sqlite3').Database;
+    const now = Date.now();
+    const info = betterSqlite
+      .prepare(`
+        INSERT INTO auto_key_repair_log (timestamp, nodeNum, nodeName, action, success, created_at, oldKeyFragment, newKeyFragment, sourceId)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(now, nodeNum, nodeName, action, success === null ? null : (success ? 1 : 0), now, oldKeyFragment, newKeyFragment, sourceId);
+    betterSqlite
+      .prepare('DELETE FROM auto_key_repair_log WHERE id NOT IN (SELECT id FROM auto_key_repair_log ORDER BY timestamp DESC LIMIT 100)')
+      .run();
+    return Number(info.lastInsertRowid);
+  }
+
+  /**
+   * SQLite-only — probe introspection used by getKeyRepairLogAsync fallback.
+   * Returns an object describing column / table presence so the caller can
+   * build the correct SELECT list without raw SQL on the facade.
+   */
+  getKeyRepairLogIntrospectionSqlite(): { tableExists: boolean; hasOldKeyCol: boolean; hasSourceId: boolean } {
+    if (!this.sqliteDb) throw new Error('getKeyRepairLogIntrospectionSqlite is SQLite-only');
+    const betterSqlite = (this.sqliteDb as any).$client as import('better-sqlite3').Database;
+    try {
+      const table = betterSqlite
+        .prepare("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table' AND name='auto_key_repair_log'")
+        .get() as { count: number };
+      if (table.count === 0) return { tableExists: false, hasOldKeyCol: false, hasSourceId: false };
+      const oldKey = betterSqlite
+        .prepare("SELECT COUNT(*) as count FROM pragma_table_info('auto_key_repair_log') WHERE name='oldKeyFragment'")
+        .get() as { count: number };
+      const src = betterSqlite
+        .prepare("SELECT COUNT(*) as count FROM pragma_table_info('auto_key_repair_log') WHERE name='sourceId'")
+        .get() as { count: number };
+      return { tableExists: true, hasOldKeyCol: oldKey.count > 0, hasSourceId: src.count > 0 };
+    } catch {
+      return { tableExists: false, hasOldKeyCol: false, hasSourceId: false };
+    }
+  }
+
+  /**
+   * SQLite-only — fetch key repair log rows with optional sourceId filter.
+   * Assumes introspection has already confirmed the table and columns exist.
+   */
+  getKeyRepairLogSqlite(limit: number, sourceId: string | undefined, hasOldKeyCol: boolean, hasSourceId: boolean): Array<{
+    id: number;
+    timestamp: number;
+    nodeNum: number;
+    nodeName: string | null;
+    action: string;
+    success: boolean | null;
+    oldKeyFragment: string | null;
+    newKeyFragment: string | null;
+  }> {
+    if (!this.sqliteDb) throw new Error('getKeyRepairLogSqlite is SQLite-only');
+    const betterSqlite = (this.sqliteDb as any).$client as import('better-sqlite3').Database;
+    const selectCols = hasOldKeyCol
+      ? 'id, timestamp, nodeNum, nodeName, action, success, oldKeyFragment, newKeyFragment'
+      : 'id, timestamp, nodeNum, nodeName, action, success';
+    const useSourceFilter = !!sourceId && hasSourceId;
+    const whereClause = useSourceFilter ? 'WHERE sourceId = ?' : '';
+    const params: any[] = useSourceFilter ? [sourceId, limit] : [limit];
+    const rows = betterSqlite
+      .prepare(`SELECT ${selectCols} FROM auto_key_repair_log ${whereClause} ORDER BY timestamp DESC LIMIT ?`)
+      .all(...params) as any[];
+    return rows.map(row => ({
+      id: row.id,
+      timestamp: Number(row.timestamp),
+      nodeNum: Number(row.nodeNum),
+      nodeName: row.nodeName,
+      action: row.action,
+      success: row.success === null ? null : Boolean(row.success),
+      oldKeyFragment: row.oldKeyFragment || null,
+      newKeyFragment: row.newKeyFragment || null,
+    }));
   }
 }
 
@@ -1367,4 +1982,5 @@ export interface PacketLogFilterOptions {
   encrypted?: boolean;
   since?: number;
   relay_node?: number | 'unknown';
+  sourceId?: string;
 }

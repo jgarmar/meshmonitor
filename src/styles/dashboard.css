@@ -60,6 +60,38 @@
   overflow: hidden;
 }
 
+/* ── Hamburger toggle (mobile only) ──────────────────────────────────────── */
+
+.dashboard-topbar-hamburger {
+  display: none; /* Hidden on desktop — shown via media query below */
+  background: none;
+  border: none;
+  color: var(--ctp-text);
+  font-size: 22px;
+  line-height: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.dashboard-topbar-hamburger:hover {
+  background-color: var(--ctp-surface0);
+}
+
+/* ── Sidebar backdrop (mobile overlay) ──────────────────────────────────── */
+
+.dashboard-sidebar-backdrop {
+  display: none; /* Hidden on desktop */
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 998;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
 
 .dashboard-sidebar {
@@ -92,26 +124,26 @@
   border: 1px solid transparent;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
-  overflow: hidden;
 }
 
-/* Faint Meshtastic watermark behind the tile. Uses a ::before overlay so it
-   sits behind the content but above the card background, and doesn't steal
-   pointer events from the card's click handler. */
+/* Faint Meshtastic logo watermark behind the tile. Uses a ::before overlay so
+   it sits behind the content but above the card background, and doesn't steal
+   pointer events from the card's click handler.  The official Meshtastic logo
+   fills the entire card as a subtle background graphic identifying the source
+   type at a glance.  Inlined as a data URL to avoid BASE_URL path issues.
+   Watermark is clipped to card bounds via border-radius + overflow on ::before. */
 .dashboard-source-card.has-meshtastic-watermark::before {
   content: '';
   position: absolute;
-  right: -10px;
-  bottom: -12px;
-  width: 80px;
-  height: 80px;
-  background-image: url('/meshtastic-icon.svg');
-  background-size: contain;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='512' height='512'%3E%3Cpath d='M125 0Q0 0 0 125v262q0 125 125 125h262q125 0 125-125V125Q512 0 387 0Z' fill='%2367ea94'/%3E%3Cpath d='m250.908 330.267-57.782 84.738-12.188-8.311 63.864-93.657a7.378 7.378 0 0 1 12.18-.011l64.012 93.51-12.173 8.333z' fill='%232c2d3c' transform='translate(-135.496 -390.354)scale(1.79)'/%3E%3Cpath d='m87.642 581.398 67.115-98.421-12.119-8.264-67.115 98.421z' fill='%232c2d3c' transform='translate(-63.403 -699.639)scale(1.81)'/%3E%3C/svg%3E");
+  background-size: cover;
   background-repeat: no-repeat;
-  background-position: bottom right;
-  opacity: 0.06;
+  background-position: center;
+  opacity: 0.07;
   pointer-events: none;
-  color: var(--ctp-text);
+  border-radius: inherit;
+  overflow: hidden;
 }
 
 .dashboard-source-card > * {
@@ -332,6 +364,52 @@
   color: var(--ctp-sapphire);
 }
 
+/* ── Sidebar footer ─────────────────────────────────────────────────────── */
+
+.dashboard-sidebar-footer {
+  padding: 8px 12px;
+  border-top: 1px solid var(--ctp-surface0);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.dashboard-sidebar-version {
+  font-size: 10px;
+  color: var(--ctp-subtext0);
+  opacity: 0.6;
+}
+
+.dashboard-sidebar-footer-icons {
+  display: flex;
+  gap: 6px;
+}
+
+.dashboard-sidebar-footer-btn {
+  background: none;
+  border: none;
+  padding: 4px 6px;
+  font-size: 14px;
+  cursor: pointer;
+  border-radius: 4px;
+  color: var(--ctp-subtext0);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s;
+}
+
+.dashboard-sidebar-footer-btn:hover:not(:disabled) {
+  background-color: var(--ctp-surface0);
+}
+
+.dashboard-sidebar-footer-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 /* ── Map panel ───────────────────────────────────────────────────────────── */
 
 .dashboard-map-container {
@@ -520,4 +598,63 @@
 
 .dashboard-form-input::placeholder {
   color: var(--ctp-overlay0);
+}
+
+/* ── Mobile: collapsible sidebar ─────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  /* Show hamburger toggle in the topbar */
+  .dashboard-topbar-hamburger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Tighten up the topbar on mobile so the logo/title still fit */
+  .dashboard-topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+
+  .dashboard-topbar-title {
+    font-size: 1.2rem;
+  }
+
+  /* Sidebar becomes a slide-in overlay drawer */
+  .dashboard-sidebar {
+    position: fixed;
+    top: var(--header-height, 64px);
+    left: 0;
+    bottom: 0;
+    width: 260px;
+    z-index: 999;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    box-shadow: 2px 0 12px rgba(0, 0, 0, 0.4);
+  }
+
+  .dashboard-sidebar.mobile-open {
+    transform: translateX(0);
+  }
+
+  /* Backdrop fades in when drawer is open */
+  .dashboard-sidebar-backdrop {
+    display: block;
+    top: var(--header-height, 64px);
+  }
+
+  .dashboard-sidebar-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* Map fills the full body width since the sidebar is now overlaid */
+  .dashboard-map-container {
+    width: 100%;
+  }
+
+  /* Shrink add-source button label on mobile — icon only */
+  .dashboard-add-source-btn {
+    padding: 6px 10px;
+  }
 }

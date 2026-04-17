@@ -5,14 +5,12 @@ import { calculateDistance } from '../utils/distance.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
 import { logger } from '../utils/logger.js';
 import { getEnvironmentConfig } from '../server/config/environment.js';
-import { UserModel } from '../server/models/User.js';
-import { PermissionModel } from '../server/models/Permission.js';
-import { APITokenModel } from '../server/models/APIToken.js';
+
 import { registry } from '../db/migrations.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
-
 // Drizzle ORM imports for dual-database support
-import { createSQLiteDriver } from '../db/drivers/sqlite.js';
+import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3';
+import * as drizzleSchema from '../db/schema/index.js';
 import { createPostgresDriver } from '../db/drivers/postgres.js';
 import { createMySQLDriver } from '../db/drivers/mysql.js';
 import { getDatabaseConfig, Database } from '../db/index.js';
@@ -259,9 +257,7 @@ export interface ThemeDefinition {
 class DatabaseService {
   public db: BetterSqlite3Database.Database;
   private isInitialized = false;
-  public userModel: UserModel;
-  public permissionModel: PermissionModel;
-  public apiTokenModel: APITokenModel;
+
 
   // Cache for telemetry types per node (expensive GROUP BY query)
   private telemetryTypesCache: Map<string, string[]> | null = null;
@@ -350,15 +346,18 @@ class DatabaseService {
   async getDatabaseVersion(): Promise<string> {
     try {
       if (this.drizzleDbType === 'postgres' && this.postgresPool) {
+        // eslint-disable-next-line no-restricted-syntax -- system diagnostic query, not domain data
         const result = await this.postgresPool.query('SELECT version()');
         const fullVersion = result.rows?.[0]?.version || 'Unknown';
         // Extract just the version number from "PostgreSQL 16.2 (Debian 16.2-1.pgdg120+2) on x86_64-pc-linux-gnu..."
         const match = fullVersion.match(/PostgreSQL\s+([\d.]+)/);
         return match ? match[1] : fullVersion.split(' ').slice(0, 2).join(' ');
       } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
+        // eslint-disable-next-line no-restricted-syntax -- system diagnostic query, not domain data
         const [rows] = await this.mysqlPool.query('SELECT version() as version');
         return (rows as any[])?.[0]?.version || 'Unknown';
       } else if (this.db) {
+        // eslint-disable-next-line no-restricted-syntax -- bootstrap: SQLite builtin probe (Task 2.9)
         const result = this.db.prepare('SELECT sqlite_version() as version').get() as { version: string } | undefined;
         return result?.version || 'Unknown';
       }
@@ -512,11 +511,7 @@ class DatabaseService {
         },
       });
 
-      // Models will not work with PostgreSQL/MySQL - they need to be migrated to use repositories
-      // For now, create them with the proxy db - they'll throw errors if used
-      this.userModel = new UserModel(this.db);
-      this.permissionModel = new PermissionModel(this.db);
-      this.apiTokenModel = new APITokenModel(this.db);
+      // All user operations now route through AuthRepository (async)
 
       // Initialize Drizzle repositories (async) - this will create the schema
       // The readyPromise will be resolved when this completes
@@ -588,10 +583,7 @@ class DatabaseService {
     // Now attempt to open the database with better error handling
     this.db = this.openSqliteDatabase(dbPath, dbDir);
 
-    // Initialize models
-    this.userModel = new UserModel(this.db);
-    this.permissionModel = new PermissionModel(this.db);
-    this.apiTokenModel = new APITokenModel(this.db);
+    // All user operations now route through AuthRepository (async)
 
     // Initialize Drizzle ORM and repositories
     // This uses the same database file but through Drizzle for async operations
@@ -643,7 +635,7 @@ class DatabaseService {
   /**
    * Async initialization of Drizzle ORM repositories
    */
-  private async initializeDrizzleRepositoriesAsync(dbPath: string): Promise<void> {
+  private async initializeDrizzleRepositoriesAsync(_dbPath: string): Promise<void> {
     try {
       logger.debug('[DatabaseService] Initializing Drizzle ORM repositories');
 
@@ -679,13 +671,12 @@ class DatabaseService {
         // Create MySQL schema if tables don't exist
         await this.createMySQLSchema(pool);
       } else {
-        // Use SQLite driver (default)
-        const { db } = createSQLiteDriver({
-          databasePath: dbPath,
-          enableWAL: false, // Already enabled on main connection
-          enableForeignKeys: false, // Already enabled on main connection
-        });
-        drizzleDb = db;
+        // Use SQLite driver (default).
+        // Bind Drizzle to the existing better-sqlite3 connection (this.db) so
+        // sync repository methods and raw sync paths observe schema changes
+        // (CREATE TABLE, migrations) immediately on the same connection — and
+        // so this branch runs synchronously (no awaits before repo init below).
+        drizzleDb = drizzleSqlite(this.db, { schema: drizzleSchema });
         this.drizzleDbType = 'sqlite';
       }
 
@@ -846,12 +837,14 @@ class DatabaseService {
     // Pre-3.7 detection: check BEFORE createTables() so we can distinguish
     // an existing pre-v3.7 database from a fresh install.
     // If settings table already exists at this point, it's from a previous installation.
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (see Task 2.9)
     const settingsExists = this.db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='settings'"
     ).all();
     if (settingsExists.length > 0) {
       // Check for v3.7+ markers: either the old migration_077 key (pre-clean-break)
       // or the new migration_078 key (post-clean-break baseline)
+      // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (see Task 2.9)
       const v37Key = this.db.prepare(
         "SELECT value FROM settings WHERE key IN ('migration_077_ignored_nodes_nodenum_bigint', 'migration_078_create_embed_profiles')"
       ).get();
@@ -997,6 +990,7 @@ class DatabaseService {
     // CORE TABLES (matches 001_v37_baseline.ts exactly)
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS nodes (
         nodeNum INTEGER PRIMARY KEY,
@@ -1061,6 +1055,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
@@ -1092,6 +1087,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS channels (
         id INTEGER PRIMARY KEY,
@@ -1106,6 +1102,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS telemetry (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1124,6 +1121,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -1137,6 +1135,7 @@ class DatabaseService {
     // ROUTING TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS traceroutes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1154,6 +1153,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS route_segments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1172,6 +1172,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS neighbor_info (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1188,6 +1189,7 @@ class DatabaseService {
     // AUTH TABLES (snake_case column names for SQLite)
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1209,6 +1211,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS permissions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1219,11 +1222,11 @@ class DatabaseService {
         can_write INTEGER NOT NULL DEFAULT 0,
         granted_at INTEGER NOT NULL,
         granted_by INTEGER,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-        UNIQUE(user_id, resource)
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         sid TEXT PRIMARY KEY,
@@ -1232,6 +1235,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1249,6 +1253,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS api_tokens (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1271,6 +1276,7 @@ class DatabaseService {
     // NOTIFICATION TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS read_messages (
         message_id TEXT NOT NULL PRIMARY KEY,
@@ -1280,6 +1286,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS push_subscriptions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1295,6 +1302,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS user_notification_preferences (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1324,6 +1332,7 @@ class DatabaseService {
     // PACKET LOG
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS packet_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1359,6 +1368,7 @@ class DatabaseService {
     // BACKUP & UPGRADE TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS backup_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1373,6 +1383,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS system_backup_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1388,6 +1399,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS upgrade_history (
         id TEXT PRIMARY KEY,
@@ -1411,6 +1423,7 @@ class DatabaseService {
     // UI TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS custom_themes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1425,6 +1438,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS user_map_preferences (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1444,6 +1458,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS embed_profiles (
         id TEXT PRIMARY KEY,
@@ -1471,6 +1486,7 @@ class DatabaseService {
     // SOLAR ESTIMATES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS solar_estimates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1485,6 +1501,7 @@ class DatabaseService {
     // AUTOMATION TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS auto_traceroute_nodes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1494,6 +1511,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS auto_time_sync_nodes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1503,6 +1521,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS auto_traceroute_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1514,6 +1533,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS auto_key_repair_state (
         nodeNum INTEGER PRIMARY KEY,
@@ -1524,6 +1544,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS auto_key_repair_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1537,6 +1558,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS auto_distance_delete_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1552,6 +1574,7 @@ class DatabaseService {
     // CHANNEL DATABASE
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS channel_database (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1571,6 +1594,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS channel_database_permissions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1590,6 +1614,7 @@ class DatabaseService {
     // IGNORED NODES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS ignored_nodes (
         nodeNum INTEGER PRIMARY KEY,
@@ -1605,6 +1630,7 @@ class DatabaseService {
     // GEOFENCE COOLDOWNS
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS geofence_cooldowns (
         triggerId TEXT NOT NULL,
@@ -1618,6 +1644,7 @@ class DatabaseService {
     // MESHCORE TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS meshcore_nodes (
         publicKey TEXT PRIMARY KEY,
@@ -1645,6 +1672,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS meshcore_messages (
         id TEXT PRIMARY KEY,
@@ -1665,6 +1693,7 @@ class DatabaseService {
     // NEWS TABLES
     // ============================================================
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS news_cache (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1674,6 +1703,7 @@ class DatabaseService {
       );
     `);
 
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS user_news_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1686,12 +1716,14 @@ class DatabaseService {
     `);
 
     // Create index for efficient upgrade history queries
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations (Task 2.9)
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_upgrade_history_timestamp
       ON upgrade_history(startedAt DESC);
     `);
 
     // Create index for efficient traceroute queries
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_traceroutes_nodes
       ON traceroutes(fromNodeNum, toNodeNum, timestamp DESC);
@@ -1708,6 +1740,7 @@ class DatabaseService {
   }
 
   private createIndexes(): void {
+    // eslint-disable-next-line no-restricted-syntax -- bootstrap: runs before migrations
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_nodes_nodeId ON nodes(nodeId);
       CREATE INDEX IF NOT EXISTS idx_nodes_lastHeard ON nodes(lastHeard);
@@ -1743,9 +1776,8 @@ class DatabaseService {
     logger.debug('🔄 Running route segments migration...');
 
     try {
-      // Get ALL traceroutes from the database
-      const stmt = this.db.prepare('SELECT * FROM traceroutes ORDER BY timestamp ASC');
-      const allTraceroutes = stmt.all() as DbTraceroute[];
+      // Get ALL traceroutes from the database (bootstrap: runDataMigrations)
+      const allTraceroutes = this.traceroutes.getAllTraceroutesSync() as unknown as DbTraceroute[];
 
       logger.debug(`📊 Processing ${allTraceroutes.length} traceroutes for distance calculation...`);
 
@@ -2036,7 +2068,6 @@ class DatabaseService {
       return;
     }
 
-    const now = Date.now();
     // Post-migration 029: existence check and UPDATE must be scoped per-source
     // when a sourceId is supplied. Omitting the scope would cause an upsert on
     // source A to overwrite source B's row for the same nodeNum.
@@ -2045,157 +2076,20 @@ class DatabaseService {
       ? this.getNode(nodeData.nodeNum, upsertSourceIdSqlite)
       : this.getNode(nodeData.nodeNum);
 
-    if (existingNode) {
-      const stmt = this.db.prepare(`
-        UPDATE nodes SET
-          nodeId = COALESCE(?, nodeId),
-          longName = COALESCE(?, longName),
-          shortName = COALESCE(?, shortName),
-          hwModel = COALESCE(?, hwModel),
-          role = COALESCE(?, role),
-          hopsAway = COALESCE(?, hopsAway),
-          viaMqtt = COALESCE(?, viaMqtt),
-          macaddr = COALESCE(?, macaddr),
-          latitude = COALESCE(?, latitude),
-          longitude = COALESCE(?, longitude),
-          altitude = COALESCE(?, altitude),
-          batteryLevel = COALESCE(?, batteryLevel),
-          voltage = COALESCE(?, voltage),
-          channelUtilization = COALESCE(?, channelUtilization),
-          airUtilTx = COALESCE(?, airUtilTx),
-          lastHeard = COALESCE(?, lastHeard),
-          snr = COALESCE(?, snr),
-          rssi = COALESCE(?, rssi),
-          firmwareVersion = COALESCE(?, firmwareVersion),
-          channel = COALESCE(?, channel),
-          isFavorite = COALESCE(?, isFavorite),
-          rebootCount = COALESCE(?, rebootCount),
-          publicKey = COALESCE(?, publicKey),
-          hasPKC = COALESCE(?, hasPKC),
-          lastPKIPacket = COALESCE(?, lastPKIPacket),
-          welcomedAt = COALESCE(?, welcomedAt),
-          keyIsLowEntropy = COALESCE(?, keyIsLowEntropy),
-          duplicateKeyDetected = COALESCE(?, duplicateKeyDetected),
-          keyMismatchDetected = COALESCE(?, keyMismatchDetected),
-          keySecurityIssueDetails = COALESCE(?, keySecurityIssueDetails),
-          positionChannel = COALESCE(?, positionChannel),
-          positionPrecisionBits = COALESCE(?, positionPrecisionBits),
-          positionTimestamp = COALESCE(?, positionTimestamp),
-          updatedAt = ?
-        WHERE nodeNum = ?${upsertSourceIdSqlite ? ' AND sourceId = ?' : ''}
-      `);
-
-      stmt.run(
-        nodeData.nodeId,
-        nodeData.longName,
-        nodeData.shortName,
-        nodeData.hwModel,
-        nodeData.role,
-        nodeData.hopsAway,
-        nodeData.viaMqtt !== undefined ? (nodeData.viaMqtt ? 1 : 0) : null,
-        nodeData.macaddr,
-        nodeData.latitude,
-        nodeData.longitude,
-        nodeData.altitude,
-        nodeData.batteryLevel,
-        nodeData.voltage,
-        nodeData.channelUtilization,
-        nodeData.airUtilTx,
-        nodeData.lastHeard,
-        nodeData.snr,
-        nodeData.rssi,
-        nodeData.firmwareVersion || null,
-        nodeData.channel !== undefined ? nodeData.channel : null,
-        nodeData.isFavorite !== undefined ? (nodeData.isFavorite ? 1 : 0) : null,
-        nodeData.rebootCount !== undefined ? nodeData.rebootCount : null,
-        nodeData.publicKey || null,
-        nodeData.hasPKC !== undefined ? (nodeData.hasPKC ? 1 : 0) : null,
-        nodeData.lastPKIPacket !== undefined ? nodeData.lastPKIPacket : null,
-        nodeData.welcomedAt !== undefined ? nodeData.welcomedAt : null,
-        nodeData.keyIsLowEntropy !== undefined ? (nodeData.keyIsLowEntropy ? 1 : 0) : null,
-        nodeData.duplicateKeyDetected !== undefined ? (nodeData.duplicateKeyDetected ? 1 : 0) : null,
-        nodeData.keyMismatchDetected !== undefined ? (nodeData.keyMismatchDetected ? 1 : 0) : null,
-        // For keySecurityIssueDetails, use empty string to explicitly clear (COALESCE will keep old value for null)
-        // If explicitly set to undefined, pass empty string to clear; if set to a value, use it; if not provided, pass null
-        'keySecurityIssueDetails' in nodeData ? (nodeData.keySecurityIssueDetails || '') : null,
-        nodeData.positionChannel !== undefined ? nodeData.positionChannel : null,
-        nodeData.positionPrecisionBits !== undefined ? nodeData.positionPrecisionBits : null,
-        nodeData.positionTimestamp !== undefined ? nodeData.positionTimestamp : null,
-        now,
-        nodeData.nodeNum,
-        ...(upsertSourceIdSqlite ? [upsertSourceIdSqlite] : [])
-      );
-    } else {
-      // Check if this node was previously ignored (persistent ignore list)
-      let wasIgnored = false;
-      try {
-        const ignoreCheck = this.db.prepare('SELECT nodeNum FROM ignored_nodes WHERE nodeNum = ?');
-        wasIgnored = !!ignoreCheck.get(nodeData.nodeNum);
-      } catch {
-        // Table may not exist yet during initial setup
+    let wasIgnored = false;
+    if (!existingNode) {
+      // Check if this node was previously ignored (persistent ignore list).
+      // Delegates to IgnoredNodesRepository so the raw SQL stays inside Drizzle-managed code.
+      if (this.ignoredNodesRepo) {
+        wasIgnored = this.ignoredNodesRepo.isNodeIgnoredSqlite(nodeData.nodeNum);
       }
+    }
 
-      // Post-migration 029: (nodeNum, sourceId) is the composite PK and sourceId is NOT NULL.
-      // Default to 'default' for callers that haven't been threaded through yet, matching
-      // the PG/MySQL cache path at upsertSourceId above.
-      const insertSourceId = (nodeData as any).sourceId ?? 'default';
-      const stmt = this.db.prepare(`
-        INSERT INTO nodes (
-          nodeNum, nodeId, longName, shortName, hwModel, role, hopsAway, viaMqtt, macaddr,
-          latitude, longitude, altitude, batteryLevel, voltage,
-          channelUtilization, airUtilTx, lastHeard, snr, rssi, firmwareVersion, channel,
-          isFavorite, rebootCount, publicKey, hasPKC, lastPKIPacket, welcomedAt,
-          keyIsLowEntropy, duplicateKeyDetected, keyMismatchDetected, keySecurityIssueDetails,
-          positionChannel, positionPrecisionBits, positionTimestamp,
-          isIgnored,
-          createdAt, updatedAt, sourceId
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+    // Delegate to the repository's sync upsert — eliminates raw SQL.
+    this.nodesRepo!.upsertNodeSqlite(nodeData, wasIgnored);
 
-      stmt.run(
-        nodeData.nodeNum,
-        nodeData.nodeId,
-        nodeData.longName || null,
-        nodeData.shortName || null,
-        nodeData.hwModel || null,
-        nodeData.role || null,
-        nodeData.hopsAway !== undefined ? nodeData.hopsAway : null,
-        nodeData.viaMqtt !== undefined ? (nodeData.viaMqtt ? 1 : 0) : null,
-        nodeData.macaddr || null,
-        nodeData.latitude || null,
-        nodeData.longitude || null,
-        nodeData.altitude || null,
-        nodeData.batteryLevel || null,
-        nodeData.voltage || null,
-        nodeData.channelUtilization || null,
-        nodeData.airUtilTx || null,
-        nodeData.lastHeard || null,
-        nodeData.snr || null,
-        nodeData.rssi || null,
-        nodeData.firmwareVersion || null,
-        nodeData.channel !== undefined ? nodeData.channel : null,
-        nodeData.isFavorite ? 1 : 0,
-        nodeData.rebootCount || null,
-        nodeData.publicKey || null,
-        nodeData.hasPKC ? 1 : 0,
-        nodeData.lastPKIPacket || null,
-        nodeData.welcomedAt || null,
-        nodeData.keyIsLowEntropy ? 1 : 0,
-        nodeData.duplicateKeyDetected ? 1 : 0,
-        nodeData.keyMismatchDetected ? 1 : 0,
-        nodeData.keySecurityIssueDetails || null,
-        nodeData.positionChannel !== undefined ? nodeData.positionChannel : null,
-        nodeData.positionPrecisionBits !== undefined ? nodeData.positionPrecisionBits : null,
-        nodeData.positionTimestamp !== undefined ? nodeData.positionTimestamp : null,
-        wasIgnored ? 1 : 0,
-        now,
-        now,
-        insertSourceId
-      );
-
-      if (wasIgnored) {
-        logger.debug(`Restored ignored status for returning node ${nodeData.nodeNum}`);
-      }
+    if (!existingNode && wasIgnored) {
+      logger.debug(`Restored ignored status for returning node ${nodeData.nodeNum}`);
     }
 
     // Send new node notification when a node becomes complete (has longName, shortName, hwModel)
@@ -2252,14 +2146,8 @@ class DatabaseService {
       }
       return null;
     }
-    if (sourceId) {
-      const stmt = this.db.prepare('SELECT * FROM nodes WHERE nodeNum = ? AND sourceId = ?');
-      const node = stmt.get(nodeNum, sourceId) as DbNode | null;
-      return node ? this.normalizeBigInts(node) : null;
-    }
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE nodeNum = ?');
-    const node = stmt.get(nodeNum) as DbNode | null;
-    return node ? this.normalizeBigInts(node) : null;
+    // SQLite: delegate to Drizzle sync variant
+    return this.nodesRepo!.getNodeSqlite(nodeNum, sourceId) as unknown as DbNode | null;
   }
 
   getAllNodes(sourceId?: string): DbNode[] {
@@ -2271,15 +2159,8 @@ class DatabaseService {
       }
       return Array.from(this.iterateCache(sourceId));
     }
-    // Post-migration 029: when sourceId is provided, scope the query per-source.
-    if (sourceId) {
-      const stmt = this.db.prepare('SELECT * FROM nodes WHERE sourceId = ? ORDER BY updatedAt DESC');
-      const nodes = stmt.all(sourceId) as DbNode[];
-      return nodes.map(node => this.normalizeBigInts(node));
-    }
-    const stmt = this.db.prepare('SELECT * FROM nodes ORDER BY updatedAt DESC');
-    const nodes = stmt.all() as DbNode[];
-    return nodes.map(node => this.normalizeBigInts(node));
+    // SQLite: delegate to Drizzle sync variant
+    return this.nodesRepo!.getAllNodesSqlite(sourceId) as unknown as DbNode[];
   }
 
   /**
@@ -2302,11 +2183,8 @@ class DatabaseService {
         .sort((a, b) => (b.lastHeard ?? 0) - (a.lastHeard ?? 0));
     }
 
-    // lastHeard is stored in seconds (Unix timestamp), so convert cutoff to seconds
-    const cutoff = Math.floor(Date.now() / 1000) - (sinceDays * 24 * 60 * 60);
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE lastHeard > ? ORDER BY lastHeard DESC');
-    const nodes = stmt.all(cutoff) as DbNode[];
-    return nodes.map(node => this.normalizeBigInts(node));
+    // SQLite: delegate to Drizzle sync variant
+    return this.nodesRepo!.getActiveNodesSqlite(sinceDays) as unknown as DbNode[];
   }
 
   /**
@@ -2330,8 +2208,8 @@ class DatabaseService {
       }
       return;
     }
-    const stmt = this.db.prepare('UPDATE nodes SET lastMessageHops = ?, updatedAt = ? WHERE nodeNum = ? AND sourceId = ?');
-    stmt.run(hops, now, nodeNum, sourceId);
+    // SQLite: delegate to Drizzle sync variant
+    this.nodesRepo!.updateNodeMessageHopsSqlite(nodeNum, hops, sourceId);
   }
 
   /**
@@ -2358,14 +2236,8 @@ class DatabaseService {
       }
       return count;
     }
-    if (sourceId) {
-      const stmt = this.db.prepare('UPDATE nodes SET welcomedAt = ? WHERE welcomedAt IS NULL AND sourceId = ?');
-      const result = stmt.run(now, sourceId);
-      return result.changes;
-    }
-    const stmt = this.db.prepare('UPDATE nodes SET welcomedAt = ? WHERE welcomedAt IS NULL');
-    const result = stmt.run(now);
-    return result.changes;
+    void now;
+    return this.nodesRepo!.markAllNodesAsWelcomedSqlite(sourceId ?? null);
   }
 
   /**
@@ -2397,13 +2269,8 @@ class DatabaseService {
       }
       return false;
     }
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET welcomedAt = ?, updatedAt = ?
-      WHERE nodeNum = ? AND nodeId = ? AND sourceId = ? AND welcomedAt IS NULL
-    `);
-    const result = stmt.run(now, now, nodeNum, nodeId, sourceId);
-    return result.changes > 0;
+    void now;
+    return this.nodesRepo!.markNodeAsWelcomedIfNotAlreadySqlite(nodeNum, nodeId, sourceId);
   }
 
   /**
@@ -2447,23 +2314,8 @@ class DatabaseService {
       const nodes = await this.nodes.getNodesWithKeySecurityIssues(sourceId);
       return nodes as unknown as DbNode[];
     }
-    // SQLite fallback using raw SQL on main connection
-    if (sourceId) {
-      const stmt = this.db.prepare(`
-        SELECT * FROM nodes
-        WHERE (keyIsLowEntropy = 1 OR duplicateKeyDetected = 1) AND sourceId = ?
-        ORDER BY lastHeard DESC
-      `);
-      const nodes = stmt.all(sourceId) as DbNode[];
-      return nodes.map(node => this.normalizeBigInts(node));
-    }
-    const stmt = this.db.prepare(`
-      SELECT * FROM nodes
-      WHERE keyIsLowEntropy = 1 OR duplicateKeyDetected = 1
-      ORDER BY lastHeard DESC
-    `);
-    const nodes = stmt.all() as DbNode[];
-    return nodes.map(node => this.normalizeBigInts(node));
+    // SQLite fallback via repository
+    return this.nodesRepo!.getNodesWithKeySecurityIssuesSqlite(sourceId) as unknown as DbNode[];
   }
 
   /**
@@ -2481,11 +2333,7 @@ class DatabaseService {
       return result;
     }
 
-    const stmt = this.db.prepare(`
-      SELECT nodeNum, publicKey FROM nodes
-      WHERE publicKey IS NOT NULL AND publicKey != ''
-    `);
-    return stmt.all() as Array<{ nodeNum: number; publicKey: string | null }>;
+    return this.nodesRepo!.getNodesWithPublicKeysSqlite();
   }
 
   /**
@@ -2513,15 +2361,7 @@ class DatabaseService {
     }
 
     // SQLite: synchronous update, always scoped by sourceId per migration 029.
-    const now = Date.now();
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET duplicateKeyDetected = ?,
-          keySecurityIssueDetails = ?,
-          updatedAt = ?
-      WHERE nodeNum = ? AND sourceId = ?
-    `);
-    stmt.run(duplicateKeyDetected ? 1 : 0, keySecurityIssueDetails ?? null, now, nodeNum, sourceId);
+    this.nodesRepo!.updateNodeSecurityFlagsSqlite(nodeNum, duplicateKeyDetected, keySecurityIssueDetails, sourceId);
   }
 
   updateNodeLowEntropyFlag(nodeNum: number, keyIsLowEntropy: boolean, details: string | undefined, sourceId: string): void {
@@ -2576,15 +2416,7 @@ class DatabaseService {
     }
 
     // SQLite: synchronous update, scoped per-source.
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET keyIsLowEntropy = ?,
-          keySecurityIssueDetails = ?,
-          updatedAt = ?
-      WHERE nodeNum = ? AND sourceId = ?
-    `);
-    const now = Date.now();
-    stmt.run(keyIsLowEntropy ? 1 : 0, combinedDetails || null, now, nodeNum, sourceId);
+    this.nodesRepo!.updateNodeLowEntropyFlagSqlite(nodeNum, keyIsLowEntropy, combinedDetails || null, sourceId);
   }
 
   /**
@@ -2606,15 +2438,10 @@ class DatabaseService {
     const localNodeNumStr = this.getSetting('localNodeNum');
     const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
 
-    const stmt = this.db.prepare(`
-      SELECT from_node as nodeNum, COUNT(*) as packetCount
-      FROM packet_log
-      WHERE timestamp >= ?
-        AND NOT (from_node = ? AND to_node = ?)
-      GROUP BY from_node
-    `);
-
-    return stmt.all(oneHourAgo, localNodeNum || -1, localNodeNum || -1) as Array<{ nodeNum: number; packetCount: number }>;
+    return this.miscRepo!.getPacketCountsPerNodeSinceSync({
+      since: oneHourAgo,
+      localNodeNum,
+    });
   }
 
   /**
@@ -2630,62 +2457,11 @@ class DatabaseService {
       : this.getSetting('localNodeNum');
     const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
 
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      try {
-        const sourceFilter = sourceId ? ' AND "sourceId" = $3' : '';
-        const params: any[] = [oneHourAgo, localNodeNum || -1];
-        if (sourceId) params.push(sourceId);
-        const result = await this.postgresPool.query(`
-          SELECT from_node as "nodeNum", COUNT(*)::int as "packetCount"
-          FROM packet_log
-          WHERE timestamp >= $1
-            AND NOT (from_node = $2 AND to_node = $2)${sourceFilter}
-          GROUP BY from_node
-        `, params);
-
-        return result.rows;
-      } catch (error) {
-        logger.error('Error getting packet counts per node (PostgreSQL):', error);
-        return [];
-      }
-    }
-
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      try {
-        const sourceFilter = sourceId ? ' AND sourceId = ?' : '';
-        const params: any[] = [oneHourAgo, localNodeNum || -1, localNodeNum || -1];
-        if (sourceId) params.push(sourceId);
-        const [rows] = await this.mysqlPool.query(`
-          SELECT from_node as nodeNum, COUNT(*) as packetCount
-          FROM packet_log
-          WHERE timestamp >= ?
-            AND NOT (from_node = ? AND to_node = ?)${sourceFilter}
-          GROUP BY from_node
-        `, params) as any;
-
-        return rows.map((row: any) => ({
-          nodeNum: Number(row.nodeNum),
-          packetCount: Number(row.packetCount)
-        }));
-      } catch (error) {
-        logger.error('Error getting packet counts per node (MySQL):', error);
-        return [];
-      }
-    }
-
-    // SQLite fallback
-    if (sourceId) {
-      const stmt = this.db.prepare(`
-        SELECT from_node as nodeNum, COUNT(*) as packetCount
-        FROM packet_log
-        WHERE timestamp >= ?
-          AND NOT (from_node = ? AND to_node = ?)
-          AND sourceId = ?
-        GROUP BY from_node
-      `);
-      return stmt.all(oneHourAgo, localNodeNum || -1, localNodeNum || -1, sourceId) as Array<{ nodeNum: number; packetCount: number }>;
-    }
-    return this.getPacketCountsPerNodeLastHour();
+    return this.miscRepo!.getPacketCountsPerNodeSince({
+      since: oneHourAgo,
+      localNodeNum,
+      sourceId,
+    });
   }
 
   /**
@@ -2700,88 +2476,12 @@ class DatabaseService {
     const localNodeNumStr = this.getSetting('localNodeNum');
     const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
 
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      try {
-        const sourceClause = sourceId ? `AND p."sourceId" = $4` : '';
-        const params: any[] = [oneHourAgo, limit, localNodeNum || -1];
-        if (sourceId) params.push(sourceId);
-        const result = await this.postgresPool.query(`
-          SELECT p.from_node as "nodeNum", n."shortName", n."longName", COUNT(*)::int as "packetCount"
-          FROM packet_log p
-          LEFT JOIN nodes n ON p.from_node = n."nodeNum"
-          WHERE p.timestamp >= $1
-            AND NOT (p.from_node = $3 AND p.to_node = $3)
-            ${sourceClause}
-          GROUP BY p.from_node, n."shortName", n."longName"
-          ORDER BY "packetCount" DESC
-          LIMIT $2
-        `, params);
-
-        return result.rows;
-      } catch (error) {
-        logger.error('Error getting top broadcasters (PostgreSQL):', error);
-        return [];
-      }
-    }
-
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      try {
-        const sourceClause = sourceId ? `AND p.sourceId = ?` : '';
-        const params: any[] = [oneHourAgo, localNodeNum || -1, localNodeNum || -1];
-        if (sourceId) params.push(sourceId);
-        params.push(limit);
-        const [rows] = await this.mysqlPool.query(`
-          SELECT p.from_node as nodeNum, n.shortName, n.longName, COUNT(*) as packetCount
-          FROM packet_log p
-          LEFT JOIN nodes n ON p.from_node = n.nodeNum
-          WHERE p.timestamp >= ?
-            AND NOT (p.from_node = ? AND p.to_node = ?)
-            ${sourceClause}
-          GROUP BY p.from_node, n.shortName, n.longName
-          ORDER BY packetCount DESC
-          LIMIT ?
-        `, params) as any;
-
-        return rows.map((row: any) => ({
-          nodeNum: Number(row.nodeNum),
-          shortName: row.shortName,
-          longName: row.longName,
-          packetCount: Number(row.packetCount)
-        }));
-      } catch (error) {
-        logger.error('Error getting top broadcasters (MySQL):', error);
-        return [];
-      }
-    }
-
-    // SQLite - exclude packets where both from_node and to_node are the local node
-    if (sourceId) {
-      const stmt = this.db.prepare(`
-        SELECT p.from_node as nodeNum, n.shortName, n.longName, COUNT(*) as packetCount
-        FROM packet_log p
-        LEFT JOIN nodes n ON p.from_node = n.nodeNum
-        WHERE p.timestamp >= ?
-          AND NOT (p.from_node = ? AND p.to_node = ?)
-          AND p.sourceId = ?
-        GROUP BY p.from_node
-        ORDER BY packetCount DESC
-        LIMIT ?
-      `);
-      return stmt.all(oneHourAgo, localNodeNum || -1, localNodeNum || -1, sourceId, limit) as Array<{ nodeNum: number; shortName: string | null; longName: string | null; packetCount: number }>;
-    }
-
-    const stmt = this.db.prepare(`
-      SELECT p.from_node as nodeNum, n.shortName, n.longName, COUNT(*) as packetCount
-      FROM packet_log p
-      LEFT JOIN nodes n ON p.from_node = n.nodeNum
-      WHERE p.timestamp >= ?
-        AND NOT (p.from_node = ? AND p.to_node = ?)
-      GROUP BY p.from_node
-      ORDER BY packetCount DESC
-      LIMIT ?
-    `);
-
-    return stmt.all(oneHourAgo, localNodeNum || -1, localNodeNum || -1, limit) as Array<{ nodeNum: number; shortName: string | null; longName: string | null; packetCount: number }>;
+    return this.miscRepo!.getTopBroadcastersSince({
+      since: oneHourAgo,
+      limit,
+      localNodeNum,
+      sourceId,
+    });
   }
 
   /**
@@ -2808,57 +2508,26 @@ class DatabaseService {
     }
 
     // SQLite: synchronous update
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET isExcessivePackets = ?,
-          packetRatePerHour = ?,
-          packetRateLastChecked = ?,
-          updatedAt = ?
-      WHERE nodeNum = ? AND sourceId = ?
-    `);
-    stmt.run(isExcessivePackets ? 1 : 0, packetRatePerHour, now, Date.now(), nodeNum, sourceId);
+    this.nodesRepo!.updateNodeSpamFlagsSqlite(nodeNum, isExcessivePackets, packetRatePerHour, now, sourceId);
   }
 
   /**
    * Update the spam detection flags for a node (async), scoped per-source.
    */
   async updateNodeSpamFlagsAsync(nodeNum: number, isExcessivePackets: boolean, packetRatePerHour: number, lastChecked: number, sourceId: string): Promise<void> {
-    const now = Date.now();
-
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      await this.postgresPool.query(`
-        UPDATE nodes
-        SET "isExcessivePackets" = $1,
-            "packetRatePerHour" = $2,
-            "packetRateLastChecked" = $3,
-            "updatedAt" = $4
-        WHERE "nodeNum" = $5 AND "sourceId" = $6
-      `, [isExcessivePackets, packetRatePerHour, lastChecked, now, nodeNum, sourceId]);
-      return;
-    }
-
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      await this.mysqlPool.query(`
-        UPDATE nodes
-        SET isExcessivePackets = ?,
-            packetRatePerHour = ?,
-            packetRateLastChecked = ?,
-            updatedAt = ?
-        WHERE nodeNum = ? AND sourceId = ?
-      `, [isExcessivePackets, packetRatePerHour, lastChecked, now, nodeNum, sourceId]);
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      await this.nodesRepo!.updateNodeExcessivePacketsAsync(
+        nodeNum,
+        isExcessivePackets,
+        packetRatePerHour,
+        lastChecked,
+        sourceId
+      );
       return;
     }
 
     // SQLite: synchronous update
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET isExcessivePackets = ?,
-          packetRatePerHour = ?,
-          packetRateLastChecked = ?,
-          updatedAt = ?
-      WHERE nodeNum = ? AND sourceId = ?
-    `);
-    stmt.run(isExcessivePackets ? 1 : 0, packetRatePerHour, lastChecked, now, nodeNum, sourceId);
+    this.nodesRepo!.updateNodeSpamFlagsSqlite(nodeNum, isExcessivePackets, packetRatePerHour, lastChecked, sourceId);
   }
 
   /**
@@ -2876,10 +2545,7 @@ class DatabaseService {
       return result;
     }
 
-    const stmt = this.db.prepare(`
-      SELECT * FROM nodes WHERE isExcessivePackets = 1
-    `);
-    return stmt.all() as DbNode[];
+    return this.nodesRepo!.getNodesWithExcessivePacketsSqlite() as unknown as DbNode[];
   }
 
   /**
@@ -2897,8 +2563,7 @@ class DatabaseService {
     }
 
     if (sourceId) {
-      const stmt = this.db.prepare(`SELECT * FROM nodes WHERE isExcessivePackets = 1 AND sourceId = ?`);
-      return stmt.all(sourceId) as DbNode[];
+      return this.nodesRepo!.getNodesWithExcessivePacketsSqlite(sourceId) as unknown as DbNode[];
     }
     return this.getNodesWithExcessivePackets();
   }
@@ -2925,14 +2590,7 @@ class DatabaseService {
     }
 
     // SQLite: synchronous update, scoped by sourceId
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET isTimeOffsetIssue = ?,
-          timeOffsetSeconds = ?,
-          updatedAt = ?
-      WHERE nodeNum = ? AND sourceId = ?
-    `);
-    stmt.run(isTimeOffsetIssue ? 1 : 0, timeOffsetSeconds, Date.now(), nodeNum, sourceId);
+    this.nodesRepo!.updateNodeTimeOffsetFlagsSqlite(nodeNum, isTimeOffsetIssue, timeOffsetSeconds, sourceId);
   }
 
   /**
@@ -2940,39 +2598,18 @@ class DatabaseService {
    * sourceId is required post-migration 029.
    */
   async updateNodeTimeOffsetFlagsAsync(nodeNum: number, isTimeOffsetIssue: boolean, timeOffsetSeconds: number | null, sourceId: string): Promise<void> {
-    const now = Date.now();
-
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      await this.postgresPool.query(`
-        UPDATE nodes
-        SET "isTimeOffsetIssue" = $1,
-            "timeOffsetSeconds" = $2,
-            "updatedAt" = $3
-        WHERE "nodeNum" = $4 AND "sourceId" = $5
-      `, [isTimeOffsetIssue, timeOffsetSeconds, now, nodeNum, sourceId]);
-      return;
-    }
-
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      await this.mysqlPool.query(`
-        UPDATE nodes
-        SET isTimeOffsetIssue = ?,
-            timeOffsetSeconds = ?,
-            updatedAt = ?
-        WHERE nodeNum = ? AND sourceId = ?
-      `, [isTimeOffsetIssue, timeOffsetSeconds, now, nodeNum, sourceId]);
+    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+      await this.nodesRepo!.updateNodeTimeOffsetAsync(
+        nodeNum,
+        isTimeOffsetIssue,
+        timeOffsetSeconds,
+        sourceId
+      );
       return;
     }
 
     // SQLite
-    const stmt = this.db.prepare(`
-      UPDATE nodes
-      SET isTimeOffsetIssue = ?,
-          timeOffsetSeconds = ?,
-          updatedAt = ?
-      WHERE nodeNum = ? AND sourceId = ?
-    `);
-    stmt.run(isTimeOffsetIssue ? 1 : 0, timeOffsetSeconds, now, nodeNum, sourceId);
+    this.nodesRepo!.updateNodeTimeOffsetFlagsSqlite(nodeNum, isTimeOffsetIssue, timeOffsetSeconds, sourceId);
   }
 
   /**
@@ -2990,10 +2627,7 @@ class DatabaseService {
       return result;
     }
 
-    const stmt = this.db.prepare(`
-      SELECT * FROM nodes WHERE isTimeOffsetIssue = 1
-    `);
-    return stmt.all() as DbNode[];
+    return this.nodesRepo!.getNodesWithTimeOffsetIssuesSqlite() as unknown as DbNode[];
   }
 
   /**
@@ -3011,8 +2645,7 @@ class DatabaseService {
     }
 
     if (sourceId) {
-      const stmt = this.db.prepare(`SELECT * FROM nodes WHERE isTimeOffsetIssue = 1 AND sourceId = ?`);
-      return stmt.all(sourceId) as DbNode[];
+      return this.nodesRepo!.getNodesWithTimeOffsetIssuesSqlite(sourceId) as unknown as DbNode[];
     }
     return this.getNodesWithTimeOffsetIssues();
   }
@@ -3025,71 +2658,7 @@ class DatabaseService {
     // (nodes without GPS/NTP often report 0 or boot-relative seconds)
     const MIN_VALID_TIMESTAMP_MS = 1577836800000;
 
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      const sourceFilter = sourceId ? ' AND "sourceId" = $2' : '';
-      const params: any[] = [MIN_VALID_TIMESTAMP_MS];
-      if (sourceId) params.push(sourceId);
-      const result = await this.postgresPool.query(`
-        SELECT DISTINCT ON ("nodeNum") "nodeNum", "timestamp", "packetTimestamp"
-        FROM telemetry
-        WHERE "packetTimestamp" IS NOT NULL AND "packetTimestamp" > $1${sourceFilter}
-        ORDER BY "nodeNum", "timestamp" DESC
-      `, params);
-      return result.rows.map((r: any) => ({
-        nodeNum: Number(r.nodeNum),
-        timestamp: Number(r.timestamp),
-        packetTimestamp: Number(r.packetTimestamp)
-      }));
-    }
-
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      const sourceFilter = sourceId ? ' AND t.sourceId = ?' : '';
-      const innerFilter = sourceId ? ' AND sourceId = ?' : '';
-      const params: any[] = [MIN_VALID_TIMESTAMP_MS];
-      if (sourceId) params.push(sourceId);
-      params.push(MIN_VALID_TIMESTAMP_MS);
-      if (sourceId) params.push(sourceId);
-      const [rows] = await this.mysqlPool.query(`
-        SELECT t.nodeNum, t.timestamp, t.packetTimestamp
-        FROM telemetry t
-        INNER JOIN (
-          SELECT nodeNum, MAX(timestamp) as maxTs
-          FROM telemetry
-          WHERE packetTimestamp IS NOT NULL AND packetTimestamp > ?${innerFilter}
-          GROUP BY nodeNum
-        ) latest ON t.nodeNum = latest.nodeNum AND t.timestamp = latest.maxTs
-        WHERE t.packetTimestamp IS NOT NULL AND t.packetTimestamp > ?${sourceFilter}
-      `, params) as any;
-      return (rows as any[]).map((r: any) => ({
-        nodeNum: Number(r.nodeNum),
-        timestamp: Number(r.timestamp),
-        packetTimestamp: Number(r.packetTimestamp)
-      }));
-    }
-
-    // SQLite
-    const sourceFilter = sourceId ? ' AND t.sourceId = ?' : '';
-    const innerFilter = sourceId ? ' AND sourceId = ?' : '';
-    const params: any[] = [MIN_VALID_TIMESTAMP_MS];
-    if (sourceId) params.push(sourceId);
-    params.push(MIN_VALID_TIMESTAMP_MS);
-    if (sourceId) params.push(sourceId);
-    const stmt = this.db.prepare(`
-      SELECT t.nodeNum, t.timestamp, t.packetTimestamp
-      FROM telemetry t
-      INNER JOIN (
-        SELECT nodeNum, MAX(timestamp) as maxTs
-        FROM telemetry
-        WHERE packetTimestamp IS NOT NULL AND packetTimestamp > ?${innerFilter}
-        GROUP BY nodeNum
-      ) latest ON t.nodeNum = latest.nodeNum AND t.timestamp = latest.maxTs
-      WHERE t.packetTimestamp IS NOT NULL AND t.packetTimestamp > ?${sourceFilter}
-    `);
-    return (stmt.all(...params) as any[]).map((r: any) => ({
-      nodeNum: Number(r.nodeNum),
-      timestamp: Number(r.timestamp),
-      packetTimestamp: Number(r.packetTimestamp)
-    }));
+    return this.telemetry.getLatestPacketTimestampsPerNode(MIN_VALID_TIMESTAMP_MS, sourceId);
   }
 
   // Message operations
@@ -3116,45 +2685,12 @@ class DatabaseService {
       return true;
     }
 
-    // SQLite synchronous path - Use INSERT OR IGNORE to silently skip duplicate messages
-    // (mesh networks can retransmit packets or send duplicates during reconnections)
-    const stmt = this.db.prepare(`
-      INSERT OR IGNORE INTO messages (
-        id, fromNodeNum, toNodeNum, fromNodeId, toNodeId,
-        text, channel, portnum, timestamp, rxTime, hopStart, hopLimit, relayNode, replyId, emoji,
-        requestId, ackFailed, routingErrorReceived, deliveryState, wantAck, viaMqtt, rxSnr, rxRssi, createdAt, decrypted_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const result = stmt.run(
-      messageData.id,
-      messageData.fromNodeNum,
-      messageData.toNodeNum,
-      messageData.fromNodeId,
-      messageData.toNodeId,
-      messageData.text,
-      messageData.channel,
-      messageData.portnum ?? null,
-      messageData.timestamp,
-      messageData.rxTime ?? null,
-      messageData.hopStart ?? null,
-      messageData.hopLimit ?? null,
-      messageData.relayNode ?? null,
-      messageData.replyId ?? null,
-      messageData.emoji ?? null,
-      (messageData as any).requestId ?? null,
-      (messageData as any).ackFailed ? 1 : 0,
-      (messageData as any).routingErrorReceived ? 1 : 0,
-      (messageData as any).deliveryState ?? null,
-      (messageData as any).wantAck ? 1 : 0,
-      messageData.viaMqtt ? 1 : 0,
-      messageData.rxSnr ?? null,
-      messageData.rxRssi ?? null,
-      messageData.createdAt,
-      messageData.decryptedBy ?? null
-    );
-    // result.changes is 0 when INSERT OR IGNORE skips a duplicate
-    return result.changes > 0;
+    // SQLite synchronous path - delegate to MessagesRepository Drizzle sync variant.
+    // INSERT OR IGNORE semantics preserved via onConflictDoNothing().
+    if (this.messagesRepo) {
+      return this.messagesRepo.insertMessageSqlite(messageData as any);
+    }
+    return false;
   }
 
   getMessage(id: string): DbMessage | null {
@@ -3162,9 +2698,12 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return this._messagesCache.find(m => m.id === id) ?? null;
     }
-    const stmt = this.db.prepare('SELECT * FROM messages WHERE id = ?');
-    const message = stmt.get(id) as DbMessage | null;
-    return message ? this.normalizeBigInts(message) : null;
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      const msg = this.messagesRepo.getMessageSqlite(id);
+      return msg ? this.convertRepoMessage(msg as any) : null;
+    }
+    return null;
   }
 
   getMessageByRequestId(requestId: number): DbMessage | null {
@@ -3172,9 +2711,12 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return this._messagesCache.find(m => m.requestId === requestId) ?? null;
     }
-    const stmt = this.db.prepare('SELECT * FROM messages WHERE requestId = ?');
-    const message = stmt.get(requestId) as DbMessage | null;
-    return message ? this.normalizeBigInts(message) : null;
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      const msg = this.messagesRepo.getMessageByRequestIdSqlite(requestId);
+      return msg ? this.convertRepoMessage(msg as any) : null;
+    }
+    return null;
   }
 
   async getMessageByRequestIdAsync(requestId: number): Promise<DbMessage | null> {
@@ -3273,13 +2815,12 @@ class DatabaseService {
       }
       return this._messagesCache;
     }
-    const stmt = this.db.prepare(`
-      SELECT * FROM messages
-      ORDER BY COALESCE(rxTime, timestamp) DESC
-      LIMIT ? OFFSET ?
-    `);
-    const messages = stmt.all(limit, offset) as DbMessage[];
-    return messages.map(message => this.normalizeBigInts(message));
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      const rows = this.messagesRepo.getMessagesSqlite(limit, offset);
+      return rows.map(msg => this.convertRepoMessage(msg as any));
+    }
+    return [];
   }
 
   getMessagesByChannel(channel: number, limit: number = 100, offset: number = 0): DbMessage[] {
@@ -3317,14 +2858,12 @@ class DatabaseService {
       }
       return this._messagesCacheChannel.get(channel) || [];
     }
-    const stmt = this.db.prepare(`
-      SELECT * FROM messages
-      WHERE channel = ?
-      ORDER BY COALESCE(rxTime, timestamp) DESC
-      LIMIT ? OFFSET ?
-    `);
-    const messages = stmt.all(channel, limit, offset) as DbMessage[];
-    return messages.map(message => this.normalizeBigInts(message));
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      const rows = this.messagesRepo.getMessagesByChannelSqlite(channel, limit, offset);
+      return rows.map(msg => this.convertRepoMessage(msg as any));
+    }
+    return [];
   }
 
   // Direct messages methods moved to MessagesRepository (databaseService.messages.getDirectMessages)
@@ -3336,13 +2875,12 @@ class DatabaseService {
         .filter(m => m.timestamp > timestamp)
         .sort((a, b) => a.timestamp - b.timestamp);
     }
-    const stmt = this.db.prepare(`
-      SELECT * FROM messages
-      WHERE timestamp > ?
-      ORDER BY timestamp ASC
-    `);
-    const messages = stmt.all(timestamp) as DbMessage[];
-    return messages.map(message => this.normalizeBigInts(message));
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      const rows = this.messagesRepo.getMessagesAfterTimestampSqlite(timestamp);
+      return rows.map(msg => this.convertRepoMessage(msg as any));
+    }
+    return [];
   }
 
   async searchMessagesAsync(options: {
@@ -3369,9 +2907,11 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return this._messagesCache.length;
     }
-    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM messages');
-    const result = stmt.get() as { count: number };
-    return Number(result.count);
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.getMessageCountSqlite();
+    }
+    return 0;
   }
 
   getNodeCount(): number {
@@ -3383,9 +2923,7 @@ class DatabaseService {
       }
       return this.nodesCache.size;
     }
-    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM nodes');
-    const result = stmt.get() as { count: number };
-    return Number(result.count);
+    return this.nodesRepo!.getNodeCountSqlite();
   }
 
   getTelemetryCount(): number {
@@ -3394,9 +2932,7 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return 0;
     }
-    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM telemetry');
-    const result = stmt.get() as { count: number };
-    return Number(result.count);
+    return this.telemetry.getTelemetryCountSync();
   }
 
   /** @deprecated Use databaseService.telemetry.getTelemetryCount() instead */
@@ -3409,28 +2945,7 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return 0;
     }
-
-    let query = 'SELECT COUNT(*) as count FROM telemetry WHERE nodeId = ?';
-    const params: any[] = [nodeId];
-
-    if (sinceTimestamp !== undefined) {
-      query += ' AND timestamp >= ?';
-      params.push(sinceTimestamp);
-    }
-
-    if (beforeTimestamp !== undefined) {
-      query += ' AND timestamp < ?';
-      params.push(beforeTimestamp);
-    }
-
-    if (telemetryType !== undefined) {
-      query += ' AND telemetryType = ?';
-      params.push(telemetryType);
-    }
-
-    const stmt = this.db.prepare(query);
-    const result = stmt.get(...params) as { count: number };
-    return Number(result.count);
+    return this.telemetry.getTelemetryCountByNodeSync(nodeId, sinceTimestamp, beforeTimestamp, telemetryType);
   }
 
   /** @deprecated Use databaseService.telemetry.getTelemetryCountByNode() instead */
@@ -3493,8 +3008,7 @@ class DatabaseService {
       }
 
       // Update the mobile flag in the database
-      const stmt = this.db.prepare('UPDATE nodes SET mobile = ? WHERE nodeId = ?');
-      stmt.run(isMobile, nodeId);
+      this.nodesRepo!.updateNodeMobilitySqlite(nodeId, isMobile);
 
       return isMobile;
     } catch (error) {
@@ -3575,72 +3089,18 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return [];
     }
-
-    const stmt = this.db.prepare(`
-      SELECT
-        date(timestamp/1000, 'unixepoch') as date,
-        COUNT(*) as count
-      FROM messages
-      WHERE timestamp > ?
-      GROUP BY date(timestamp/1000, 'unixepoch')
-      ORDER BY date
-    `);
-
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const results = stmt.all(cutoff) as Array<{ date: string; count: number }>;
-    return results.map(row => ({
-      date: row.date,
-      count: Number(row.count)
-    }));
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.getMessagesByDaySqlite(days);
+    }
+    return [];
   }
 
   async getMessagesByDayAsync(days: number = 7, sourceId?: string): Promise<Array<{ date: string; count: number }>> {
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const pgSourceClause = sourceId ? ` AND "sourceId" = $2` : '';
-    const mysqlSourceClause = sourceId ? ` AND sourceId = ?` : '';
-    const sqliteSourceClause = sourceId ? ` AND sourceId = ?` : '';
-
-    if (this.drizzleDbType === 'postgres') {
-      const client = await this.postgresPool!.connect();
-      try {
-        const params: any[] = [cutoff];
-        if (sourceId) params.push(sourceId);
-        const result = await client.query(
-          `SELECT to_char(to_timestamp(timestamp/1000), 'YYYY-MM-DD') as date, COUNT(*) as count
-           FROM messages WHERE timestamp > $1${pgSourceClause}
-           GROUP BY to_char(to_timestamp(timestamp/1000), 'YYYY-MM-DD')
-           ORDER BY date`,
-          params
-        );
-        return result.rows.map((row: any) => ({ date: row.date, count: Number(row.count) }));
-      } finally {
-        client.release();
-      }
-    } else if (this.drizzleDbType === 'mysql') {
-      const pool = this.mysqlPool!;
-      const params: any[] = [cutoff];
-      if (sourceId) params.push(sourceId);
-      const [rows] = await pool.query(
-        `SELECT DATE_FORMAT(FROM_UNIXTIME(timestamp/1000), '%Y-%m-%d') as date, COUNT(*) as count
-         FROM messages WHERE timestamp > ?${mysqlSourceClause}
-         GROUP BY DATE_FORMAT(FROM_UNIXTIME(timestamp/1000), '%Y-%m-%d')
-         ORDER BY date`,
-        params
-      );
-      return (rows as any[]).map((row: any) => ({ date: row.date, count: Number(row.count) }));
+    if (this.messagesRepo) {
+      return this.messagesRepo.getMessagesByDay(days, sourceId);
     }
-
-    // SQLite
-    if (sourceId) {
-      const stmt = this.db.prepare(`
-        SELECT date(timestamp/1000, 'unixepoch') as date, COUNT(*) as count
-        FROM messages WHERE timestamp > ?${sqliteSourceClause}
-        GROUP BY date(timestamp/1000, 'unixepoch') ORDER BY date
-      `);
-      const results = stmt.all(cutoff, sourceId) as Array<{ date: string; count: number }>;
-      return results.map(row => ({ date: row.date, count: Number(row.count) }));
-    }
-    return this.getMessagesByDay(days);
+    return [];
   }
 
   // Cleanup operations
@@ -3654,11 +3114,11 @@ class DatabaseService {
       }
       return 0;
     }
-
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const stmt = this.db.prepare('DELETE FROM messages WHERE timestamp < ?');
-    const result = stmt.run(cutoff);
-    return Number(result.changes);
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.cleanupOldMessagesSqlite(days);
+    }
+    return 0;
   }
 
   cleanupInactiveNodes(days: number = 30): number {
@@ -3675,9 +3135,7 @@ class DatabaseService {
 
     const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
     // Skip nodes that are ignored - they should persist even if inactive
-    const stmt = this.db.prepare('DELETE FROM nodes WHERE (lastHeard < ? OR lastHeard IS NULL) AND (isIgnored = 0 OR isIgnored IS NULL)');
-    const result = stmt.run(cutoff);
-    return Number(result.changes);
+    return this.nodesRepo!.deleteInactiveNodesSqlite(cutoff);
   }
 
   // Message deletion operations
@@ -3691,10 +3149,11 @@ class DatabaseService {
       }
       return true;
     }
-
-    const stmt = this.db.prepare('DELETE FROM messages WHERE id = ?');
-    const result = stmt.run(id);
-    return Number(result.changes) > 0;
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.deleteMessageSqlite(id);
+    }
+    return false;
   }
 
   purgeChannelMessages(channel: number, sourceId?: string): number {
@@ -3708,16 +3167,13 @@ class DatabaseService {
       return 0;
     }
 
-    // When sourceId is provided, restrict deletion to that source
-    if (sourceId) {
-      const stmt = this.db.prepare('DELETE FROM messages WHERE channel = ? AND source_id = ?');
-      const result = stmt.run(channel, sourceId);
-      return Number(result.changes);
+    // SQLite: dispatch to Drizzle-backed repo sync helper. Column names come
+    // from the schema, so the `sourceId` vs `source_id` mismatch that caused
+    // issue #2631 on SQLite can't recur.
+    if (this.messagesRepo) {
+      return this.messagesRepo.purgeChannelMessagesSqlite(channel, sourceId);
     }
-
-    const stmt = this.db.prepare('DELETE FROM messages WHERE channel = ?');
-    const result = stmt.run(channel);
-    return Number(result.changes);
+    return 0;
   }
 
   purgeDirectMessages(nodeNum: number, sourceId?: string): number {
@@ -3731,27 +3187,11 @@ class DatabaseService {
       return 0;
     }
 
-    // Delete all DMs to/from this node
-    // DMs are identified by fromNodeNum/toNodeNum pairs, regardless of channel.
-    // When sourceId is provided, restrict deletion to that source.
-    if (sourceId) {
-      const stmt = this.db.prepare(`
-        DELETE FROM messages
-        WHERE (fromNodeNum = ? OR toNodeNum = ?)
-        AND toNodeId != '!ffffffff'
-        AND source_id = ?
-      `);
-      const result = stmt.run(nodeNum, nodeNum, sourceId);
-      return Number(result.changes);
+    // SQLite: dispatch to Drizzle-backed repo sync helper.
+    if (this.messagesRepo) {
+      return this.messagesRepo.purgeDirectMessagesSqlite(nodeNum, sourceId);
     }
-
-    const stmt = this.db.prepare(`
-      DELETE FROM messages
-      WHERE (fromNodeNum = ? OR toNodeNum = ?)
-      AND toNodeId != '!ffffffff'
-    `);
-    const result = stmt.run(nodeNum, nodeNum);
-    return Number(result.changes);
+    return 0;
   }
 
   purgeNodeTraceroutes(nodeNum: number): number {
@@ -3766,12 +3206,7 @@ class DatabaseService {
     }
 
     // Delete all traceroutes involving this node (either as source or destination)
-    const stmt = this.db.prepare(`
-      DELETE FROM traceroutes
-      WHERE fromNodeNum = ? OR toNodeNum = ?
-    `);
-    const result = stmt.run(nodeNum, nodeNum);
-    return Number(result.changes);
+    return this.traceroutes.deleteTraceroutesInvolvingNodeSync(nodeNum);
   }
 
   purgeNodeTelemetry(nodeNum: number): number {
@@ -3786,9 +3221,7 @@ class DatabaseService {
     }
 
     // Delete all telemetry data for this node
-    const stmt = this.db.prepare('DELETE FROM telemetry WHERE nodeNum = ?');
-    const result = stmt.run(nodeNum);
-    return Number(result.changes);
+    return this.telemetry.deleteTelemetryByNodeSync(nodeNum);
   }
 
   deleteNode(nodeNum: number, sourceId: string): {
@@ -3828,37 +3261,28 @@ class DatabaseService {
     const dmsDeleted = this.purgeDirectMessages(nodeNum);
 
     // Also delete broadcast/channel messages FROM this node
-    // (messages the deleted node sent to public channels)
-    const broadcastStmt = this.db.prepare(`
-      DELETE FROM messages
-      WHERE fromNodeNum = ?
-      AND toNodeId = '!ffffffff'
-    `);
-    const broadcastResult = broadcastStmt.run(nodeNum);
-    const broadcastDeleted = Number(broadcastResult.changes);
+    // (messages the deleted node sent to public channels).
+    // SQLite: delegate to Drizzle sync variant.
+    const broadcastDeleted = this.messagesRepo
+      ? this.messagesRepo.deleteBroadcastMessagesFromNodeSqlite(nodeNum)
+      : 0;
 
     const messagesDeleted = dmsDeleted + broadcastDeleted;
     const traceroutesDeleted = this.purgeNodeTraceroutes(nodeNum);
     const telemetryDeleted = this.purgeNodeTelemetry(nodeNum);
 
     // Delete route segments where this node is involved
-    const routeSegmentsStmt = this.db.prepare(`
-      DELETE FROM route_segments
-      WHERE fromNodeNum = ? OR toNodeNum = ?
-    `);
-    routeSegmentsStmt.run(nodeNum, nodeNum);
+    this.traceroutes.deleteRouteSegmentsInvolvingNodeSync(nodeNum);
 
     // Delete neighbor_info records where this node is involved (either as source or neighbor)
-    const neighborInfoStmt = this.db.prepare(`
-      DELETE FROM neighbor_info
-      WHERE nodeNum = ? OR neighborNodeNum = ?
-    `);
-    neighborInfoStmt.run(nodeNum, nodeNum);
+    if (this.neighborsRepo) {
+      this.neighborsRepo.deleteNeighborInfoInvolvingNode(nodeNum).catch(err =>
+        logger.debug('Failed to delete neighbor info involving node:', err)
+      );
+    }
 
     // Delete the node from the nodes table (scoped to sourceId)
-    const nodeStmt = this.db.prepare('DELETE FROM nodes WHERE nodeNum = ? AND sourceId = ?');
-    const nodeResult = nodeStmt.run(nodeNum, sourceId);
-    const nodeDeleted = Number(nodeResult.changes) > 0;
+    const nodeDeleted = this.nodesRepo!.deleteNodeSqlite(nodeNum, sourceId);
 
     return {
       messagesDeleted,
@@ -3997,44 +3421,23 @@ class DatabaseService {
 
     const transaction = this.db.transaction(() => {
       // Clear existing data
-      this.db.exec('DELETE FROM messages');
-      this.db.exec('DELETE FROM nodes');
+      if (this.messagesRepo) {
+        this.messagesRepo.deleteAllMessagesSqlite();
+      }
+      this.nodesRepo!.truncateNodesSqlite();
 
-      // Import nodes
-      const nodeStmt = this.db.prepare(`
-        INSERT INTO nodes (
-          nodeNum, nodeId, longName, shortName, hwModel, macaddr,
-          latitude, longitude, altitude, batteryLevel, voltage,
-          channelUtilization, airUtilTx, lastHeard, snr, rssi,
-          createdAt, updatedAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
+      // Import nodes via repository
       for (const node of data.nodes) {
-        nodeStmt.run(
-          node.nodeNum, node.nodeId, node.longName, node.shortName,
-          node.hwModel, node.macaddr, node.latitude, node.longitude,
-          node.altitude, node.batteryLevel, node.voltage,
-          node.channelUtilization, node.airUtilTx, node.lastHeard,
-          node.snr, node.rssi, node.createdAt, node.updatedAt
-        );
+        this.nodesRepo!.importNodeSqlite(node);
       }
 
-      // Import messages
-      const msgStmt = this.db.prepare(`
-        INSERT INTO messages (
-          id, fromNodeNum, toNodeNum, fromNodeId, toNodeId,
-          text, channel, portnum, timestamp, rxTime, createdAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      for (const message of data.messages) {
-        msgStmt.run(
-          message.id, message.fromNodeNum, message.toNodeNum,
-          message.fromNodeId, message.toNodeId, message.text,
-          message.channel, message.portnum, message.timestamp,
-          message.rxTime, message.createdAt
-        );
+      // Import messages — delegate to the Drizzle-backed sync variant so
+      // column mapping matches the schema. insertMessageSqlite uses INSERT
+      // OR IGNORE which is safe on re-import (no duplicate-key failures).
+      if (this.messagesRepo) {
+        for (const message of data.messages) {
+          this.messagesRepo.insertMessageSqlite(message as any);
+        }
       }
     });
 
@@ -4113,60 +3516,20 @@ class DatabaseService {
       return;
     }
 
-    // SQLite path
-    let existingChannel: DbChannel | null = null;
-
-    // If we have an ID, check by ID FIRST
-    if (channelData.id !== undefined) {
-      existingChannel = this.getChannelById(channelData.id);
-      logger.info(`📝 getChannelById(${channelData.id}) returned: ${existingChannel ? `"${existingChannel.name}"` : 'null'}`);
+    // SQLite path — route through ChannelsRepository
+    if (channelData.id === undefined) {
+      logger.error(`❌ Cannot upsert channel without ID. Name: "${channelData.name}"`);
+      throw new Error('Channel ID is required for upsert operation');
     }
-
-    if (existingChannel) {
-      // Update existing channel (by name match or ID match)
-      logger.info(`📝 Updating channel ${existingChannel.id} from "${existingChannel.name}" to "${channelData.name}"`);
-      const stmt = this.db.prepare(`
-        UPDATE channels SET
-          name = ?,
-          psk = COALESCE(?, psk),
-          role = COALESCE(?, role),
-          uplinkEnabled = COALESCE(?, uplinkEnabled),
-          downlinkEnabled = COALESCE(?, downlinkEnabled),
-          positionPrecision = COALESCE(?, positionPrecision),
-          updatedAt = ?
-        WHERE id = ?
-      `);
-      const result = stmt.run(
-        channelData.name,
-        channelData.psk,
-        channelData.role !== undefined ? channelData.role : null,
-        channelData.uplinkEnabled !== undefined ? (channelData.uplinkEnabled ? 1 : 0) : null,
-        channelData.downlinkEnabled !== undefined ? (channelData.downlinkEnabled ? 1 : 0) : null,
-        channelData.positionPrecision !== undefined ? channelData.positionPrecision : null,
-        now,
-        existingChannel.id
-      );
-      logger.info(`✅ Updated channel ${existingChannel.id}, changes: ${result.changes}`);
-    } else {
-      // Create new channel
-      logger.debug(`📝 Creating new channel with ID: ${channelData.id !== undefined ? channelData.id : null}`);
-      const stmt = this.db.prepare(`
-        INSERT INTO channels (id, name, psk, role, uplinkEnabled, downlinkEnabled, positionPrecision, createdAt, updatedAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const result = stmt.run(
-        channelData.id !== undefined ? channelData.id : null,
-        channelData.name,
-        channelData.psk || null,
-        channelData.role !== undefined ? channelData.role : null,
-        channelData.uplinkEnabled !== undefined ? (channelData.uplinkEnabled ? 1 : 0) : 1,
-        channelData.downlinkEnabled !== undefined ? (channelData.downlinkEnabled ? 1 : 0) : 1,
-        channelData.positionPrecision !== undefined ? channelData.positionPrecision : null,
-        now,
-        now
-      );
-      logger.debug(`Created channel: ${channelData.name} (ID: ${channelData.id !== undefined ? channelData.id : 'auto'}), lastInsertRowid: ${result.lastInsertRowid}`);
-    }
+    this.channelsRepo!.upsertChannelSync({
+      id: channelData.id,
+      name: channelData.name,
+      psk: channelData.psk,
+      role: channelData.role,
+      uplinkEnabled: channelData.uplinkEnabled,
+      downlinkEnabled: channelData.downlinkEnabled,
+      positionPrecision: channelData.positionPrecision,
+    });
   }
 
   getChannelById(id: number): DbChannel | null {
@@ -4182,12 +3545,8 @@ class DatabaseService {
       }
       return channel;
     }
-    const stmt = this.db.prepare('SELECT * FROM channels WHERE id = ?');
-    const channel = stmt.get(id) as DbChannel | null;
-    if (id === 0) {
-      logger.info(`🔍 getChannelById(0) - RAW from DB: ${channel ? `name="${channel.name}" (length: ${channel.name?.length || 0})` : 'null'}`);
-    }
-    return channel ? this.normalizeBigInts(channel) : null;
+    const channel = this.channelsRepo!.getChannelByIdSync(id);
+    return channel;
   }
 
   getAllChannels(): DbChannel[] {
@@ -4199,9 +3558,7 @@ class DatabaseService {
       }
       return Array.from(this.channelsCache.values()).sort((a, b) => a.id - b.id);
     }
-    const stmt = this.db.prepare('SELECT * FROM channels ORDER BY id ASC');
-    const channels = stmt.all() as DbChannel[];
-    return channels.map(channel => this.normalizeBigInts(channel));
+    return this.channelsRepo!.getAllChannelsSync();
   }
 
   getChannelCount(): number {
@@ -4213,9 +3570,7 @@ class DatabaseService {
       }
       return this.channelsCache.size;
     }
-    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM channels');
-    const result = stmt.get() as { count: number };
-    return Number(result.count);
+    return this.channelsRepo!.getChannelCountSync();
   }
 
   // Clean up invalid channels that shouldn't have been created
@@ -4239,10 +3594,9 @@ class DatabaseService {
       logger.debug(`🧹 Cleaned up ${count} invalid channels (outside 0-7 range)`);
       return count;
     }
-    const stmt = this.db.prepare(`DELETE FROM channels WHERE id < 0 OR id > 7`);
-    const result = stmt.run();
-    logger.debug(`🧹 Cleaned up ${result.changes} invalid channels (outside 0-7 range)`);
-    return Number(result.changes);
+    const deleted = this.channelsRepo!.cleanupInvalidChannelsSync();
+    logger.debug(`🧹 Cleaned up ${deleted} invalid channels (outside 0-7 range)`);
+    return deleted;
   }
 
   // Clean up channels that appear to be empty/unused
@@ -4267,15 +3621,9 @@ class DatabaseService {
       logger.debug(`🧹 Cleaned up ${count} empty channels (ID > 1, no PSK/role)`);
       return count;
     }
-    const stmt = this.db.prepare(`
-      DELETE FROM channels
-      WHERE id > 1
-      AND psk IS NULL
-      AND role IS NULL
-    `);
-    const result = stmt.run();
-    logger.debug(`🧹 Cleaned up ${result.changes} empty channels (ID > 1, no PSK/role)`);
-    return Number(result.changes);
+    const deleted = this.channelsRepo!.cleanupEmptyChannelsSync();
+    logger.debug(`🧹 Cleaned up ${deleted} empty channels (ID > 1, no PSK/role)`);
+    return deleted;
   }
 
   // Telemetry operations
@@ -4301,22 +3649,7 @@ class DatabaseService {
       return;
     }
 
-    const stmt = this.db.prepare(`
-      INSERT INTO telemetry (
-        nodeId, nodeNum, telemetryType, timestamp, value, unit, createdAt, packetTimestamp
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      telemetryData.nodeId,
-      telemetryData.nodeNum,
-      telemetryData.telemetryType,
-      telemetryData.timestamp,
-      telemetryData.value,
-      telemetryData.unit || null,
-      telemetryData.createdAt,
-      telemetryData.packetTimestamp || null
-    );
+    this.telemetry.insertTelemetrySync(telemetryData);
 
     // Invalidate the telemetry types cache since we may have added a new type
     this.invalidateTelemetryTypesCache();
@@ -4331,36 +3664,7 @@ class DatabaseService {
   }
 
   getTelemetryByNode(nodeId: string, limit: number = 100, sinceTimestamp?: number, beforeTimestamp?: number, offset: number = 0, telemetryType?: string): DbTelemetry[] {
-    let query = `
-      SELECT * FROM telemetry
-      WHERE nodeId = ?
-    `;
-    const params: any[] = [nodeId];
-
-    if (sinceTimestamp !== undefined) {
-      query += ` AND timestamp >= ?`;
-      params.push(sinceTimestamp);
-    }
-
-    if (beforeTimestamp !== undefined) {
-      query += ` AND timestamp < ?`;
-      params.push(beforeTimestamp);
-    }
-
-    if (telemetryType !== undefined) {
-      query += ` AND telemetryType = ?`;
-      params.push(telemetryType);
-    }
-
-    query += `
-      ORDER BY timestamp DESC
-      LIMIT ? OFFSET ?
-    `;
-    params.push(limit, offset);
-
-    const stmt = this.db.prepare(query);
-    const telemetry = stmt.all(...params) as DbTelemetry[];
-    return telemetry.map(t => this.normalizeBigInts(t));
+    return this.telemetry.getTelemetryByNodeSync(nodeId, limit, sinceTimestamp, beforeTimestamp, offset, telemetryType) as unknown as DbTelemetry[];
   }
 
   /** @deprecated Use databaseService.telemetry.getTelemetryByNode() instead */
@@ -4407,6 +3711,7 @@ class DatabaseService {
     `;
     params.push(limit);
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(query);
     const telemetry = stmt.all(...params) as DbTelemetry[];
     return telemetry.map(t => this.normalizeBigInts(t));
@@ -4447,6 +3752,7 @@ class DatabaseService {
         AND t.timestamp = le.maxTimestamp
     `;
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(query);
     const results = stmt.all() as Array<{ nodeId: string; telemetryType: string; value: number }>;
 
@@ -4599,22 +3905,7 @@ class DatabaseService {
       return [];
     }
 
-    const query = `
-      SELECT id, fromNodeNum, toNodeNum, route, snrTowards, timestamp
-      FROM traceroutes
-      WHERE route IS NOT NULL AND route != '[]'
-      ORDER BY timestamp ASC
-    `;
-
-    const stmt = this.db.prepare(query);
-    return stmt.all() as Array<{
-      id: number;
-      fromNodeNum: number;
-      toNodeNum: number;
-      route: string | null;
-      snrTowards: string | null;
-      timestamp: number;
-    }>;
+    return this.traceroutesRepo!.getCompletedTraceroutesForMigrationSync();
   }
 
   /**
@@ -4622,12 +3913,7 @@ class DatabaseService {
    * Used during migration to force recalculation with new algorithm.
    */
   deleteAllEstimatedPositions(): number {
-    const stmt = this.db.prepare(`
-      DELETE FROM telemetry
-      WHERE telemetryType IN ('estimated_latitude', 'estimated_longitude')
-    `);
-    const result = stmt.run();
-    return result.changes;
+    return this.telemetry.deleteAllEstimatedPositionsSync();
   }
 
   // Cache for PostgreSQL telemetry data
@@ -4679,144 +3965,20 @@ class DatabaseService {
       actualIntervalMinutes = 3;
     }
 
-    // Calculate the interval in milliseconds
-    const intervalMs = actualIntervalMinutes * 60 * 1000;
-
-    // Telemetry types that should use raw values instead of averaging
-    // These are discrete integer values where averaging produces meaningless floats
-    const rawValueTypes = [
-      'sats_in_view',
-      'messageHops',
-      'batteryLevel',
-      'numOnlineNodes', 'numTotalNodes',
-      'numPacketsTx', 'numPacketsRx', 'numPacketsRxBad',
-      'numRxDupe', 'numTxRelay', 'numTxRelayCanceled', 'numTxDropped',
-      'systemNodeCount', 'systemDirectNodeCount',
-      'paxcounterWifi', 'paxcounterBle',
-      'particles03um', 'particles05um', 'particles10um',
-      'particles25um', 'particles50um', 'particles100um',
-      'co2', 'iaq',
-    ];
-
-    // Build the query to group and average telemetry data by time intervals
-    // Exclude raw value types from this query - they'll be fetched separately
-    let query = `
-      SELECT
-        nodeId,
-        nodeNum,
-        telemetryType,
-        CAST((timestamp / ?) * ? AS INTEGER) as timestamp,
-        AVG(value) as value,
-        unit,
-        MIN(createdAt) as createdAt
-      FROM telemetry
-      WHERE nodeId = ?
-        AND telemetryType NOT IN (${rawValueTypes.map(() => '?').join(', ')})
-    `;
-    const params: any[] = [intervalMs, intervalMs, nodeId, ...rawValueTypes];
-
-    // Scope to this source so nodes that exist in multiple sources don't mix telemetry
-    if (sourceId !== undefined) {
-      query += ` AND source_id = ?`;
-      params.push(sourceId);
+    // SQLite: delegate to Drizzle-backed repo sync helper. Keeps column names
+    // aligned with the schema (fixes issue #2631 where raw SQL used
+    // `source_id` while the schema column is `sourceId`).
+    if (!this.telemetryRepo) {
+      return [];
     }
-
-    if (sinceTimestamp !== undefined) {
-      query += ` AND timestamp >= ?`;
-      params.push(sinceTimestamp);
-    }
-
-    query += `
-      GROUP BY
-        nodeId,
-        nodeNum,
-        telemetryType,
-        CAST(timestamp / ? AS INTEGER),
-        unit
-      ORDER BY timestamp DESC
-    `;
-    params.push(intervalMs);
-
-    // Add limit based on max hours if specified
-    // Calculate points per hour based on the actual interval used
-    if (maxHours !== undefined) {
-      const pointsPerHour = 60 / actualIntervalMinutes;
-
-      // Query the actual number of distinct telemetry types for this node
-      // This is more efficient than using a blanket multiplier
-      let countQuery = `
-        SELECT COUNT(DISTINCT telemetryType) as typeCount
-        FROM telemetry
-        WHERE nodeId = ?
-      `;
-      const countParams: any[] = [nodeId];
-      if (sourceId !== undefined) {
-        countQuery += ` AND source_id = ?`;
-        countParams.push(sourceId);
-      }
-      if (sinceTimestamp !== undefined) {
-        countQuery += ` AND timestamp >= ?`;
-        countParams.push(sinceTimestamp);
-      }
-
-      const countStmt = this.db.prepare(countQuery);
-      const result = countStmt.get(...countParams) as { typeCount: number } | undefined;
-      const telemetryTypeCount = result?.typeCount || 1;
-
-      // Calculate limit: expected data points per type × number of types
-      // Add 50% padding to account for data density variations and ensure we don't cut off
-      const expectedPointsPerType = (maxHours + 1) * pointsPerHour;
-      const limit = Math.ceil(expectedPointsPerType * telemetryTypeCount * 1.5);
-
-      query += ` LIMIT ?`;
-      params.push(limit);
-    }
-
-    const stmt = this.db.prepare(query);
-    const telemetry = stmt.all(...params) as DbTelemetry[];
-
-    // Fetch raw values for types that shouldn't be averaged (sparse integer data)
-    let rawQuery = `
-      SELECT
-        nodeId,
-        nodeNum,
-        telemetryType,
-        timestamp,
-        value,
-        unit,
-        createdAt
-      FROM telemetry
-      WHERE nodeId = ?
-        AND telemetryType IN (${rawValueTypes.map(() => '?').join(', ')})
-    `;
-    const rawParams: any[] = [nodeId, ...rawValueTypes];
-
-    if (sourceId !== undefined) {
-      rawQuery += ` AND source_id = ?`;
-      rawParams.push(sourceId);
-    }
-
-    if (sinceTimestamp !== undefined) {
-      rawQuery += ` AND timestamp >= ?`;
-      rawParams.push(sinceTimestamp);
-    }
-
-    rawQuery += ` ORDER BY timestamp DESC`;
-
-    // Apply same limit logic for raw data
-    if (maxHours !== undefined) {
-      // For raw data, limit based on expected frequency (~10 per hour max for position data)
-      const rawLimit = Math.ceil((maxHours + 1) * 10 * rawValueTypes.length * 1.5);
-      rawQuery += ` LIMIT ?`;
-      rawParams.push(rawLimit);
-    }
-
-    const rawStmt = this.db.prepare(rawQuery);
-    const rawTelemetry = rawStmt.all(...rawParams) as DbTelemetry[];
-
-    // Combine averaged and raw telemetry
-    const combined = [...telemetry, ...rawTelemetry];
-    return combined.map(t => this.normalizeBigInts(t));
+    const rows = this.telemetryRepo.getTelemetryByNodeAveragedSqlite(
+      nodeId,
+      sinceTimestamp,
+      actualIntervalMinutes,
+      maxHours,
+      sourceId
+    );
+    return rows.map(t => this.normalizeBigInts(t));
   }
 
   /**
@@ -4865,6 +4027,7 @@ class DatabaseService {
 
     query += ` ORDER BY telemetryType, timestamp ASC`;
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(query);
     const rows = stmt.all(...params) as Array<{
       telemetryType: string;
@@ -5061,127 +4224,13 @@ class DatabaseService {
       return;
     }
 
-    // SQLite: Wrap in transaction to prevent race conditions
-    const transaction = this.db.transaction(() => {
-      const now = Date.now();
-      const pendingTimeoutAgo = now - PENDING_TRACEROUTE_TIMEOUT_MS;
-
-      // Check if there's a pending traceroute request (with null route) within the timeout window
-      // NOTE: When a traceroute response comes in, fromNum is the destination (responder) and toNum is the local node (requester)
-      // But when we created the pending record, fromNodeNum was the local node and toNodeNum was the destination
-      // So we need to check the REVERSE direction (toNum -> fromNum instead of fromNum -> toNum)
-      const findPendingStmt = this.db.prepare(
-        sourceId !== undefined
-          ? `SELECT id FROM traceroutes
-             WHERE fromNodeNum = ? AND toNodeNum = ?
-             AND route IS NULL
-             AND timestamp >= ?
-             AND sourceId = ?
-             ORDER BY timestamp DESC
-             LIMIT 1`
-          : `SELECT id FROM traceroutes
-             WHERE fromNodeNum = ? AND toNodeNum = ?
-             AND route IS NULL
-             AND timestamp >= ?
-             ORDER BY timestamp DESC
-             LIMIT 1`
-      );
-
-      const pendingRecord = (sourceId !== undefined
-        ? findPendingStmt.get(
-            tracerouteData.toNodeNum,
-            tracerouteData.fromNodeNum,
-            pendingTimeoutAgo,
-            sourceId
-          )
-        : findPendingStmt.get(
-            tracerouteData.toNodeNum,
-            tracerouteData.fromNodeNum,
-            pendingTimeoutAgo
-          )) as { id: number } | undefined;
-
-      if (pendingRecord) {
-        // Update the existing pending record with the response data
-        const updateStmt = this.db.prepare(`
-          UPDATE traceroutes
-          SET route = ?, routeBack = ?, snrTowards = ?, snrBack = ?, timestamp = ?
-          WHERE id = ?
-        `);
-
-        updateStmt.run(
-          tracerouteData.route || null,
-          tracerouteData.routeBack || null,
-          tracerouteData.snrTowards || null,
-          tracerouteData.snrBack || null,
-          tracerouteData.timestamp,
-          pendingRecord.id
-        );
-      } else {
-        // No pending request found, insert a new traceroute record
-        const insertStmt = this.db.prepare(`
-          INSERT INTO traceroutes (
-            fromNodeNum, toNodeNum, fromNodeId, toNodeId, route, routeBack, snrTowards, snrBack, timestamp, createdAt, sourceId
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        insertStmt.run(
-          tracerouteData.fromNodeNum,
-          tracerouteData.toNodeNum,
-          tracerouteData.fromNodeId,
-          tracerouteData.toNodeId,
-          tracerouteData.route || null,
-          tracerouteData.routeBack || null,
-          tracerouteData.snrTowards || null,
-          tracerouteData.snrBack || null,
-          tracerouteData.timestamp,
-          tracerouteData.createdAt,
-          sourceId ?? null
-        );
-      }
-
-      // Keep only the last N traceroutes for this source-destination pair
-      // Delete older traceroutes beyond the limit
-      const deleteOldStmt = this.db.prepare(
-        sourceId !== undefined
-          ? `DELETE FROM traceroutes
-             WHERE fromNodeNum = ? AND toNodeNum = ? AND sourceId = ?
-             AND id NOT IN (
-               SELECT id FROM traceroutes
-               WHERE fromNodeNum = ? AND toNodeNum = ? AND sourceId = ?
-               ORDER BY timestamp DESC
-               LIMIT ?
-             )`
-          : `DELETE FROM traceroutes
-             WHERE fromNodeNum = ? AND toNodeNum = ?
-             AND id NOT IN (
-               SELECT id FROM traceroutes
-               WHERE fromNodeNum = ? AND toNodeNum = ?
-               ORDER BY timestamp DESC
-               LIMIT ?
-             )`
-      );
-      if (sourceId !== undefined) {
-        deleteOldStmt.run(
-          tracerouteData.fromNodeNum,
-          tracerouteData.toNodeNum,
-          sourceId,
-          tracerouteData.fromNodeNum,
-          tracerouteData.toNodeNum,
-          sourceId,
-          TRACEROUTE_HISTORY_LIMIT
-        );
-      } else {
-        deleteOldStmt.run(
-          tracerouteData.fromNodeNum,
-          tracerouteData.toNodeNum,
-          tracerouteData.fromNodeNum,
-          tracerouteData.toNodeNum,
-          TRACEROUTE_HISTORY_LIMIT
-        );
-      }
-    });
-
-    transaction();
+    // SQLite: delegate to repository sync upsert (runs in a transaction)
+    this.traceroutes.upsertTracerouteSync(
+      tracerouteData,
+      PENDING_TRACEROUTE_TIMEOUT_MS,
+      TRACEROUTE_HISTORY_LIMIT,
+      sourceId
+    );
   }
 
   getTraceroutesByNodes(fromNodeNum: number, toNodeNum: number, limit: number = 10): DbTraceroute[] {
@@ -5206,16 +4255,7 @@ class DatabaseService {
     }
 
     // Search bidirectionally to capture traceroutes initiated from either direction
-    // This is especially important for 3rd party traceroutes (e.g., via Virtual Node)
-    // where the stored direction might be reversed from what's being queried
-    const stmt = this.db.prepare(`
-      SELECT * FROM traceroutes
-      WHERE (fromNodeNum = ? AND toNodeNum = ?) OR (fromNodeNum = ? AND toNodeNum = ?)
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-    const traceroutes = stmt.all(fromNodeNum, toNodeNum, toNodeNum, fromNodeNum, limit) as DbTraceroute[];
-    return traceroutes.map(t => this.normalizeBigInts(t));
+    return this.traceroutes.getTraceroutesByNodesSync(fromNodeNum, toNodeNum, limit) as unknown as DbTraceroute[];
   }
 
   getAllTraceroutes(limit: number = 100): DbTraceroute[] {
@@ -5240,13 +4280,7 @@ class DatabaseService {
       return this._traceroutesCache || [];
     }
 
-    const stmt = this.db.prepare(`
-      SELECT * FROM traceroutes
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-    const traceroutes = stmt.all(limit) as DbTraceroute[];
-    return traceroutes.map(t => this.normalizeBigInts(t));
+    return this.traceroutes.getAllTraceroutesRecentSync(limit) as unknown as DbTraceroute[];
   }
 
   getNodeNeedingTraceroute(localNodeNum: number): DbNode | null {
@@ -5296,40 +4330,12 @@ class DatabaseService {
     // Two categories:
     // 1. Nodes with no successful traceroute: retry every 3 hours
     // 2. Nodes with successful traceroute: retry every 24 hours
-    const stmt = this.db.prepare(`
-      SELECT n.*,
-        (SELECT COUNT(*) FROM traceroutes t
-         WHERE t.fromNodeNum = ? AND t.toNodeNum = n.nodeNum) as hasTraceroute
-      FROM nodes n
-      WHERE n.nodeNum != ?
-        AND n.lastHeard > ?
-        AND (
-          -- Category 1: No traceroute exists, and (never requested OR requested > 3 hours ago)
-          (
-            (SELECT COUNT(*) FROM traceroutes t
-             WHERE t.fromNodeNum = ? AND t.toNodeNum = n.nodeNum) = 0
-            AND (n.lastTracerouteRequest IS NULL OR n.lastTracerouteRequest < ?)
-          )
-          OR
-          -- Category 2: Traceroute exists, and (never requested OR requested > expiration hours ago)
-          (
-            (SELECT COUNT(*) FROM traceroutes t
-             WHERE t.fromNodeNum = ? AND t.toNodeNum = n.nodeNum) > 0
-            AND (n.lastTracerouteRequest IS NULL OR n.lastTracerouteRequest < ?)
-          )
-        )
-      ORDER BY n.lastHeard DESC
-    `);
-
-    let eligibleNodes = stmt.all(
-      localNodeNum,
+    let eligibleNodes = this.traceroutesRepo!.getEligibleTracerouteCandidatesSync(
       localNodeNum,
       activeNodeCutoff,
-      localNodeNum,
       now - THREE_HOURS_MS,
-      localNodeNum,
       now - EXPIRATION_MS
-    ) as DbNode[];
+    ) as unknown as DbNode[];
 
     // Apply last-heard filter (AND logic — applied before OR union filters)
     if (filterLastHeardEnabled) {
@@ -5713,67 +4719,32 @@ class DatabaseService {
 
     // SQLite path
     // Update the nodes table with last request time (Phase 3C: scoped per-source when available).
-    if (sourceId) {
-      const updateStmt = this.db.prepare(`
-        UPDATE nodes SET lastTracerouteRequest = ? WHERE nodeNum = ? AND sourceId = ?
-      `);
-      updateStmt.run(now, toNodeNum, sourceId);
-    } else {
-      const updateStmt = this.db.prepare(`
-        UPDATE nodes SET lastTracerouteRequest = ? WHERE nodeNum = ?
-      `);
-      updateStmt.run(now, toNodeNum);
-    }
+    this.nodesRepo!.updateNodeLastTracerouteRequestSqlite(toNodeNum, now, sourceId);
 
     // Insert a traceroute record for the attempt (with null routes indicating pending)
     const fromNodeId = `!${fromNodeNum.toString(16).padStart(8, '0')}`;
     const toNodeId = `!${toNodeNum.toString(16).padStart(8, '0')}`;
 
-    const insertStmt = this.db.prepare(`
-      INSERT INTO traceroutes (
-        fromNodeNum, toNodeNum, fromNodeId, toNodeId, route, routeBack, snrTowards, snrBack, timestamp, createdAt, sourceId
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    insertStmt.run(
-      fromNodeNum,
-      toNodeNum,
-      fromNodeId,
-      toNodeId,
-      null, // route will be null until response received
-      null, // routeBack will be null until response received
-      null, // snrTowards will be null until response received
-      null, // snrBack will be null until response received
-      now,
-      now,
-      sourceId ?? null
+    // upsertTracerouteSync handles insert + history prune in a transaction.
+    // Using a pending timeout of 0 guarantees no "pending match" occurs so
+    // we always insert a new pending record (matching legacy behavior).
+    this.traceroutes.upsertTracerouteSync(
+      {
+        fromNodeNum,
+        toNodeNum,
+        fromNodeId,
+        toNodeId,
+        route: null as unknown as string,
+        routeBack: null as unknown as string,
+        snrTowards: null as unknown as string,
+        snrBack: null as unknown as string,
+        timestamp: now,
+        createdAt: now,
+      } as DbTraceroute,
+      0,
+      TRACEROUTE_HISTORY_LIMIT,
+      sourceId
     );
-
-    // Keep only the last N traceroutes for this source-destination pair
-    const deleteOldStmt = this.db.prepare(
-      sourceId !== undefined
-        ? `DELETE FROM traceroutes
-           WHERE fromNodeNum = ? AND toNodeNum = ? AND sourceId = ?
-           AND id NOT IN (
-             SELECT id FROM traceroutes
-             WHERE fromNodeNum = ? AND toNodeNum = ? AND sourceId = ?
-             ORDER BY timestamp DESC
-             LIMIT ?
-           )`
-        : `DELETE FROM traceroutes
-           WHERE fromNodeNum = ? AND toNodeNum = ?
-           AND id NOT IN (
-             SELECT id FROM traceroutes
-             WHERE fromNodeNum = ? AND toNodeNum = ?
-             ORDER BY timestamp DESC
-             LIMIT ?
-           )`
-    );
-    if (sourceId !== undefined) {
-      deleteOldStmt.run(fromNodeNum, toNodeNum, sourceId, fromNodeNum, toNodeNum, sourceId, TRACEROUTE_HISTORY_LIMIT);
-    } else {
-      deleteOldStmt.run(fromNodeNum, toNodeNum, fromNodeNum, toNodeNum, TRACEROUTE_HISTORY_LIMIT);
-    }
   }
 
   // Auto-traceroute node filter methods
@@ -5781,42 +4752,14 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       throw new Error(`SQLite method 'getAutoTracerouteNodes' called but using ${this.drizzleDbType} database. Use getAutoTracerouteNodesAsync() instead.`);
     }
-    const stmt = this.db.prepare(`
-      SELECT nodeNum FROM auto_traceroute_nodes
-      ORDER BY createdAt ASC
-    `);
-    const nodes = stmt.all() as { nodeNum: number }[];
-    return nodes.map(n => Number(n.nodeNum));
+    return this.misc!.getAutoTracerouteNodesSync();
   }
 
   setAutoTracerouteNodes(nodeNums: number[]): void {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       throw new Error(`SQLite method 'setAutoTracerouteNodes' called but using ${this.drizzleDbType} database. Use setAutoTracerouteNodesAsync() instead.`);
     }
-    const now = Date.now();
-
-    // Use a transaction for atomic operation
-    const deleteStmt = this.db.prepare('DELETE FROM auto_traceroute_nodes');
-    const insertStmt = this.db.prepare(`
-      INSERT INTO auto_traceroute_nodes (nodeNum, createdAt)
-      VALUES (?, ?)
-    `);
-
-    this.db.transaction(() => {
-      // Clear existing entries
-      deleteStmt.run();
-
-      // Insert new entries
-      for (const nodeNum of nodeNums) {
-        try {
-          insertStmt.run(nodeNum, now);
-        } catch (error) {
-          // Ignore duplicate entries or foreign key violations
-          logger.debug(`Skipping invalid nodeNum: ${nodeNum}`, error);
-        }
-      }
-    })();
-
+    this.misc!.setAutoTracerouteNodesSync(nodeNums);
     logger.debug(`✅ Set auto-traceroute filter to ${nodeNums.length} nodes`);
   }
 
@@ -6276,47 +5219,16 @@ class DatabaseService {
 
   // Auto-traceroute log methods
   logAutoTracerouteAttempt(toNodeNum: number, toNodeName: string | null, sourceId?: string): number {
-    const now = Date.now();
-    const stmt = this.db.prepare(`
-      INSERT INTO auto_traceroute_log (timestamp, to_node_num, to_node_name, success, created_at, sourceId)
-      VALUES (?, ?, ?, NULL, ?, ?)
-    `);
-    const result = stmt.run(now, toNodeNum, toNodeName, now, sourceId ?? null);
-
-    // Clean up old entries (keep last 100)
-    const cleanupStmt = this.db.prepare(`
-      DELETE FROM auto_traceroute_log
-      WHERE id NOT IN (
-        SELECT id FROM auto_traceroute_log
-        ORDER BY timestamp DESC
-        LIMIT 100
-      )
-    `);
-    cleanupStmt.run();
-
-    return result.lastInsertRowid as number;
+    return this.misc!.logAutoTracerouteAttemptSync(toNodeNum, toNodeName, sourceId);
   }
 
   updateAutoTracerouteResult(logId: number, success: boolean): void {
-    const stmt = this.db.prepare(`
-      UPDATE auto_traceroute_log SET success = ? WHERE id = ?
-    `);
-    stmt.run(success ? 1 : 0, logId);
+    this.misc!.updateAutoTracerouteResultSync(logId, success);
   }
 
   // Update the most recent pending auto-traceroute for a given destination
   updateAutoTracerouteResultByNode(toNodeNum: number, success: boolean): void {
-    const stmt = this.db.prepare(`
-      UPDATE auto_traceroute_log
-      SET success = ?
-      WHERE id = (
-        SELECT id FROM auto_traceroute_log
-        WHERE to_node_num = ? AND success IS NULL
-        ORDER BY timestamp DESC
-        LIMIT 1
-      )
-    `);
-    stmt.run(success ? 1 : 0, toNodeNum);
+    this.misc!.updateAutoTracerouteResultByNodeSync(toNodeNum, success);
   }
 
   getAutoTracerouteLog(limit: number = 10, sourceId?: string): {
@@ -6330,33 +5242,7 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return [];
     }
-
-    const stmt = sourceId
-      ? this.db.prepare(`
-          SELECT id, timestamp, to_node_num as toNodeNum, to_node_name as toNodeName, success
-          FROM auto_traceroute_log
-          WHERE sourceId = ?
-          ORDER BY timestamp DESC
-          LIMIT ?
-        `)
-      : this.db.prepare(`
-          SELECT id, timestamp, to_node_num as toNodeNum, to_node_name as toNodeName, success
-          FROM auto_traceroute_log
-          ORDER BY timestamp DESC
-          LIMIT ?
-        `);
-    const results = (sourceId ? stmt.all(sourceId, limit) : stmt.all(limit)) as {
-      id: number;
-      timestamp: number;
-      toNodeNum: number;
-      toNodeName: string | null;
-      success: number | null;
-    }[];
-
-    return results.map(r => ({
-      ...r,
-      success: r.success === null ? null : r.success === 1
-    }));
+    return this.misc!.getAutoTracerouteLogSync(limit, sourceId);
   }
 
   /**
@@ -6373,45 +5259,7 @@ class DatabaseService {
       // Fallback to sync for SQLite
       return this.getAutoTracerouteLog(limit, sourceId);
     }
-
-    try {
-      let results: any[] = [];
-
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const result = sourceId
-          ? await this.postgresPool.query(
-              `SELECT id, timestamp, to_node_num, to_node_name, success FROM auto_traceroute_log WHERE "sourceId" = $1 ORDER BY timestamp DESC LIMIT $2`,
-              [sourceId, limit]
-            )
-          : await this.postgresPool.query(
-              `SELECT id, timestamp, to_node_num, to_node_name, success FROM auto_traceroute_log ORDER BY timestamp DESC LIMIT $1`,
-              [limit]
-            );
-        results = result.rows || [];
-      } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const [rows] = sourceId
-          ? await this.mysqlPool.query(
-              `SELECT id, timestamp, to_node_num, to_node_name, success FROM auto_traceroute_log WHERE sourceId = ? ORDER BY timestamp DESC LIMIT ?`,
-              [sourceId, limit]
-            )
-          : await this.mysqlPool.query(
-              `SELECT id, timestamp, to_node_num, to_node_name, success FROM auto_traceroute_log ORDER BY timestamp DESC LIMIT ?`,
-              [limit]
-            );
-        results = rows as any[] || [];
-      }
-
-      return results.map((r: any) => ({
-        id: Number(r.id),
-        timestamp: Number(r.timestamp),
-        toNodeNum: Number(r.to_node_num),
-        toNodeName: r.to_node_name,
-        success: r.success === null ? null : Boolean(r.success)
-      }));
-    } catch (error) {
-      logger.error(`[DatabaseService] Failed to get auto traceroute log async: ${error}`);
-      return [];
-    }
+    return this.misc!.getAutoTracerouteLog(limit, sourceId);
   }
 
   /**
@@ -6422,55 +5270,7 @@ class DatabaseService {
       // Fallback to sync for SQLite
       return this.logAutoTracerouteAttempt(toNodeNum, toNodeName, sourceId);
     }
-
-    const now = Date.now();
-
-    try {
-      let insertedId = 0;
-
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const result = await this.postgresPool.query(
-          `INSERT INTO auto_traceroute_log (timestamp, to_node_num, to_node_name, success, created_at, "sourceId")
-           VALUES ($1, $2, $3, NULL, $4, $5) RETURNING id`,
-          [now, toNodeNum, toNodeName, now, sourceId ?? null]
-        );
-        insertedId = result.rows[0]?.id || 0;
-
-        // Clean up old entries (keep last 100)
-        await this.postgresPool.query(`
-          DELETE FROM auto_traceroute_log
-          WHERE id NOT IN (
-            SELECT id FROM auto_traceroute_log
-            ORDER BY timestamp DESC
-            LIMIT 100
-          )
-        `);
-      } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const [result] = await this.mysqlPool.query(
-          `INSERT INTO auto_traceroute_log (timestamp, to_node_num, to_node_name, success, created_at, sourceId)
-           VALUES (?, ?, ?, NULL, ?, ?)`,
-          [now, toNodeNum, toNodeName, now, sourceId ?? null]
-        ) as any;
-        insertedId = result.insertId || 0;
-
-        // Clean up old entries (keep last 100)
-        await this.mysqlPool.query(`
-          DELETE FROM auto_traceroute_log
-          WHERE id NOT IN (
-            SELECT id FROM (
-              SELECT id FROM auto_traceroute_log
-              ORDER BY timestamp DESC
-              LIMIT 100
-            ) AS keep_ids
-          )
-        `);
-      }
-
-      return insertedId;
-    } catch (error) {
-      logger.error(`[DatabaseService] Failed to log auto traceroute attempt async: ${error}`);
-      return 0;
-    }
+    return this.misc!.logAutoTracerouteAttempt(toNodeNum, toNodeName, sourceId);
   }
 
   /**
@@ -6482,36 +5282,7 @@ class DatabaseService {
       this.updateAutoTracerouteResultByNode(toNodeNum, success);
       return;
     }
-
-    try {
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        await this.postgresPool.query(`
-          UPDATE auto_traceroute_log
-          SET success = $1
-          WHERE id = (
-            SELECT id FROM auto_traceroute_log
-            WHERE to_node_num = $2 AND success IS NULL
-            ORDER BY timestamp DESC
-            LIMIT 1
-          )
-        `, [success ? 1 : 0, toNodeNum]);
-      } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        await this.mysqlPool.query(`
-          UPDATE auto_traceroute_log
-          SET success = ?
-          WHERE id = (
-            SELECT id FROM (
-              SELECT id FROM auto_traceroute_log
-              WHERE to_node_num = ? AND success IS NULL
-              ORDER BY timestamp DESC
-              LIMIT 1
-            ) AS subq
-          )
-        `, [success ? 1 : 0, toNodeNum]);
-      }
-    } catch (error) {
-      logger.error(`[DatabaseService] Failed to update auto traceroute result async: ${error}`);
-    }
+    await this.misc!.updateAutoTracerouteResultByNode(toNodeNum, success);
   }
 
   // Auto key repair state methods
@@ -6527,25 +5298,7 @@ class DatabaseService {
       return null;
     }
 
-    const stmt = this.db.prepare(`
-      SELECT nodeNum, attemptCount, lastAttemptTime, exhausted, startedAt
-      FROM auto_key_repair_state
-      WHERE nodeNum = ?
-    `);
-    const result = stmt.get(nodeNum) as {
-      nodeNum: number;
-      attemptCount: number;
-      lastAttemptTime: number | null;
-      exhausted: number;
-      startedAt: number;
-    } | undefined;
-
-    if (!result) return null;
-
-    return {
-      ...result,
-      exhausted: result.exhausted === 1
-    };
+    return this.miscRepo!.getKeyRepairStateSqlite(nodeNum);
   }
 
   async getKeyRepairStateAsync(nodeNum: number): Promise<{
@@ -6612,35 +5365,7 @@ class DatabaseService {
     }
 
     const existing = this.getKeyRepairState(nodeNum);
-    const now = Date.now();
-
-    if (existing) {
-      // Update existing state
-      const stmt = this.db.prepare(`
-        UPDATE auto_key_repair_state
-        SET attemptCount = ?, lastAttemptTime = ?, exhausted = ?
-        WHERE nodeNum = ?
-      `);
-      stmt.run(
-        state.attemptCount ?? existing.attemptCount,
-        state.lastAttemptTime ?? existing.lastAttemptTime,
-        (state.exhausted ?? existing.exhausted) ? 1 : 0,
-        nodeNum
-      );
-    } else {
-      // Insert new state
-      const stmt = this.db.prepare(`
-        INSERT INTO auto_key_repair_state (nodeNum, attemptCount, lastAttemptTime, exhausted, startedAt)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      stmt.run(
-        nodeNum,
-        state.attemptCount ?? 0,
-        state.lastAttemptTime ?? null,
-        (state.exhausted ?? false) ? 1 : 0,
-        state.startedAt ?? now
-      );
-    }
+    this.miscRepo!.setKeyRepairStateSqlite(nodeNum, state, existing);
   }
 
   async setKeyRepairStateAsync(nodeNum: number, state: {
@@ -6726,11 +5451,7 @@ class DatabaseService {
       return;
     }
 
-    const stmt = this.db.prepare(`
-      DELETE FROM auto_key_repair_state
-      WHERE nodeNum = ?
-    `);
-    stmt.run(nodeNum);
+    this.miscRepo!.clearKeyRepairStateSqlite(nodeNum);
   }
 
   getNodesNeedingKeyRepair(): {
@@ -6748,29 +5469,7 @@ class DatabaseService {
     }
 
     // Get nodes with keyMismatchDetected=true that are not exhausted
-    const stmt = this.db.prepare(`
-      SELECT
-        n.nodeNum,
-        n.nodeId,
-        n.longName,
-        n.shortName,
-        COALESCE(s.attemptCount, 0) as attemptCount,
-        s.lastAttemptTime,
-        s.startedAt
-      FROM nodes n
-      LEFT JOIN auto_key_repair_state s ON n.nodeNum = s.nodeNum
-      WHERE n.keyMismatchDetected = 1
-        AND (s.exhausted IS NULL OR s.exhausted = 0)
-    `);
-    return stmt.all() as {
-      nodeNum: number;
-      nodeId: string;
-      longName: string | null;
-      shortName: string | null;
-      attemptCount: number;
-      lastAttemptTime: number | null;
-      startedAt: number | null;
-    }[];
+    return this.miscRepo!.getNodesNeedingKeyRepairSqlite();
   }
 
   async getNodesNeedingKeyRepairAsync(): Promise<{
@@ -6851,25 +5550,7 @@ class DatabaseService {
       return 0;
     }
 
-    const now = Date.now();
-    const stmt = this.db.prepare(`
-      INSERT INTO auto_key_repair_log (timestamp, nodeNum, nodeName, action, success, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    const result = stmt.run(now, nodeNum, nodeName, action, success === null ? null : (success ? 1 : 0), now);
-
-    // Clean up old entries (keep last 100)
-    const cleanupStmt = this.db.prepare(`
-      DELETE FROM auto_key_repair_log
-      WHERE id NOT IN (
-        SELECT id FROM auto_key_repair_log
-        ORDER BY timestamp DESC
-        LIMIT 100
-      )
-    `);
-    cleanupStmt.run();
-
-    return result.lastInsertRowid as number;
+    return this.miscRepo!.logKeyRepairAttemptSqlite(nodeNum, nodeName, action, success, null, null, null);
   }
 
   getKeyRepairLog(limit: number = 50): {
@@ -6885,24 +5566,14 @@ class DatabaseService {
       return [];
     }
 
-    const stmt = this.db.prepare(`
-      SELECT id, timestamp, nodeNum, nodeName, action, success
-      FROM auto_key_repair_log
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-    const results = stmt.all(limit) as {
-      id: number;
-      timestamp: number;
-      nodeNum: number;
-      nodeName: string | null;
-      action: string;
-      success: number | null;
-    }[];
-
-    return results.map(r => ({
-      ...r,
-      success: r.success === null ? null : r.success === 1
+    const rows = this.miscRepo!.getKeyRepairLogSqlite(limit, undefined, false, false);
+    return rows.map(r => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      nodeNum: r.nodeNum,
+      nodeName: r.nodeName,
+      action: r.action,
+      success: r.success,
     }));
   }
 
@@ -6946,14 +5617,8 @@ class DatabaseService {
       );
       return (result as any).insertId || 0;
     }
-    // SQLite fallback - use existing sync method plus new columns
-    const stmt = this.db.prepare(`
-      INSERT INTO auto_key_repair_log (timestamp, nodeNum, nodeName, action, success, created_at, oldKeyFragment, newKeyFragment, sourceId)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(Date.now(), nodeNum, nodeName, action, success === null ? null : (success ? 1 : 0), Date.now(), oldKeyFragment, newKeyFragment, sourceId);
-    this.db.prepare('DELETE FROM auto_key_repair_log WHERE id NOT IN (SELECT id FROM auto_key_repair_log ORDER BY timestamp DESC LIMIT 100)').run();
-    return Number(info.lastInsertRowid);
+    // SQLite fallback - delegate to repo (uses raw better-sqlite3 for extended columns)
+    return this.miscRepo!.logKeyRepairAttemptSqlite(nodeNum, nodeName, action, success, oldKeyFragment, newKeyFragment, sourceId);
   }
 
   async getKeyRepairLogAsync(limit: number = 50, sourceId?: string): Promise<{
@@ -7052,44 +5717,10 @@ class DatabaseService {
         newKeyFragment: row.newKeyFragment || null,
       }));
     }
-    // SQLite — check if table exists first (may not exist if auto-key management was never enabled)
-    const hasTable = this.db.prepare(
-      "SELECT COUNT(*) as count FROM sqlite_master WHERE type='table' AND name='auto_key_repair_log'"
-    ).get() as { count: number };
-    if (hasTable.count === 0) {
-      return [];
-    }
-
-    // Check if migration 084 columns exist
-    const hasOldKeyCol = this.db.prepare(
-      "SELECT COUNT(*) as count FROM pragma_table_info('auto_key_repair_log') WHERE name='oldKeyFragment'"
-    ).get() as { count: number };
-    const selectCols = hasOldKeyCol.count > 0
-      ? 'id, timestamp, nodeNum, nodeName, action, success, oldKeyFragment, newKeyFragment'
-      : 'id, timestamp, nodeNum, nodeName, action, success';
-
-    // Check if sourceId column exists (migration 027)
-    const hasSourceIdColSqlite = this.db.prepare(
-      "SELECT COUNT(*) as count FROM pragma_table_info('auto_key_repair_log') WHERE name='sourceId'"
-    ).get() as { count: number };
-    const useSourceFilter = !!sourceId && hasSourceIdColSqlite.count > 0;
-    const whereClauseSqlite = useSourceFilter ? 'WHERE sourceId = ?' : '';
-    const paramsSqlite: any[] = useSourceFilter ? [sourceId, limit] : [limit];
-
-    const rows = this.db.prepare(`
-      SELECT ${selectCols}
-      FROM auto_key_repair_log ${whereClauseSqlite} ORDER BY timestamp DESC LIMIT ?
-    `).all(...paramsSqlite) as any[];
-    return rows.map((row: any) => ({
-      id: row.id,
-      timestamp: Number(row.timestamp),
-      nodeNum: Number(row.nodeNum),
-      nodeName: row.nodeName,
-      action: row.action,
-      success: row.success === null ? null : Boolean(row.success),
-      oldKeyFragment: row.oldKeyFragment || null,
-      newKeyFragment: row.newKeyFragment || null,
-    }));
+    // SQLite — delegate to repository (introspection + fetch)
+    const { tableExists, hasOldKeyCol, hasSourceId } = this.miscRepo!.getKeyRepairLogIntrospectionSqlite();
+    if (!tableExists) return [];
+    return this.miscRepo!.getKeyRepairLogSqlite(limit, sourceId, hasOldKeyCol, hasSourceId);
   }
 
   // Distance delete log methods moved to MiscRepository (databaseService.misc.getDistanceDeleteLog / addDistanceDeleteLogEntry)
@@ -7116,14 +5747,7 @@ class DatabaseService {
       return [];
     }
 
-    const stmt = this.db.prepare(`
-      SELECT * FROM telemetry
-      WHERE telemetryType = ?
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-    const telemetry = stmt.all(telemetryType, limit) as DbTelemetry[];
-    return telemetry.map(t => this.normalizeBigInts(t));
+    return this.telemetry.getTelemetryByTypeSync(telemetryType, limit) as unknown as DbTelemetry[];
   }
 
   /** @deprecated Use databaseService.telemetry.getTelemetryByType() instead */
@@ -7138,16 +5762,7 @@ class DatabaseService {
       return [];
     }
 
-    const stmt = this.db.prepare(`
-      SELECT * FROM telemetry t1
-      WHERE nodeId = ? AND timestamp = (
-        SELECT MAX(timestamp) FROM telemetry t2
-        WHERE t2.nodeId = t1.nodeId AND t2.telemetryType = t1.telemetryType
-      )
-      ORDER BY telemetryType ASC
-    `);
-    const telemetry = stmt.all(nodeId) as DbTelemetry[];
-    return telemetry.map(t => this.normalizeBigInts(t));
+    return this.telemetry.getLatestTelemetryByNodeSync(nodeId) as unknown as DbTelemetry[];
   }
 
   getLatestTelemetryForType(nodeId: string, telemetryType: string): DbTelemetry | null {
@@ -7158,14 +5773,7 @@ class DatabaseService {
       // The actual data will be fetched via API endpoints which can be async
       return null;
     }
-    const stmt = this.db.prepare(`
-      SELECT * FROM telemetry
-      WHERE nodeId = ? AND telemetryType = ?
-      ORDER BY timestamp DESC
-      LIMIT 1
-    `);
-    const telemetry = stmt.get(nodeId, telemetryType) as DbTelemetry | null;
-    return telemetry ? this.normalizeBigInts(telemetry) : null;
+    return this.telemetry.getLatestTelemetryForTypeSync(nodeId, telemetryType) as unknown as DbTelemetry | null;
   }
 
   /**
@@ -7202,12 +5810,7 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return [];
     }
-    const stmt = this.db.prepare(`
-      SELECT DISTINCT telemetryType FROM telemetry
-      WHERE nodeId = ?
-    `);
-    const results = stmt.all(nodeId) as Array<{ telemetryType: string }>;
-    return results.map(r => r.telemetryType);
+    return this.telemetry.getNodeTelemetryTypesSync(nodeId);
   }
 
   // Get all nodes with their telemetry types (cached for performance)
@@ -7237,16 +5840,7 @@ class DatabaseService {
     }
 
     // SQLite: query the database and update cache
-    const stmt = this.db.prepare(`
-      SELECT nodeId, GROUP_CONCAT(DISTINCT telemetryType) as types
-      FROM telemetry
-      GROUP BY nodeId
-    `);
-    const results = stmt.all() as Array<{ nodeId: string; types: string }>;
-    const map = new Map<string, string[]>();
-    results.forEach(r => {
-      map.set(r.nodeId, r.types ? r.types.split(',') : []);
-    });
+    const map = this.telemetry.getAllNodesTelemetryTypesSync();
 
     this.telemetryTypesCache = map;
     this.telemetryTypesCacheTime = now;
@@ -7275,16 +5869,7 @@ class DatabaseService {
     }
 
     // SQLite: query the database and update cache
-    const stmt = this.db.prepare(`
-      SELECT nodeId, GROUP_CONCAT(DISTINCT telemetryType) as types
-      FROM telemetry
-      GROUP BY nodeId
-    `);
-    const results = stmt.all() as Array<{ nodeId: string; types: string }>;
-    const map = new Map<string, string[]>();
-    results.forEach(r => {
-      map.set(r.nodeId, r.types ? r.types.split(',') : []);
-    });
+    const map = this.telemetry.getAllNodesTelemetryTypesSync();
 
     this.telemetryTypesCache = map;
     this.telemetryTypesCacheTime = now;
@@ -7318,13 +5903,22 @@ class DatabaseService {
     // SQLite: synchronous deletion
     // Delete in order to respect foreign key constraints
     // First delete all child records that reference nodes
-    this.db.exec('DELETE FROM messages');
-    this.db.exec('DELETE FROM telemetry');
-    this.db.exec('DELETE FROM traceroutes');
-    this.db.exec('DELETE FROM route_segments');
-    this.db.exec('DELETE FROM neighbor_info');
+    if (this.messagesRepo) {
+      this.messagesRepo.deleteAllMessagesSqlite();
+    }
+    this.telemetry.deleteAllTelemetrySync();
+    this.traceroutes.deleteAllTraceroutesSync();
+    this.traceroutes.deleteAllRouteSegmentsSync();
+    if (this.neighborsRepo) {
+      // Use Drizzle repo for all backends (including SQLite)
+      this.neighborsRepo.deleteAllNeighborInfo().catch(err =>
+        logger.debug('Failed to delete all neighbor info:', err)
+      );
+    }
     // Finally delete the nodes themselves
-    this.db.exec('DELETE FROM nodes');
+    this.nodesRepo!.truncateNodesSqlite();
+    // Telemetry cache invalidation after bulk purge
+    this.invalidateTelemetryTypesCache();
     logger.debug('✅ Successfully purged all nodes and related data');
   }
 
@@ -7336,6 +5930,7 @@ class DatabaseService {
       if (this.telemetryRepo) {
         this.telemetryRepo.deleteAllTelemetry().then(() => {
           logger.debug('✅ Successfully purged all telemetry');
+          this.invalidateTelemetryTypesCache();
         }).catch(err => {
           logger.error('Failed to purge all telemetry:', err);
         });
@@ -7345,7 +5940,8 @@ class DatabaseService {
       return;
     }
 
-    this.db.exec('DELETE FROM telemetry');
+    this.telemetry.deleteAllTelemetrySync();
+    this.invalidateTelemetryTypesCache();
   }
 
   purgeOldTelemetry(hoursToKeep: number, favoriteDaysToKeep?: number): number {
@@ -7397,10 +5993,10 @@ class DatabaseService {
 
     // If no favorite storage duration specified, purge all telemetry older than hoursToKeep
     if (!favoriteDaysToKeep) {
-      const stmt = this.db.prepare('DELETE FROM telemetry WHERE timestamp < ?');
-      const result = stmt.run(regularCutoffTime);
-      logger.debug(`🧹 Purged ${result.changes} old telemetry records (keeping last ${hoursToKeep} hours)`);
-      return Number(result.changes);
+      const deleted = this.telemetry.deleteOldTelemetrySync(regularCutoffTime);
+      logger.debug(`🧹 Purged ${deleted} old telemetry records (keeping last ${hoursToKeep} hours)`);
+      if (deleted > 0) this.invalidateTelemetryTypesCache();
+      return deleted;
     }
 
     // Get the list of favorited telemetry from settings
@@ -7416,42 +6012,28 @@ class DatabaseService {
 
     // If no favorites, just purge everything older than hoursToKeep
     if (favorites.length === 0) {
-      const stmt = this.db.prepare('DELETE FROM telemetry WHERE timestamp < ?');
-      const result = stmt.run(regularCutoffTime);
-      logger.debug(`🧹 Purged ${result.changes} old telemetry records (keeping last ${hoursToKeep} hours, no favorites)`);
-      return Number(result.changes);
+      const deleted = this.telemetry.deleteOldTelemetrySync(regularCutoffTime);
+      logger.debug(`🧹 Purged ${deleted} old telemetry records (keeping last ${hoursToKeep} hours, no favorites)`);
+      if (deleted > 0) this.invalidateTelemetryTypesCache();
+      return deleted;
     }
 
     // Calculate the cutoff time for favorited telemetry
     const favoriteCutoffTime = Date.now() - (favoriteDaysToKeep * 24 * 60 * 60 * 1000);
 
-    // Build a query to purge old telemetry, exempting favorited telemetry
-    // Purge non-favorited telemetry older than hoursToKeep
-    // Purge favorited telemetry older than favoriteDaysToKeep
-    let totalDeleted = 0;
-
-    // First, delete non-favorited telemetry older than regularCutoffTime
-    const conditions = favorites.map(() => '(nodeId = ? AND telemetryType = ?)').join(' OR ');
-    const params = favorites.flatMap(f => [f.nodeId, f.telemetryType]);
-
-    const deleteNonFavoritesStmt = this.db.prepare(
-      `DELETE FROM telemetry WHERE timestamp < ? AND NOT (${conditions})`
+    const { nonFavoritesDeleted, favoritesDeleted } = this.telemetry.deleteOldTelemetryWithFavoritesSync(
+      regularCutoffTime,
+      favoriteCutoffTime,
+      favorites
     );
-    const nonFavoritesResult = deleteNonFavoritesStmt.run(regularCutoffTime, ...params);
-    totalDeleted += Number(nonFavoritesResult.changes);
-
-    // Then, delete favorited telemetry older than favoriteCutoffTime
-    const deleteFavoritesStmt = this.db.prepare(
-      `DELETE FROM telemetry WHERE timestamp < ? AND (${conditions})`
-    );
-    const favoritesResult = deleteFavoritesStmt.run(favoriteCutoffTime, ...params);
-    totalDeleted += Number(favoritesResult.changes);
+    const totalDeleted = nonFavoritesDeleted + favoritesDeleted;
 
     logger.debug(
       `🧹 Purged ${totalDeleted} old telemetry records ` +
-      `(${nonFavoritesResult.changes} non-favorites older than ${hoursToKeep}h, ` +
-      `${favoritesResult.changes} favorites older than ${favoriteDaysToKeep}d)`
+      `(${nonFavoritesDeleted} non-favorites older than ${hoursToKeep}h, ` +
+      `${favoritesDeleted} favorites older than ${favoriteDaysToKeep}d)`
     );
+    if (totalDeleted > 0) this.invalidateTelemetryTypesCache();
     return totalDeleted;
   }
 
@@ -7463,11 +6045,13 @@ class DatabaseService {
 
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       await this.telemetry.deleteAllTelemetry();
+      this.invalidateTelemetryTypesCache();
       logger.debug('✅ Successfully purged all telemetry');
       return;
     }
 
-    this.db.exec('DELETE FROM telemetry');
+    this.telemetry.deleteAllTelemetrySync();
+    this.invalidateTelemetryTypesCache();
     logger.debug('✅ Successfully purged all telemetry');
   }
 
@@ -7511,12 +6095,12 @@ class DatabaseService {
       return totalDeleted;
     }
 
-    // SQLite: synchronous path
+    // SQLite: synchronous path via repository
     if (!favoriteDaysToKeep) {
-      const stmt = this.db.prepare('DELETE FROM telemetry WHERE timestamp < ?');
-      const result = stmt.run(regularCutoffTime);
-      logger.debug(`🧹 Purged ${result.changes} old telemetry records (keeping last ${hoursToKeep} hours)`);
-      return Number(result.changes);
+      const deleted = this.telemetry.deleteOldTelemetrySync(regularCutoffTime);
+      logger.debug(`🧹 Purged ${deleted} old telemetry records (keeping last ${hoursToKeep} hours)`);
+      if (deleted > 0) this.invalidateTelemetryTypesCache();
+      return deleted;
     }
 
     const favoritesStr = this.getSetting('telemetryFavorites');
@@ -7530,35 +6114,27 @@ class DatabaseService {
     }
 
     if (favorites.length === 0) {
-      const stmt = this.db.prepare('DELETE FROM telemetry WHERE timestamp < ?');
-      const result = stmt.run(regularCutoffTime);
-      logger.debug(`🧹 Purged ${result.changes} old telemetry records (keeping last ${hoursToKeep} hours, no favorites)`);
-      return Number(result.changes);
+      const deleted = this.telemetry.deleteOldTelemetrySync(regularCutoffTime);
+      logger.debug(`🧹 Purged ${deleted} old telemetry records (keeping last ${hoursToKeep} hours, no favorites)`);
+      if (deleted > 0) this.invalidateTelemetryTypesCache();
+      return deleted;
     }
 
     const favoriteCutoffTime = Date.now() - (favoriteDaysToKeep * 24 * 60 * 60 * 1000);
-    let totalDeleted = 0;
 
-    const conditions = favorites.map(() => '(nodeId = ? AND telemetryType = ?)').join(' OR ');
-    const params = favorites.flatMap(f => [f.nodeId, f.telemetryType]);
-
-    const deleteNonFavoritesStmt = this.db.prepare(
-      `DELETE FROM telemetry WHERE timestamp < ? AND NOT (${conditions})`
+    const { nonFavoritesDeleted, favoritesDeleted } = this.telemetry.deleteOldTelemetryWithFavoritesSync(
+      regularCutoffTime,
+      favoriteCutoffTime,
+      favorites
     );
-    const nonFavoritesResult = deleteNonFavoritesStmt.run(regularCutoffTime, ...params);
-    totalDeleted += Number(nonFavoritesResult.changes);
-
-    const deleteFavoritesStmt = this.db.prepare(
-      `DELETE FROM telemetry WHERE timestamp < ? AND (${conditions})`
-    );
-    const favoritesResult = deleteFavoritesStmt.run(favoriteCutoffTime, ...params);
-    totalDeleted += Number(favoritesResult.changes);
+    const totalDeleted = nonFavoritesDeleted + favoritesDeleted;
 
     logger.debug(
       `🧹 Purged ${totalDeleted} old telemetry records ` +
-      `(${nonFavoritesResult.changes} non-favorites older than ${hoursToKeep}h, ` +
-      `${favoritesResult.changes} favorites older than ${favoriteDaysToKeep}d)`
+      `(${nonFavoritesDeleted} non-favorites older than ${hoursToKeep}h, ` +
+      `${favoritesDeleted} favorites older than ${favoriteDaysToKeep}d)`
     );
+    if (totalDeleted > 0) this.invalidateTelemetryTypesCache();
     return totalDeleted;
   }
 
@@ -7582,9 +6158,11 @@ class DatabaseService {
       }
       return this.settingsCache.get(key) ?? null;
     }
-    const stmt = this.db.prepare('SELECT value FROM settings WHERE key = ?');
-    const row = stmt.get(key) as { value: string } | undefined;
-    return row ? row.value : null;
+    // SQLite: route through repo's sync drizzle path (no raw SQL)
+    if (this.settingsRepo) {
+      return this.settingsRepo.getSettingSync(key);
+    }
+    return null;
   }
 
   getAllSettings(): Record<string, string> {
@@ -7600,13 +6178,11 @@ class DatabaseService {
       });
       return settings;
     }
-    const stmt = this.db.prepare('SELECT key, value FROM settings');
-    const rows = stmt.all() as Array<{ key: string; value: string }>;
-    const settings: Record<string, string> = {};
-    rows.forEach(row => {
-      settings[row.key] = row.value;
-    });
-    return settings;
+    // SQLite: route through repo's sync drizzle path (no raw SQL)
+    if (this.settingsRepo) {
+      return this.settingsRepo.getAllSettingsSync();
+    }
+    return {};
   }
 
   setSetting(key: string, value: string): void {
@@ -7622,15 +6198,10 @@ class DatabaseService {
       }
       return;
     }
-    const now = Date.now();
-    const stmt = this.db.prepare(`
-      INSERT INTO settings (key, value, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        value = excluded.value,
-        updatedAt = excluded.updatedAt
-    `);
-    stmt.run(key, value, now, now);
+    // SQLite: route through repo's sync drizzle path (no raw SQL)
+    if (this.settingsRepo) {
+      this.settingsRepo.setSettingSync(key, value);
+    }
   }
 
   setSettings(settings: Record<string, string>): void {
@@ -7647,20 +6218,10 @@ class DatabaseService {
       }
       return;
     }
-    const now = Date.now();
-    const stmt = this.db.prepare(`
-      INSERT INTO settings (key, value, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        value = excluded.value,
-        updatedAt = excluded.updatedAt
-    `);
-
-    this.db.transaction(() => {
-      Object.entries(settings).forEach(([key, value]) => {
-        stmt.run(key, value, now, now);
-      });
-    })();
+    // SQLite: route through repo's sync drizzle path (no raw SQL)
+    if (this.settingsRepo) {
+      this.settingsRepo.setSettingsSync(settings);
+    }
   }
 
   deleteAllSettings(): void {
@@ -7675,7 +6236,10 @@ class DatabaseService {
       return;
     }
     logger.debug('🔄 Resetting all settings to defaults');
-    this.db.exec('DELETE FROM settings');
+    // SQLite: route through repo's sync drizzle path (no raw SQL)
+    if (this.settingsRepo) {
+      this.settingsRepo.deleteAllSettingsSync();
+    }
   }
 
   // ============ ASYNC NOTIFICATION PREFERENCES METHODS ============
@@ -7784,23 +6348,7 @@ class DatabaseService {
     }
 
     // SQLite path
-    const stmt = this.db.prepare(`
-      INSERT INTO route_segments (
-        fromNodeNum, toNodeNum, fromNodeId, toNodeId, distanceKm, isRecordHolder, timestamp, createdAt, sourceId
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      segmentData.fromNodeNum,
-      segmentData.toNodeNum,
-      segmentData.fromNodeId,
-      segmentData.toNodeId,
-      segmentData.distanceKm,
-      segmentData.isRecordHolder ? 1 : 0,
-      segmentData.timestamp,
-      segmentData.createdAt,
-      sourceId ?? null,
-    );
+    this.traceroutesRepo!.insertRouteSegmentSync(segmentData, sourceId);
   }
 
   getLongestActiveRouteSegment(sourceId?: string): DbRouteSegment | null {
@@ -7808,25 +6356,7 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return null;
     }
-    // Get the longest segment from recent traceroutes (within last 7 days)
-    const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
-    const stmt = sourceId !== undefined
-      ? this.db.prepare(`
-          SELECT * FROM route_segments
-          WHERE timestamp > ? AND sourceId IS ?
-          ORDER BY distanceKm DESC
-          LIMIT 1
-        `)
-      : this.db.prepare(`
-          SELECT * FROM route_segments
-          WHERE timestamp > ?
-          ORDER BY distanceKm DESC
-          LIMIT 1
-        `);
-    const segment = (sourceId !== undefined
-      ? stmt.get(cutoff, sourceId)
-      : stmt.get(cutoff)) as DbRouteSegment | null;
-    return segment ? this.normalizeBigInts(segment) : null;
+    return this.traceroutesRepo!.getLongestActiveRouteSegmentSync(sourceId) as unknown as DbRouteSegment | null;
   }
 
   getRecordHolderRouteSegment(sourceId?: string): DbRouteSegment | null {
@@ -7834,23 +6364,7 @@ class DatabaseService {
     if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
       return null;
     }
-    const stmt = sourceId !== undefined
-      ? this.db.prepare(`
-          SELECT * FROM route_segments
-          WHERE isRecordHolder = 1 AND sourceId IS ?
-          ORDER BY distanceKm DESC
-          LIMIT 1
-        `)
-      : this.db.prepare(`
-          SELECT * FROM route_segments
-          WHERE isRecordHolder = 1
-          ORDER BY distanceKm DESC
-          LIMIT 1
-        `);
-    const segment = (sourceId !== undefined
-      ? stmt.get(sourceId)
-      : stmt.get()) as DbRouteSegment | null;
-    return segment ? this.normalizeBigInts(segment) : null;
+    return this.traceroutesRepo!.getRecordHolderRouteSegmentSync(sourceId) as unknown as DbRouteSegment | null;
   }
 
   updateRecordHolderSegment(newSegment: DbRouteSegment, sourceId?: string): void {
@@ -7880,11 +6394,7 @@ class DatabaseService {
     if (!currentRecord || newSegment.distanceKm > currentRecord.distanceKm) {
       // Clear existing record holders for this source (IS NULL when scope is
       // global, exact match when scoped — keeps per-source records independent).
-      if (sourceId !== undefined) {
-        this.db.prepare('UPDATE route_segments SET isRecordHolder = 0 WHERE sourceId IS ?').run(sourceId);
-      } else {
-        this.db.exec('UPDATE route_segments SET isRecordHolder = 0');
-      }
+      this.traceroutesRepo!.clearRecordHolderSegmentSync(sourceId);
 
       // Insert new record holder
       this.insertRouteSegment({
@@ -7908,11 +6418,7 @@ class DatabaseService {
       return;
     }
 
-    if (sourceId !== undefined) {
-      this.db.prepare('UPDATE route_segments SET isRecordHolder = 0 WHERE sourceId IS ?').run(sourceId);
-    } else {
-      this.db.exec('UPDATE route_segments SET isRecordHolder = 0');
-    }
+    this.traceroutesRepo!.clearRecordHolderSegmentSync(sourceId);
     logger.debug('🗑️ Cleared record holder route segment');
   }
 
@@ -7927,22 +6433,7 @@ class DatabaseService {
       return 0;
     }
 
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    if (sourceId !== undefined) {
-      const stmt = this.db.prepare(`
-        DELETE FROM route_segments
-        WHERE timestamp < ? AND isRecordHolder = 0 AND sourceId IS ?
-      `);
-      const result = stmt.run(cutoff, sourceId);
-      return Number(result.changes);
-    }
-
-    const stmt = this.db.prepare(`
-      DELETE FROM route_segments
-      WHERE timestamp < ? AND isRecordHolder = 0
-    `);
-    const result = stmt.run(cutoff);
-    return Number(result.changes);
+    return this.traceroutesRepo!.cleanupOldRouteSegmentsSync(days, sourceId);
   }
 
   /**
@@ -7959,30 +6450,19 @@ class DatabaseService {
       return 0;
     }
 
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const stmt = this.db.prepare('DELETE FROM traceroutes WHERE timestamp < ?');
-    const result = stmt.run(cutoff);
-    return Number(result.changes);
+    return this.traceroutesRepo!.cleanupOldTraceroutesSync(days);
   }
 
   /**
    * Delete neighbor info records older than the specified number of days
    */
   cleanupOldNeighborInfo(days: number = 30): number {
-    // For PostgreSQL/MySQL, fire-and-forget async cleanup
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      if (this.neighborsRepo) {
-        this.neighborsRepo.cleanupOldNeighborInfo(days).catch(err => {
-          logger.debug('Failed to cleanup old neighbor info:', err);
-        });
-      }
-      return 0;
+    if (this.neighborsRepo) {
+      this.neighborsRepo.cleanupOldNeighborInfo(days).catch(err => {
+        logger.debug('Failed to cleanup old neighbor info:', err);
+      });
     }
-
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const stmt = this.db.prepare('DELETE FROM neighbor_info WHERE timestamp < ?');
-    const result = stmt.run(cutoff);
-    return Number(result.changes);
+    return 0;
   }
 
   /**
@@ -8008,6 +6488,7 @@ class DatabaseService {
     }
 
     logger.info('🧹 Running VACUUM on database...');
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     this.db.exec('VACUUM');
     logger.info('✅ VACUUM complete');
   }
@@ -8027,6 +6508,7 @@ class DatabaseService {
       return 0;
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare('SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()');
     const result = stmt.get() as { size: number } | undefined;
     return result?.size ?? 0;
@@ -8061,18 +6543,14 @@ class DatabaseService {
       return;
     }
 
-    const stmt = this.db.prepare(`
-      INSERT INTO neighbor_info (nodeNum, neighborNodeNum, snr, lastRxTime, timestamp, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      neighborInfo.nodeNum,
-      neighborInfo.neighborNodeNum,
-      neighborInfo.snr || null,
-      neighborInfo.lastRxTime || null,
-      neighborInfo.timestamp,
-      Date.now()
-    );
+    if (this.neighborsRepo) {
+      this.neighborsRepo.upsertNeighborInfo({
+        ...neighborInfo,
+        createdAt: Date.now()
+      } as DbNeighborInfo).catch(err =>
+        logger.debug('Failed to save neighbor info:', err)
+      );
+    }
   }
 
   /**
@@ -8093,9 +6571,12 @@ class DatabaseService {
       return;
     }
 
-    // SQLite: direct delete
-    const stmt = this.db.prepare('DELETE FROM neighbor_info WHERE nodeNum = ?');
-    stmt.run(nodeNum);
+    // SQLite: use repo
+    if (this.neighborsRepo) {
+      this.neighborsRepo.deleteNeighborInfoForNode(nodeNum).catch(err =>
+        logger.debug('Failed to clear neighbor info for node:', err)
+      );
+    }
   }
 
   private convertRepoNeighborInfo(n: import('../db/types.js').DbNeighborInfo): DbNeighborInfo {
@@ -8111,88 +6592,34 @@ class DatabaseService {
   }
 
   getNeighborsForNode(nodeNum: number): DbNeighborInfo[] {
-    // For PostgreSQL/MySQL, use async repo with cache
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      if (this.neighborsRepo) {
-        this.neighborsRepo.getNeighborsForNode(nodeNum).then(neighbors => {
-          this._neighborsByNodeCache.set(nodeNum, neighbors.map(n => this.convertRepoNeighborInfo(n)));
-        }).catch(err => logger.debug('Failed to get neighbors for node:', err));
-      }
-      return this._neighborsByNodeCache.get(nodeNum) || [];
+    // All backends: fire async repo refresh, return cached data immediately
+    if (this.neighborsRepo) {
+      this.neighborsRepo.getNeighborsForNode(nodeNum).then(neighbors => {
+        this._neighborsByNodeCache.set(nodeNum, neighbors.map(n => this.convertRepoNeighborInfo(n)));
+      }).catch(err => logger.debug('Failed to get neighbors for node:', err));
     }
-
-    const stmt = this.db.prepare(`
-      SELECT * FROM neighbor_info
-      WHERE nodeNum = ?
-      ORDER BY timestamp DESC
-    `);
-    return stmt.all(nodeNum) as DbNeighborInfo[];
+    return this._neighborsByNodeCache.get(nodeNum) || [];
   }
 
   getAllNeighborInfo(): DbNeighborInfo[] {
-    // For PostgreSQL/MySQL, use async repo with cache
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      if (this.neighborsRepo) {
-        this.neighborsRepo.getAllNeighborInfo().then(neighbors => {
-          this._neighborsCache = neighbors.map(n => this.convertRepoNeighborInfo(n));
-        }).catch(err => logger.debug('Failed to get all neighbor info:', err));
-      }
-      return this._neighborsCache;
+    // All backends: fire async repo refresh, return cached data immediately
+    if (this.neighborsRepo) {
+      this.neighborsRepo.getAllNeighborInfo().then(neighbors => {
+        this._neighborsCache = neighbors.map(n => this.convertRepoNeighborInfo(n));
+      }).catch(err => logger.debug('Failed to get all neighbor info:', err));
     }
-
-    const stmt = this.db.prepare(`
-      SELECT * FROM neighbor_info
-      ORDER BY timestamp DESC
-    `);
-    return stmt.all() as DbNeighborInfo[];
+    return this._neighborsCache;
   }
 
   getLatestNeighborInfoPerNode(): DbNeighborInfo[] {
-    // For PostgreSQL/MySQL, use the all neighbor info cache (simplified)
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      // Return cached data - getAllNeighborInfo is already ordered by timestamp DESC
-      // For now, just return all (filtering can be done on demand)
-      return this._neighborsCache;
-    }
-
-    const stmt = this.db.prepare(`
-      SELECT ni.*
-      FROM neighbor_info ni
-      INNER JOIN (
-        SELECT nodeNum, neighborNodeNum, MAX(timestamp) as maxTimestamp
-        FROM neighbor_info
-        GROUP BY nodeNum, neighborNodeNum
-      ) latest
-      ON ni.nodeNum = latest.nodeNum
-        AND ni.neighborNodeNum = latest.neighborNodeNum
-        AND ni.timestamp = latest.maxTimestamp
-    `);
-    return stmt.all() as DbNeighborInfo[];
+    // All backends: return the in-memory cache (populated via async repo calls)
+    // The cache is populated by getAllNeighborInfo() which fires on each read
+    return this._neighborsCache;
   }
 
   getLatestNeighborInfoPerNodeScoped(sourceId?: string): DbNeighborInfo[] {
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      if (!sourceId) return this._neighborsCache;
-      return this._neighborsCache.filter((ni: any) => ni.sourceId === sourceId);
-    }
-
     if (!sourceId) return this.getLatestNeighborInfoPerNode();
-
-    const stmt = this.db.prepare(`
-      SELECT ni.*
-      FROM neighbor_info ni
-      INNER JOIN (
-        SELECT nodeNum, neighborNodeNum, MAX(timestamp) as maxTimestamp
-        FROM neighbor_info
-        WHERE sourceId = ?
-        GROUP BY nodeNum, neighborNodeNum
-      ) latest
-      ON ni.nodeNum = latest.nodeNum
-        AND ni.neighborNodeNum = latest.neighborNodeNum
-        AND ni.timestamp = latest.maxTimestamp
-      WHERE ni.sourceId = ?
-    `);
-    return stmt.all(sourceId, sourceId) as DbNeighborInfo[];
+    return this._neighborsCache.filter((ni: any) => ni.sourceId === sourceId);
   }
 
   /**
@@ -8263,6 +6690,7 @@ class DatabaseService {
     // SQLite: synchronous update
     const now = Date.now();
     if (favoriteLocked !== undefined) {
+      // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
       const stmt = this.db.prepare(`
         UPDATE nodes SET
           isFavorite = ?,
@@ -8278,6 +6706,7 @@ class DatabaseService {
       }
       logger.debug(`${isFavorite ? '⭐' : '☆'} Node ${nodeNum}@${sourceId} favorite status set to: ${isFavorite}, locked: ${favoriteLocked} (${result.changes} row updated)`);
     } else {
+      // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
       const stmt = this.db.prepare(`
         UPDATE nodes SET
           isFavorite = ?,
@@ -8315,6 +6744,7 @@ class DatabaseService {
 
     // SQLite: synchronous update
     const now = Date.now();
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       UPDATE nodes SET
         favoriteLocked = ?,
@@ -8371,6 +6801,7 @@ class DatabaseService {
 
     // SQLite: synchronous update
     const now = Date.now();
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       UPDATE nodes SET
         isIgnored = ?,
@@ -8394,6 +6825,7 @@ class DatabaseService {
   // Geofence cooldown operations
   getGeofenceCooldownAsync(triggerId: string, nodeNum: number): Promise<number | null> {
     if (this.drizzleDbType === 'sqlite') {
+      // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
       const stmt = this.db.prepare('SELECT firedAt FROM geofence_cooldowns WHERE triggerId = ? AND nodeNum = ?');
       const row = stmt.get(triggerId, nodeNum) as { firedAt: number } | undefined;
       return Promise.resolve(row ? Number(row.firedAt) : null);
@@ -8412,6 +6844,7 @@ class DatabaseService {
 
   setGeofenceCooldownAsync(triggerId: string, nodeNum: number, firedAt: number): Promise<void> {
     if (this.drizzleDbType === 'sqlite') {
+      // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
       const stmt = this.db.prepare(
         'INSERT INTO geofence_cooldowns (triggerId, nodeNum, firedAt) VALUES (?, ?, ?) ON CONFLICT(triggerId, nodeNum) DO UPDATE SET firedAt = excluded.firedAt'
       );
@@ -8432,6 +6865,7 @@ class DatabaseService {
 
   clearGeofenceCooldownsAsync(triggerId: string): Promise<void> {
     if (this.drizzleDbType === 'sqlite') {
+      // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
       const stmt = this.db.prepare('DELETE FROM geofence_cooldowns WHERE triggerId = ?');
       stmt.run(triggerId);
       return Promise.resolve();
@@ -8450,6 +6884,7 @@ class DatabaseService {
 
   getAllGeofenceCooldownsAsync(): Promise<Array<{ triggerId: string; nodeNum: number; firedAt: number }>> {
     if (this.drizzleDbType === 'sqlite') {
+      // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
       const stmt = this.db.prepare('SELECT triggerId, nodeNum, firedAt FROM geofence_cooldowns');
       const rows = stmt.all() as Array<{ triggerId: string; nodeNum: number; firedAt: number }>;
       return Promise.resolve(rows.map(r => ({ triggerId: r.triggerId, nodeNum: Number(r.nodeNum), firedAt: Number(r.firedAt) })));
@@ -8503,6 +6938,7 @@ class DatabaseService {
     }
 
     // SQLite path
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       UPDATE nodes SET
         positionOverrideEnabled = ?,
@@ -8557,6 +6993,7 @@ class DatabaseService {
     }
 
     // SQLite path
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       SELECT positionOverrideEnabled, latitudeOverride, longitudeOverride, altitudeOverride, positionOverrideIsPrivate
       FROM nodes
@@ -8793,101 +7230,6 @@ class DatabaseService {
     });
   }
 
-  getAuditLogs(options: {
-    limit?: number;
-    offset?: number;
-    userId?: number;
-    action?: string;
-    excludeAction?: string;
-    resource?: string;
-    startDate?: number;
-    endDate?: number;
-    search?: string;
-  } = {}): { logs: any[]; total: number } {
-    const {
-      limit = 100,
-      offset = 0,
-      userId,
-      action,
-      excludeAction,
-      resource,
-      startDate,
-      endDate,
-      search
-    } = options;
-
-    // Build WHERE clause dynamically
-    const conditions: string[] = [];
-    const params: any[] = [];
-
-    if (userId !== undefined) {
-      conditions.push('al.user_id = ?');
-      params.push(userId);
-    }
-
-    if (action) {
-      conditions.push('al.action = ?');
-      params.push(action);
-    }
-
-    if (excludeAction) {
-      conditions.push('al.action != ?');
-      params.push(excludeAction);
-    }
-
-    if (resource) {
-      conditions.push('al.resource = ?');
-      params.push(resource);
-    }
-
-    if (startDate !== undefined) {
-      conditions.push('al.timestamp >= ?');
-      params.push(startDate);
-    }
-
-    if (endDate !== undefined) {
-      conditions.push('al.timestamp <= ?');
-      params.push(endDate);
-    }
-
-    if (search) {
-      conditions.push('(al.details LIKE ? OR u.username LIKE ?)');
-      params.push(`%${search}%`, `%${search}%`);
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    // Get total count
-    const countQuery = `
-      SELECT COUNT(*) as count
-      FROM audit_log al
-      LEFT JOIN users u ON al.user_id = u.id
-      ${whereClause}
-    `;
-    const countStmt = this.db.prepare(countQuery);
-    const countResult = countStmt.get(...params) as { count: number };
-    const total = Number(countResult.count);
-
-    // Get paginated results
-    const query = `
-      SELECT
-        al.id, al.user_id as userId, al.action, al.resource,
-        al.details, al.ip_address as ipAddress, al.value_before as valueBefore,
-        al.value_after as valueAfter, al.timestamp,
-        u.username
-      FROM audit_log al
-      LEFT JOIN users u ON al.user_id = u.id
-      ${whereClause}
-      ORDER BY al.timestamp DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    const stmt = this.db.prepare(query);
-    const logs = stmt.all(...params, limit, offset) as any[];
-
-    return { logs, total };
-  }
-
   /**
    * Async version of getAuditLogs - works with all database backends
    */
@@ -8902,281 +7244,11 @@ class DatabaseService {
     endDate?: number;
     search?: string;
   } = {}): Promise<{ logs: any[]; total: number }> {
-    if (!this.drizzleDatabase || this.drizzleDbType === 'sqlite') {
-      // Fallback to sync for SQLite
-      return this.getAuditLogs(options);
-    }
-
-    const {
-      limit = 100,
-      offset = 0,
-      userId,
-      action,
-      excludeAction,
-      resource,
-      startDate,
-      endDate,
-      search
-    } = options;
-
-    try {
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        // Build WHERE clause dynamically for PostgreSQL
-        // Note: PostgreSQL schema uses camelCase column names (userId, ipAddress, etc.)
-        // and username is stored directly in audit_log, not joined from users
-        const conditions: string[] = [];
-        const params: any[] = [];
-        let paramIndex = 1;
-
-        if (userId !== undefined) {
-          conditions.push(`"userId" = $${paramIndex++}`);
-          params.push(userId);
-        }
-
-        if (action) {
-          conditions.push(`action = $${paramIndex++}`);
-          params.push(action);
-        }
-
-        if (excludeAction) {
-          conditions.push(`action != $${paramIndex++}`);
-          params.push(excludeAction);
-        }
-
-        if (resource) {
-          conditions.push(`resource = $${paramIndex++}`);
-          params.push(resource);
-        }
-
-        if (startDate !== undefined) {
-          conditions.push(`timestamp >= $${paramIndex++}`);
-          params.push(startDate);
-        }
-
-        if (endDate !== undefined) {
-          conditions.push(`timestamp <= $${paramIndex++}`);
-          params.push(endDate);
-        }
-
-        if (search) {
-          conditions.push(`(details ILIKE $${paramIndex} OR username ILIKE $${paramIndex + 1})`);
-          params.push(`%${search}%`, `%${search}%`);
-          paramIndex += 2;
-        }
-
-        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-        // Get total count
-        const countResult = await this.postgresPool.query(
-          `SELECT COUNT(*) as count FROM audit_log ${whereClause}`,
-          params
-        );
-        const total = parseInt(countResult.rows[0]?.count || '0', 10);
-
-        // Get paginated results
-        const result = await this.postgresPool.query(
-          `SELECT id, "userId", username, action, resource, details, "ipAddress", timestamp
-           FROM audit_log
-           ${whereClause}
-           ORDER BY timestamp DESC
-           LIMIT $${paramIndex++} OFFSET $${paramIndex}`,
-          [...params, limit, offset]
-        );
-
-        return { logs: result.rows || [], total };
-
-      } else if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        // Build WHERE clause dynamically for MySQL
-        // Note: MySQL schema uses camelCase column names (userId, ipAddress, etc.)
-        // and username is stored directly in audit_log, not joined from users
-        const conditions: string[] = [];
-        const params: any[] = [];
-
-        if (userId !== undefined) {
-          conditions.push('userId = ?');
-          params.push(userId);
-        }
-
-        if (action) {
-          conditions.push('action = ?');
-          params.push(action);
-        }
-
-        if (excludeAction) {
-          conditions.push('action != ?');
-          params.push(excludeAction);
-        }
-
-        if (resource) {
-          conditions.push('resource = ?');
-          params.push(resource);
-        }
-
-        if (startDate !== undefined) {
-          conditions.push('timestamp >= ?');
-          params.push(startDate);
-        }
-
-        if (endDate !== undefined) {
-          conditions.push('timestamp <= ?');
-          params.push(endDate);
-        }
-
-        if (search) {
-          conditions.push('(details LIKE ? OR username LIKE ?)');
-          params.push(`%${search}%`, `%${search}%`);
-        }
-
-        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-        // Get total count
-        const [countRows] = await this.mysqlPool.query(
-          `SELECT COUNT(*) as count FROM audit_log ${whereClause}`,
-          params
-        ) as any;
-        const total = parseInt(countRows[0]?.count || '0', 10);
-
-        // Get paginated results
-        const [rows] = await this.mysqlPool.query(
-          `SELECT id, userId, username, action, resource, details, ipAddress, timestamp
-           FROM audit_log
-           ${whereClause}
-           ORDER BY timestamp DESC
-           LIMIT ? OFFSET ?`,
-          [...params, limit, offset]
-        ) as any;
-
-        return { logs: rows || [], total };
-      }
-
-      return { logs: [], total: 0 };
-    } catch (error) {
-      logger.error(`[DatabaseService] Failed to get audit logs async: ${error}`);
-      return { logs: [], total: 0 };
-    }
-  }
-
-  // Get audit log statistics
-  getAuditStats(days: number = 30): any {
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-
-    // Count by action type
-    const actionStats = this.db.prepare(`
-      SELECT action, COUNT(*) as count
-      FROM audit_log
-      WHERE timestamp >= ?
-      GROUP BY action
-      ORDER BY count DESC
-    `).all(cutoff);
-
-    // Count by user
-    const userStats = this.db.prepare(`
-      SELECT u.username, COUNT(*) as count
-      FROM audit_log al
-      LEFT JOIN users u ON al.user_id = u.id
-      WHERE al.timestamp >= ?
-      GROUP BY al.user_id
-      ORDER BY count DESC
-      LIMIT 10
-    `).all(cutoff);
-
-    // Count by day
-    const dailyStats = this.db.prepare(`
-      SELECT
-        date(timestamp/1000, 'unixepoch') as date,
-        COUNT(*) as count
-      FROM audit_log
-      WHERE timestamp >= ?
-      GROUP BY date(timestamp/1000, 'unixepoch')
-      ORDER BY date DESC
-    `).all(cutoff);
-
-    return {
-      actionStats,
-      userStats,
-      dailyStats,
-      totalEvents: actionStats.reduce((sum: number, stat: any) => sum + Number(stat.count), 0)
-    };
+    return this.authRepo!.getAuditLogsFiltered(options) as Promise<{ logs: any[]; total: number }>;
   }
 
   async getAuditStatsAsync(days: number = 30): Promise<any> {
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-
-    if (this.drizzleDbType === 'postgres') {
-      const client = await this.postgresPool!.connect();
-      try {
-        const actionStats = await client.query(
-          `SELECT action, COUNT(*) as count FROM audit_log WHERE timestamp >= $1 GROUP BY action ORDER BY count DESC`,
-          [cutoff]
-        );
-        const userStats = await client.query(
-          `SELECT u.username, COUNT(*) as count FROM audit_log al LEFT JOIN users u ON al."userId" = u.id
-           WHERE al.timestamp >= $1 GROUP BY al."userId", u.username ORDER BY count DESC LIMIT 10`,
-          [cutoff]
-        );
-        const dailyStats = await client.query(
-          `SELECT to_char(to_timestamp(timestamp/1000), 'YYYY-MM-DD') as date, COUNT(*) as count
-           FROM audit_log WHERE timestamp >= $1
-           GROUP BY to_char(to_timestamp(timestamp/1000), 'YYYY-MM-DD')
-           ORDER BY date DESC`,
-          [cutoff]
-        );
-        const rows = actionStats.rows.map((r: any) => ({ action: r.action, count: Number(r.count) }));
-        return {
-          actionStats: rows,
-          userStats: userStats.rows.map((r: any) => ({ username: r.username, count: Number(r.count) })),
-          dailyStats: dailyStats.rows.map((r: any) => ({ date: r.date, count: Number(r.count) })),
-          totalEvents: rows.reduce((sum: number, stat: any) => sum + stat.count, 0),
-        };
-      } finally {
-        client.release();
-      }
-    } else if (this.drizzleDbType === 'mysql') {
-      const pool = this.mysqlPool!;
-      const [actionRows] = await pool.query(
-        `SELECT action, COUNT(*) as count FROM audit_log WHERE timestamp >= ? GROUP BY action ORDER BY count DESC`,
-        [cutoff]
-      );
-      const [userRows] = await pool.query(
-        `SELECT u.username, COUNT(*) as count FROM audit_log al LEFT JOIN users u ON al.userId = u.id
-         WHERE al.timestamp >= ? GROUP BY al.userId ORDER BY count DESC LIMIT 10`,
-        [cutoff]
-      );
-      const [dailyRows] = await pool.query(
-        `SELECT DATE_FORMAT(FROM_UNIXTIME(timestamp/1000), '%Y-%m-%d') as date, COUNT(*) as count
-         FROM audit_log WHERE timestamp >= ?
-         GROUP BY DATE_FORMAT(FROM_UNIXTIME(timestamp/1000), '%Y-%m-%d')
-         ORDER BY date DESC`,
-        [cutoff]
-      );
-      const actionStats = (actionRows as any[]).map((r: any) => ({ action: r.action, count: Number(r.count) }));
-      return {
-        actionStats,
-        userStats: (userRows as any[]).map((r: any) => ({ username: r.username, count: Number(r.count) })),
-        dailyStats: (dailyRows as any[]).map((r: any) => ({ date: r.date, count: Number(r.count) })),
-        totalEvents: actionStats.reduce((sum: number, stat: any) => sum + stat.count, 0),
-      };
-    }
-    return this.getAuditStats(days);
-  }
-
-  // Cleanup old audit logs
-  cleanupAuditLogs(days: number): number {
-    // For PostgreSQL/MySQL, fire-and-forget async cleanup
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      if (this.authRepo) {
-        this.authRepo.cleanupOldAuditLogs(days).catch(err => {
-          logger.debug('Failed to cleanup old audit logs:', err);
-        });
-      }
-      return 0;
-    }
-
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-    const stmt = this.db.prepare('DELETE FROM audit_log WHERE timestamp < ?');
-    const result = stmt.run(cutoff);
-    logger.debug(`🧹 Cleaned up ${result.changes} audit log entries older than ${days} days`);
-    return Number(result.changes);
+    return this.authRepo!.getAuditStats(days);
   }
 
   // Read Messages tracking
@@ -9187,6 +7259,7 @@ class DatabaseService {
       return;
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO read_messages (message_id, user_id, read_at)
       VALUES (?, ?, ?)
@@ -9203,6 +7276,7 @@ class DatabaseService {
       return;
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO read_messages (message_id, user_id, read_at)
       VALUES (?, ?, ?)
@@ -9258,6 +7332,7 @@ class DatabaseService {
       params.push(beforeTimestamp);
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(query);
     const result = stmt.run(...params);
     return Number(result.changes);
@@ -9294,6 +7369,7 @@ class DatabaseService {
       params.push(beforeTimestamp);
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(query);
     const result = stmt.run(...params);
     return Number(result.changes);
@@ -9322,6 +7398,7 @@ class DatabaseService {
     `;
     const params: any[] = [userId, Date.now(), localNodeId, localNodeId];
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(query);
     const result = stmt.run(...params);
     return Number(result.changes);
@@ -9338,15 +7415,11 @@ class DatabaseService {
       }
       return true; // Optimistically return true
     }
-    const stmt = this.db.prepare(`
-      UPDATE messages
-      SET ackFailed = ?, routingErrorReceived = ?, deliveryState = ?
-      WHERE requestId = ?
-    `);
-    // Set deliveryState based on whether ACK was successful or failed
-    const deliveryState = ackFailed ? 'failed' : 'delivered';
-    const result = stmt.run(ackFailed ? 1 : 0, ackFailed ? 1 : 0, deliveryState, requestId);
-    return Number(result.changes) > 0;
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.updateMessageAckByRequestIdSqlite(requestId, ackFailed);
+    }
+    return false;
   }
 
   // Update message delivery state directly (undefined/delivered/confirmed)
@@ -9380,14 +7453,11 @@ class DatabaseService {
       }
       return true; // Optimistic return
     }
-    const stmt = this.db.prepare(`
-      UPDATE messages
-      SET deliveryState = ?, ackFailed = ?
-      WHERE requestId = ?
-    `);
-    const ackFailed = deliveryState === 'failed' ? 1 : 0;
-    const result = stmt.run(deliveryState, ackFailed, requestId);
-    return Number(result.changes) > 0;
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.updateMessageDeliveryStateSqlite(requestId, deliveryState);
+    }
+    return false;
   }
 
   // Update message rxTime and timestamp when ACK is received (fixes outgoing message ordering)
@@ -9419,16 +7489,15 @@ class DatabaseService {
       }
       return true; // Optimistic return
     }
-    const stmt = this.db.prepare(`
-      UPDATE messages
-      SET rxTime = ?, timestamp = ?
-      WHERE requestId = ?
-    `);
-    const result = stmt.run(rxTime, rxTime, requestId);
-    return Number(result.changes) > 0;
+    // SQLite: delegate to Drizzle sync variant
+    if (this.messagesRepo) {
+      return this.messagesRepo.updateMessageTimestampsSqlite(requestId, rxTime);
+    }
+    return false;
   }
 
   getUnreadMessageIds(userId: number | null): string[] {
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       SELECT m.id FROM messages m
       LEFT JOIN read_messages rm ON m.id = rm.message_id AND rm.user_id ${userId === null ? 'IS NULL' : '= ?'}
@@ -9448,6 +7517,7 @@ class DatabaseService {
 
     // Only count incoming messages (exclude messages sent by our node)
     const excludeOutgoing = localNodeId ? 'AND m.fromNodeId != ?' : '';
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       SELECT m.channel, COUNT(*) as count
       FROM messages m
@@ -9485,6 +7555,7 @@ class DatabaseService {
 
     // Only count incoming DMs (messages FROM remote node TO local node)
     // Exclude outgoing messages (messages FROM local node TO remote node)
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       SELECT COUNT(*) as count
       FROM messages m
@@ -9505,211 +7576,29 @@ class DatabaseService {
   }
 
   /**
-   * Async version of getUnreadCountsByChannel for PostgreSQL/MySQL
+   * Async version of getUnreadCountsByChannel for PostgreSQL/MySQL.
+   * Delegates to NotificationsRepository for Drizzle-based execution on all backends.
    */
   async getUnreadCountsByChannelAsync(userId: number | null, localNodeId?: string): Promise<{[channelId: number]: number}> {
-    // For SQLite, use sync version
+    // For SQLite, use sync version (legacy compatibility)
     if (this.drizzleDbType !== 'postgres' && this.drizzleDbType !== 'mysql') {
       return this.getUnreadCountsByChannel(userId, localNodeId);
     }
-
-    // PostgreSQL implementation using postgresPool
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      try {
-        let query: string;
-        let params: any[];
-
-        if (userId === null) {
-          // Anonymous user - check for messages not in read_messages at all
-          query = `
-            SELECT m.channel, COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm."messageId"
-            WHERE rm."messageId" IS NULL
-              AND m.channel != -1
-              AND m.portnum = 1
-              ${localNodeId ? 'AND m."fromNodeId" != $1' : ''}
-            GROUP BY m.channel
-          `;
-          params = localNodeId ? [localNodeId] : [];
-        } else {
-          // Authenticated user - check for messages not read by this user
-          query = `
-            SELECT m.channel, COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm."messageId" AND rm."userId" = $1
-            WHERE rm."messageId" IS NULL
-              AND m.channel != -1
-              AND m.portnum = 1
-              ${localNodeId ? 'AND m."fromNodeId" != $2' : ''}
-            GROUP BY m.channel
-          `;
-          params = localNodeId ? [userId, localNodeId] : [userId];
-        }
-
-        const result = await this.postgresPool.query(query, params);
-        const counts: {[channelId: number]: number} = {};
-
-        result.rows.forEach((row: any) => {
-          counts[Number(row.channel)] = Number(row.count);
-        });
-
-        return counts;
-      } catch (error) {
-        logger.error('Error getting unread counts by channel:', error);
-        return {};
-      }
-    }
-
-    // MySQL implementation using mysqlPool
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      try {
-        let query: string;
-        let params: any[];
-
-        if (userId === null) {
-          query = `
-            SELECT m.channel, COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm.messageId
-            WHERE rm.messageId IS NULL
-              AND m.channel != -1
-              AND m.portnum = 1
-              ${localNodeId ? 'AND m.fromNodeId != ?' : ''}
-            GROUP BY m.channel
-          `;
-          params = localNodeId ? [localNodeId] : [];
-        } else {
-          query = `
-            SELECT m.channel, COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm.messageId AND rm.userId = ?
-            WHERE rm.messageId IS NULL
-              AND m.channel != -1
-              AND m.portnum = 1
-              ${localNodeId ? 'AND m.fromNodeId != ?' : ''}
-            GROUP BY m.channel
-          `;
-          params = localNodeId ? [userId, localNodeId] : [userId];
-        }
-
-        const [rows] = await this.mysqlPool.query(query, params) as any;
-        const counts: {[channelId: number]: number} = {};
-
-        for (const row of rows) {
-          counts[Number(row.channel)] = Number(row.count);
-        }
-
-        return counts;
-      } catch (error) {
-        logger.error('Error getting unread counts by channel:', error);
-        return {};
-      }
-    }
-
-    return {};
+    if (!this.notificationsRepo) return {};
+    return this.notificationsRepo.getUnreadCountsByChannelAsync(userId, localNodeId);
   }
 
   /**
-   * Async version of getUnreadDMCount for PostgreSQL/MySQL
+   * Async version of getUnreadDMCount for PostgreSQL/MySQL.
+   * Delegates to NotificationsRepository for Drizzle-based execution on all backends.
    */
   async getUnreadDMCountAsync(localNodeId: string, remoteNodeId: string, userId: number | null): Promise<number> {
     // For SQLite, use sync version
     if (this.drizzleDbType !== 'postgres' && this.drizzleDbType !== 'mysql') {
       return this.getUnreadDMCount(localNodeId, remoteNodeId, userId);
     }
-
-    // PostgreSQL implementation using postgresPool
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      try {
-        let query: string;
-        let params: any[];
-
-        if (userId === null) {
-          query = `
-            SELECT COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm."messageId"
-            WHERE rm."messageId" IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m."fromNodeId" = $1
-              AND m."toNodeId" = $2
-          `;
-          params = [remoteNodeId, localNodeId];
-        } else {
-          query = `
-            SELECT COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm."messageId" AND rm."userId" = $1
-            WHERE rm."messageId" IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m."fromNodeId" = $2
-              AND m."toNodeId" = $3
-          `;
-          params = [userId, remoteNodeId, localNodeId];
-        }
-
-        const result = await this.postgresPool.query(query, params);
-
-        if (result.rows.length > 0) {
-          return Number(result.rows[0].count);
-        }
-
-        return 0;
-      } catch (error) {
-        logger.error('Error getting unread DM count:', error);
-        return 0;
-      }
-    }
-
-    // MySQL implementation using mysqlPool
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      try {
-        let query: string;
-        let params: any[];
-
-        if (userId === null) {
-          query = `
-            SELECT COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm.messageId
-            WHERE rm.messageId IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m.fromNodeId = ?
-              AND m.toNodeId = ?
-          `;
-          params = [remoteNodeId, localNodeId];
-        } else {
-          query = `
-            SELECT COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm.messageId AND rm.userId = ?
-            WHERE rm.messageId IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m.fromNodeId = ?
-              AND m.toNodeId = ?
-          `;
-          params = [userId, remoteNodeId, localNodeId];
-        }
-
-        const [rows] = await this.mysqlPool.query(query, params) as any;
-
-        if (rows.length > 0) {
-          return Number(rows[0].count);
-        }
-
-        return 0;
-      } catch (error) {
-        logger.error('Error getting unread DM count:', error);
-        return 0;
-      }
-    }
-
-    return 0;
+    if (!this.notificationsRepo) return 0;
+    return this.notificationsRepo.getUnreadDMCountAsync(localNodeId, remoteNodeId, userId);
   }
 
   /**
@@ -9722,6 +7611,7 @@ class DatabaseService {
       return {};
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare(`
       SELECT m.fromNodeId, COUNT(*) as count
       FROM messages m
@@ -9747,106 +7637,20 @@ class DatabaseService {
 
   /**
    * Async version of getBatchUnreadDMCounts for PostgreSQL/MySQL support.
+   * Delegates to NotificationsRepository for Drizzle-based execution on all backends.
    */
   async getBatchUnreadDMCountsAsync(localNodeId: string, userId: number | null): Promise<{ [fromNodeId: string]: number }> {
     // For SQLite, use sync version
     if (this.drizzleDbType !== 'postgres' && this.drizzleDbType !== 'mysql') {
       return this.getBatchUnreadDMCounts(localNodeId, userId);
     }
-
-    // PostgreSQL implementation
-    if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-      try {
-        let query: string;
-        let params: any[];
-
-        if (userId === null) {
-          query = `
-            SELECT m."fromNodeId", COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm."messageId"
-            WHERE rm."messageId" IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m."toNodeId" = $1
-            GROUP BY m."fromNodeId"
-          `;
-          params = [localNodeId];
-        } else {
-          query = `
-            SELECT m."fromNodeId", COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm."messageId" AND rm."userId" = $1
-            WHERE rm."messageId" IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m."toNodeId" = $2
-            GROUP BY m."fromNodeId"
-          `;
-          params = [userId, localNodeId];
-        }
-
-        const result = await this.postgresPool.query(query, params);
-        const counts: { [fromNodeId: string]: number } = {};
-        for (const row of result.rows) {
-          counts[row.fromNodeId] = Number(row.count);
-        }
-        return counts;
-      } catch (error) {
-        logger.error('Error getting batch unread DM counts:', error);
-        return {};
-      }
-    }
-
-    // MySQL implementation using mysqlPool
-    if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-      try {
-        let query: string;
-        let params: any[];
-
-        if (userId === null) {
-          query = `
-            SELECT m.fromNodeId, COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm.messageId
-            WHERE rm.messageId IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m.toNodeId = ?
-            GROUP BY m.fromNodeId
-          `;
-          params = [localNodeId];
-        } else {
-          query = `
-            SELECT m.fromNodeId, COUNT(*) as count
-            FROM messages m
-            LEFT JOIN read_messages rm ON m.id = rm.messageId AND rm.userId = ?
-            WHERE rm.messageId IS NULL
-              AND m.portnum = 1
-              AND m.channel = -1
-              AND m.toNodeId = ?
-            GROUP BY m.fromNodeId
-          `;
-          params = [userId, localNodeId];
-        }
-
-        const [rows] = await this.mysqlPool.query(query, params) as any;
-        const counts: { [fromNodeId: string]: number } = {};
-        for (const row of rows) {
-          counts[row.fromNodeId] = Number(row.count);
-        }
-        return counts;
-      } catch (error) {
-        logger.error('Error getting batch unread DM counts:', error);
-        return {};
-      }
-    }
-
-    return {};
+    if (!this.notificationsRepo) return {};
+    return this.notificationsRepo.getBatchUnreadDMCountsAsync(localNodeId, userId);
   }
 
   cleanupOldReadMessages(days: number): number {
     const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
+    // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
     const stmt = this.db.prepare('DELETE FROM read_messages WHERE read_at < ?');
     const result = stmt.run(cutoff);
     logger.debug(`🧹 Cleaned up ${result.changes} read_messages entries older than ${days} days`);
@@ -9861,119 +7665,37 @@ class DatabaseService {
     const enabled = await this.getSettingAsync('packet_log_enabled');
     if (enabled !== '1') return 0;
 
-    // For non-SQLite, use async repository
-    if (this.drizzleDbType !== 'sqlite') {
-      const id = await this.misc.insertPacketLog(packet);
-      const maxCountStr = await this.getSettingAsync('packet_log_max_count');
-      const maxCount = maxCountStr ? parseInt(maxCountStr, 10) : 1000;
-      await this.misc.enforcePacketLogMaxCount(maxCount);
-      return id;
-    }
-
-    // SQLite: use synchronous raw SQL for immediate consistency
-    const stmt = this.db.prepare(`
-      INSERT INTO packet_log (
-        packet_id, timestamp, from_node, from_node_id, to_node, to_node_id,
-        channel, portnum, portnum_name, encrypted, snr, rssi, hop_limit, hop_start,
-        relay_node, payload_size, want_ack, priority, payload_preview, metadata, direction,
-        transport_mechanism, decrypted_by, decrypted_channel_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const result = stmt.run(
-      packet.packet_id ?? null, packet.timestamp, packet.from_node,
-      packet.from_node_id ?? null, packet.to_node ?? null, packet.to_node_id ?? null,
-      packet.channel ?? null, packet.portnum, packet.portnum_name ?? null,
-      packet.encrypted ? 1 : 0, packet.snr ?? null, packet.rssi ?? null,
-      packet.hop_limit ?? null, packet.hop_start ?? null, packet.relay_node ?? null,
-      packet.payload_size ?? null, packet.want_ack ? 1 : 0, packet.priority ?? null,
-      packet.payload_preview ?? null, packet.metadata ?? null, packet.direction ?? 'rx',
-      packet.transport_mechanism ?? null, packet.decrypted_by ?? null, packet.decrypted_channel_id ?? null
-    );
-
-    // Enforce max count
-    const maxCountStr = this.getSetting('packet_log_max_count');
+    // All backends route through MiscRepository
+    const id = await this.misc.insertPacketLog(packet, packet.sourceId ?? undefined);
+    const maxCountStr = this.drizzleDbType === 'sqlite'
+      ? this.getSetting('packet_log_max_count')
+      : await this.getSettingAsync('packet_log_max_count');
     const maxCount = maxCountStr ? parseInt(maxCountStr, 10) : 1000;
-    const countStmt = this.db.prepare('SELECT COUNT(*) as count FROM packet_log');
-    const countResult = countStmt.get() as { count: number };
-    if (Number(countResult.count) > maxCount) {
-      const deleteCount = Number(countResult.count) - maxCount;
-      this.db.prepare(`DELETE FROM packet_log WHERE id IN (SELECT id FROM packet_log ORDER BY timestamp ASC LIMIT ?)`).run(deleteCount);
-    }
-
-    return Number(result.lastInsertRowid);
+    await this.misc.enforcePacketLogMaxCount(maxCount);
+    return id;
   }
 
   async getPacketLogsAsync(options: {
     offset?: number; limit?: number; portnum?: number; from_node?: number;
     to_node?: number; channel?: number; encrypted?: boolean; since?: number;
-    relay_node?: number | 'unknown';
+    relay_node?: number | 'unknown'; sourceId?: string;
   }): Promise<DbPacketLog[]> {
-    if (this.drizzleDbType !== 'sqlite') return this.misc.getPacketLogs(options);
-    // SQLite fallback using raw SQL on main connection
-    const { offset = 0, limit = 100, portnum, from_node, to_node, channel, encrypted, since, relay_node } = options;
-    let query = `
-      SELECT pl.*, from_nodes.longName as from_node_longName, to_nodes.longName as to_node_longName
-      FROM packet_log pl
-      LEFT JOIN nodes from_nodes ON pl.from_node = from_nodes.nodeNum
-      LEFT JOIN nodes to_nodes ON pl.to_node = to_nodes.nodeNum
-      WHERE 1=1
-    `;
-    const params: any[] = [];
-    if (portnum !== undefined) { query += ' AND pl.portnum = ?'; params.push(portnum); }
-    if (from_node !== undefined) { query += ' AND pl.from_node = ?'; params.push(from_node); }
-    if (to_node !== undefined) { query += ' AND pl.to_node = ?'; params.push(to_node); }
-    if (channel !== undefined) { query += ' AND pl.channel = ?'; params.push(channel); }
-    if (encrypted !== undefined) { query += ' AND pl.encrypted = ?'; params.push(encrypted ? 1 : 0); }
-    if (since !== undefined) { query += ' AND pl.timestamp >= ?'; params.push(since); }
-    if (relay_node === 'unknown') { query += ' AND pl.relay_node IS NULL'; }
-    else if (relay_node !== undefined) { query += ' AND pl.relay_node = ?'; params.push(relay_node); }
-    query += ' ORDER BY pl.timestamp DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
-    const stmt = this.db.prepare(query);
-    return stmt.all(...params) as DbPacketLog[];
+    return this.misc.getPacketLogs(options);
   }
 
   async getPacketLogByIdAsync(id: number): Promise<DbPacketLog | null> {
-    if (this.drizzleDbType !== 'sqlite') return this.misc.getPacketLogById(id);
-    // SQLite fallback
-    const stmt = this.db.prepare(`
-      SELECT pl.*, from_nodes.longName as from_node_longName, to_nodes.longName as to_node_longName
-      FROM packet_log pl
-      LEFT JOIN nodes from_nodes ON pl.from_node = from_nodes.nodeNum
-      LEFT JOIN nodes to_nodes ON pl.to_node = to_nodes.nodeNum
-      WHERE pl.id = ?
-    `);
-    const result = stmt.get(id) as DbPacketLog | undefined;
-    return result || null;
+    return this.misc.getPacketLogById(id);
   }
 
   async getPacketLogCountAsync(options: {
     portnum?: number; from_node?: number; to_node?: number; channel?: number;
-    encrypted?: boolean; since?: number; relay_node?: number | 'unknown';
+    encrypted?: boolean; since?: number; relay_node?: number | 'unknown'; sourceId?: string;
   } = {}): Promise<number> {
-    if (this.drizzleDbType !== 'sqlite') return this.misc.getPacketLogCount(options);
-    // SQLite fallback
-    const { portnum, from_node, to_node, channel, encrypted, since, relay_node } = options;
-    let query = 'SELECT COUNT(*) as count FROM packet_log WHERE 1=1';
-    const params: any[] = [];
-    if (portnum !== undefined) { query += ' AND portnum = ?'; params.push(portnum); }
-    if (from_node !== undefined) { query += ' AND from_node = ?'; params.push(from_node); }
-    if (to_node !== undefined) { query += ' AND to_node = ?'; params.push(to_node); }
-    if (channel !== undefined) { query += ' AND channel = ?'; params.push(channel); }
-    if (encrypted !== undefined) { query += ' AND encrypted = ?'; params.push(encrypted ? 1 : 0); }
-    if (since !== undefined) { query += ' AND timestamp >= ?'; params.push(since); }
-    if (relay_node === 'unknown') { query += ' AND relay_node IS NULL'; }
-    else if (relay_node !== undefined) { query += ' AND relay_node = ?'; params.push(relay_node); }
-    const stmt = this.db.prepare(query);
-    const result = stmt.get(...params) as { count: number };
-    return Number(result.count);
+    return this.misc.getPacketLogCount(options);
   }
 
   clearPacketLogs(): number {
-    const stmt = this.db.prepare('DELETE FROM packet_log');
-    const result = stmt.run();
-    logger.debug(`Cleared ${result.changes} packet log entries`);
-    return Number(result.changes);
+    return this.miscRepo!.clearPacketLogsSync();
   }
 
   async clearPacketLogsAsync(): Promise<number> {
@@ -9981,8 +7703,8 @@ class DatabaseService {
     return this.clearPacketLogs();
   }
 
-  async getDistinctRelayNodesAsync(): Promise<DbDistinctRelayNode[]> {
-    return this.misc.getDistinctRelayNodes();
+  async getDistinctRelayNodesAsync(sourceId?: string): Promise<DbDistinctRelayNode[]> {
+    return this.misc.getDistinctRelayNodes(sourceId);
   }
 
   async updatePacketLogDecryptionAsync(
@@ -9992,24 +7714,14 @@ class DatabaseService {
     portnum: number,
     metadata: string
   ): Promise<void> {
-    if (this.miscRepo) {
-      return this.miscRepo.updatePacketLogDecryption(id, decryptedBy, decryptedChannelId, portnum, metadata);
-    }
-    // SQLite fallback
-    const stmt = this.db.prepare(`
-      UPDATE packet_log SET decrypted_by = ?, decrypted_channel_id = ?,
-      portnum = ?, encrypted = 0, metadata = ? WHERE id = ?
-    `);
-    stmt.run(decryptedBy, decryptedChannelId, portnum, metadata, id);
+    return this.miscRepo!.updatePacketLogDecryption(id, decryptedBy, decryptedChannelId, portnum, metadata);
   }
 
   cleanupOldPacketLogs(): number {
     const maxAgeHoursStr = this.getSetting('packet_log_max_age_hours');
     const maxAgeHours = maxAgeHoursStr ? parseInt(maxAgeHoursStr, 10) : 24;
     const cutoffTimestamp = Date.now() - (maxAgeHours * 60 * 60 * 1000);
-    const stmt = this.db.prepare('DELETE FROM packet_log WHERE timestamp < ?');
-    const result = stmt.run(cutoffTimestamp);
-    return Number(result.changes);
+    return this.miscRepo!.cleanupOldPacketLogsSync(cutoffTimestamp);
   }
 
   async cleanupOldPacketLogsAsync(): Promise<number> {
@@ -10019,11 +7731,11 @@ class DatabaseService {
     return this.cleanupOldPacketLogs();
   }
 
-  async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number }): Promise<DbPacketCountByNode[]> {
+  async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number; sourceId?: string }): Promise<DbPacketCountByNode[]> {
     return this.misc.getPacketCountsByNode(options);
   }
 
-  async getPacketCountsByPortnumAsync(options?: { since?: number; from_node?: number }): Promise<DbPacketCountByPortnum[]> {
+  async getPacketCountsByPortnumAsync(options?: { since?: number; from_node?: number; sourceId?: string }): Promise<DbPacketCountByPortnum[]> {
     return this.misc.getPacketCountsByPortnum(options);
   }
 
@@ -10206,6 +7918,13 @@ class DatabaseService {
    * Works with all database backends (SQLite, PostgreSQL, MySQL).
    */
   async checkPermissionAsync(userId: number, resource: string, action: string, sourceId?: string): Promise<boolean> {
+    // Admin bypass: matches the same shortcut used by requirePermission/hasPermission
+    // middleware. Without this, admin users (whose perm rows historically have
+    // sourceId=NULL) are silently denied by direct callers like the notification
+    // filter, since the per-source lookup below requires an exact sourceId match.
+    const user = await this.auth.getUserById(userId);
+    if (user?.isAdmin) return true;
+
     const permissions = await this.auth.getPermissionsForUser(userId);
 
     const check = (perm: (typeof permissions)[0]): boolean => {
@@ -10215,22 +7934,24 @@ class DatabaseService {
       return false;
     };
 
-    // Source-specific permission takes precedence when sourceId is provided
+    // All resources are now sourcey (per-source).
+    // When sourceId is provided, check for an exact match.
+    // When sourceId is omitted, grant access if the user has the permission on ANY source.
     if (sourceId) {
       for (const perm of permissions) {
         if (perm.resource === resource && (perm as any).sourceId === sourceId) {
           return check(perm);
         }
       }
+      return false;
     }
 
-    // Fall back to global permission (null/undefined sourceId)
+    // No sourceId — check if user has this permission on any source
     for (const perm of permissions) {
-      if (perm.resource === resource && !(perm as any).sourceId) {
-        return check(perm);
+      if (perm.resource === resource && (perm as any).sourceId) {
+        if (check(perm)) return true;
       }
     }
-
     return false;
   }
 
@@ -10242,18 +7963,9 @@ class DatabaseService {
     const permissions = await this.auth.getPermissionsForUser(userId);
     const permissionSet: Record<string, { viewOnMap?: boolean; read: boolean; write: boolean }> = {};
 
-    // First apply global permissions (null sourceId)
-    for (const perm of permissions) {
-      if (!(perm as any).sourceId) {
-        permissionSet[perm.resource] = {
-          viewOnMap: (perm as any).canViewOnMap ?? false,
-          read: perm.canRead,
-          write: perm.canWrite,
-        };
-      }
-    }
-
-    // Then override with source-specific permissions when sourceId is provided
+    // All resources are per-source. When sourceId is provided, return permissions
+    // for that source. When omitted, merge permissions across all sources (grant
+    // access if the user has it on any source).
     if (sourceId) {
       for (const perm of permissions) {
         if ((perm as any).sourceId === sourceId) {
@@ -10263,6 +7975,17 @@ class DatabaseService {
             write: perm.canWrite,
           };
         }
+      }
+    } else {
+      // No sourceId — merge across all sources (most permissive wins)
+      for (const perm of permissions) {
+        if (!(perm as any).sourceId) continue;
+        const existing = permissionSet[perm.resource];
+        permissionSet[perm.resource] = {
+          viewOnMap: existing?.viewOnMap || ((perm as any).canViewOnMap ?? false),
+          read: existing?.read || perm.canRead,
+          write: existing?.write || perm.canWrite,
+        };
       }
     }
 
@@ -10387,6 +8110,24 @@ class DatabaseService {
    */
   async consumeBackupCodeAsync(userId: number, remainingCodes: string): Promise<void> {
     await this.auth.updateUser(userId, { mfaBackupCodes: remainingCodes });
+  }
+
+  // ============ SESSION METHODS ============
+
+  async getSessionAsync(sid: string): Promise<{ sid: string; sess: string; expire: number } | null> {
+    return this.auth.getSession(sid);
+  }
+
+  async setSessionAsync(sid: string, sess: string, expire: number): Promise<void> {
+    return this.auth.setSession(sid, sess, expire);
+  }
+
+  async deleteSessionAsync(sid: string): Promise<void> {
+    return this.auth.deleteSession(sid);
+  }
+
+  async cleanupExpiredSessionsAsync(): Promise<number> {
+    return this.auth.cleanupExpiredSessions();
   }
 
   // ============ ASYNC CHANNEL DATABASE METHODS ============
@@ -10668,20 +8409,12 @@ class DatabaseService {
 
   // Group 1: Cleanup/Maintenance
   async cleanupOldMessagesAsync(days: number = 30, sourceId?: string): Promise<number> {
-    if (sourceId) {
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-        const result = await this.postgresPool.query(`DELETE FROM messages WHERE timestamp < $1 AND "sourceId" = $2`, [cutoff, sourceId]);
-        return result.rowCount ?? 0;
-      }
-      if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-        const [result] = await this.mysqlPool.query(`DELETE FROM messages WHERE timestamp < ? AND sourceId = ?`, [cutoff, sourceId]) as any;
-        return result.affectedRows ?? 0;
-      }
-      const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-      const stmt = this.db.prepare('DELETE FROM messages WHERE timestamp < ? AND sourceId = ?');
-      return Number(stmt.run(cutoff, sourceId).changes);
+    if (sourceId && this.messagesRepo) {
+      return this.messagesRepo.cleanupOldMessagesForSource(days, sourceId);
+    }
+    // No sourceId: use the plain repo cleanup (PG/MySQL) or sync SQLite path.
+    if ((this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') && this.messagesRepo) {
+      return this.messagesRepo.cleanupOldMessages(days);
     }
     return this.cleanupOldMessages(days);
   }
@@ -10701,25 +8434,19 @@ class DatabaseService {
   }
 
   async cleanupOldNeighborInfoAsync(days: number = 30): Promise<number> {
-    if ((this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') && this.neighborsRepo) {
+    if (this.neighborsRepo) {
       return this.neighborsRepo.cleanupOldNeighborInfo(days);
     }
-    return this.cleanupOldNeighborInfo(days);
+    return 0;
   }
 
   async cleanupInactiveNodesAsync(days: number = 30, sourceId?: string): Promise<number> {
     if (sourceId) {
+      if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
+        return this.nodesRepo!.cleanupInactiveNodesForSourceAsync(days, sourceId);
+      }
       const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const result = await this.postgresPool.query(`DELETE FROM nodes WHERE "lastHeard" < $1 AND "sourceId" = $2`, [cutoff, sourceId]);
-        return result.rowCount ?? 0;
-      }
-      if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const [result] = await this.mysqlPool.query(`DELETE FROM nodes WHERE lastHeard < ? AND sourceId = ?`, [cutoff, sourceId]) as any;
-        return result.affectedRows ?? 0;
-      }
-      const stmt = this.db.prepare('DELETE FROM nodes WHERE lastHeard < ? AND sourceId = ?');
-      return Number(stmt.run(cutoff, sourceId).changes);
+      return this.nodesRepo!.deleteInactiveNodesForSourceSqlite(cutoff, sourceId);
     }
     return this.cleanupInactiveNodes(days);
   }
@@ -10727,31 +8454,13 @@ class DatabaseService {
   async cleanupInvalidChannelsAsync(sourceId?: string): Promise<number> {
     if (sourceId) {
       // Channels with no name and no PSK scoped to a source
-      if (this.drizzleDbType === 'postgres' && this.postgresPool) {
-        const result = await this.postgresPool.query(
-          `DELETE FROM channels WHERE ("name" IS NULL OR "name" = '') AND ("psk" IS NULL OR "psk" = '') AND "sourceId" = $1`,
-          [sourceId]
-        );
-        return result.rowCount ?? 0;
-      }
-      if (this.drizzleDbType === 'mysql' && this.mysqlPool) {
-        const [result] = await this.mysqlPool.query(
-          `DELETE FROM channels WHERE (name IS NULL OR name = '') AND (psk IS NULL OR psk = '') AND sourceId = ?`,
-          [sourceId]
-        ) as any;
-        return result.affectedRows ?? 0;
-      }
-      const stmt = this.db.prepare(`DELETE FROM channels WHERE (name IS NULL OR name = '') AND (psk IS NULL OR psk = '') AND sourceId = ?`);
-      return Number(stmt.run(sourceId).changes);
+      return this.channelsRepo!.cleanupEmptyChannelsForSource(sourceId);
     }
     return this.cleanupInvalidChannels();
   }
 
   async cleanupAuditLogsAsync(days: number): Promise<number> {
-    if ((this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') && this.authRepo) {
-      return this.authRepo.cleanupOldAuditLogs(days);
-    }
-    return this.cleanupAuditLogs(days);
+    return this.authRepo!.cleanupOldAuditLogs(days);
   }
 
   async vacuumAsync(): Promise<void> {
@@ -10859,11 +8568,11 @@ class DatabaseService {
 
   // Group 5: Neighbors/Telemetry
   async getNeighborsForNodeAsync(nodeNum: number, sourceId?: string): Promise<DbNeighborInfo[]> {
-    if ((this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') && this.neighborsRepo) {
+    if (this.neighborsRepo) {
       const results = await this.neighborsRepo.getNeighborsForNode(nodeNum, sourceId);
       return results.map(n => this.convertRepoNeighborInfo(n));
     }
-    return this.getNeighborsForNode(nodeNum);
+    return [];
   }
 
   async getTelemetryByNodeAveragedAsync(nodeId: string, sinceTimestamp?: number, intervalMinutes?: number, maxHours?: number, sourceId?: string): Promise<DbTelemetry[]> {

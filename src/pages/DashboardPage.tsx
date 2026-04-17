@@ -19,6 +19,8 @@ import {
 import DashboardSidebar from '../components/Dashboard/DashboardSidebar';
 import DashboardMap from '../components/Dashboard/DashboardMap';
 import LoginModal from '../components/LoginModal';
+import UserMenu from '../components/UserMenu';
+import { ToastProvider } from '../components/ToastContainer';
 import { appBasename } from '../init';
 import '../styles/dashboard.css';
 
@@ -43,7 +45,6 @@ function DashboardInner() {
 
   const isAuthenticated = authStatus?.authenticated ?? false;
   const isAdmin = authStatus?.user?.isAdmin ?? false;
-  const username = authStatus?.user?.username ?? null;
 
   const defaultCenter = {
     lat: defaultMapCenterLat ?? 30.0,
@@ -54,6 +55,8 @@ function DashboardInner() {
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [showLogin, setShowLogin] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  // Mobile drawer state — hamburger toggles; source selection auto-closes.
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   // Source add/edit modal state
   const [showSourceModal, setShowSourceModal] = useState(false);
@@ -236,18 +239,21 @@ function DashboardInner() {
     <div className="dashboard-page">
       {/* Top bar */}
       <header className="dashboard-topbar">
+        <button
+          className="dashboard-topbar-hamburger"
+          aria-label={mobileSidebarOpen ? 'Close sources' : 'Open sources'}
+          aria-expanded={mobileSidebarOpen}
+          onClick={() => setMobileSidebarOpen((v) => !v)}
+        >
+          {mobileSidebarOpen ? '✕' : '☰'}
+        </button>
         <div className="dashboard-topbar-logo">
           <img src={`${appBasename}/logo.png`} alt="MeshMonitor Logo" className="dashboard-topbar-logo-img" />
           <span className="dashboard-topbar-title">MeshMonitor</span>
         </div>
         <div className="dashboard-topbar-actions">
-          {isAdmin && (
-            <button className="dashboard-add-source-btn" onClick={onAddSource}>
-              + Add Source
-            </button>
-          )}
           {isAuthenticated ? (
-            <span style={{ fontSize: 13, color: 'var(--ctp-subtext1)', fontWeight: 500 }}>👤 {username}</span>
+            <UserMenu />
           ) : (
             <button
               className="dashboard-signin-btn"
@@ -273,6 +279,8 @@ function DashboardInner() {
           onEditSource={onEditSource}
           onToggleSource={onToggleSource}
           onDeleteSource={onDeleteSource}
+          mobileOpen={mobileSidebarOpen}
+          onMobileClose={() => setMobileSidebarOpen(false)}
         />
 
         <DashboardMap
@@ -283,6 +291,7 @@ function DashboardInner() {
           tilesetId={mapTileset}
           customTilesets={customTilesets}
           defaultCenter={defaultCenter}
+          sourceId={selectedSourceId}
         />
       </div>
 
@@ -420,7 +429,9 @@ function DashboardInner() {
 export default function DashboardPage() {
   return (
     <SettingsProvider>
-      <DashboardInner />
+      <ToastProvider>
+        <DashboardInner />
+      </ToastProvider>
     </SettingsProvider>
   );
 }

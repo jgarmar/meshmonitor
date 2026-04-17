@@ -4,8 +4,8 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { version } from '../../../package.json';
 import type { DashboardSource, SourceStatus } from '../../hooks/useDashboardData';
-import { appBasename } from '../../init';
 
 interface DashboardSidebarProps {
   sources: DashboardSource[];
@@ -19,6 +19,10 @@ interface DashboardSidebarProps {
   onEditSource: (id: string) => void;
   onToggleSource: (id: string, enabled: boolean) => void;
   onDeleteSource: (id: string) => void;
+  /** Mobile drawer state — on desktop the sidebar is always visible. */
+  mobileOpen?: boolean;
+  /** Called to close the drawer on mobile (after selecting a source or tapping backdrop). */
+  onMobileClose?: () => void;
 }
 
 function getStatusInfo(
@@ -128,11 +132,26 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
   onEditSource,
   onToggleSource,
   onDeleteSource,
+  mobileOpen = false,
+  onMobileClose,
 }) => {
   const navigate = useNavigate();
 
+  // On mobile, wrap source selection so the drawer auto-closes after tap.
+  const handleSelectSource = (id: string) => {
+    onSelectSource(id);
+    onMobileClose?.();
+  };
+
   return (
-    <aside className="dashboard-sidebar">
+    <>
+      {/* Mobile backdrop — only rendered (via CSS) on small screens when open. */}
+      <div
+        className={`dashboard-sidebar-backdrop${mobileOpen ? ' open' : ''}`}
+        onClick={onMobileClose}
+        aria-hidden="true"
+      />
+      <aside className={`dashboard-sidebar${mobileOpen ? ' mobile-open' : ''}`}>
       <div className="dashboard-sidebar-header">
         Sources
         {isAdmin && (
@@ -165,25 +184,18 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
           <div
             key={source.id}
             className={cardClassName}
-            onClick={() => onSelectSource(source.id)}
+            onClick={() => handleSelectSource(source.id)}
             role="button"
             tabIndex={0}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') onSelectSource(source.id);
+              if (e.key === 'Enter' || e.key === ' ') handleSelectSource(source.id);
             }}
           >
             <div className="dashboard-source-card-header">
               <span className="dashboard-source-card-name" title={source.name}>
                 {source.name}
               </span>
-              {source.type === 'meshtastic_tcp' || source.type === 'meshtastic_mqtt' ? (
-                <img
-                  src={`${appBasename}/meshtastic-icon.svg`}
-                  alt="Meshtastic"
-                  title={source.type}
-                  className="dashboard-source-card-type-icon"
-                />
-              ) : (
+              {source.type !== 'meshtastic_tcp' && source.type !== 'meshtastic_mqtt' && (
                 <span className="dashboard-source-card-badge">{source.type}</span>
               )}
               {(() => {
@@ -232,9 +244,12 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
       })}
 
       <div className="dashboard-sidebar-links">
-        <span className="dashboard-sidebar-link coming-soon">
-          💬 Unified Messages (coming soon)
-        </span>
+        <button
+          className="dashboard-sidebar-link dashboard-sidebar-link--active"
+          onClick={() => navigate('/unified/messages')}
+        >
+          💬 Unified Messages
+        </button>
         <button
           className="dashboard-sidebar-link dashboard-sidebar-link--active"
           onClick={() => navigate('/unified/telemetry')}
@@ -242,7 +257,57 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
           📡 Unified Telemetry
         </button>
       </div>
+
+      <div className="dashboard-sidebar-footer">
+        <span className="dashboard-sidebar-version">v{version}</span>
+        <div className="dashboard-sidebar-footer-icons">
+          {isAdmin && (
+            <>
+              <button
+                className="dashboard-sidebar-footer-btn"
+                title="Users"
+                onClick={() => navigate('/users')}
+              >
+                👥
+              </button>
+              <button
+                className="dashboard-sidebar-footer-btn"
+                title="Settings"
+                onClick={() => navigate('/settings')}
+              >
+                ⚙️
+              </button>
+            </>
+          )}
+          <button
+            className="dashboard-sidebar-footer-btn"
+            title="News"
+            disabled
+          >
+            📰
+          </button>
+          <a
+            className="dashboard-sidebar-footer-btn"
+            href="https://github.com/Yeraze/meshmonitor"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="GitHub"
+          >
+            🐙
+          </a>
+          <a
+            className="dashboard-sidebar-footer-btn"
+            href="https://meshmonitor.org"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Website"
+          >
+            🔗
+          </a>
+        </div>
+      </div>
     </aside>
+    </>
   );
 };
 

@@ -6,12 +6,17 @@
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from 'vitest';
 import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from '../../db/schema/index.js';
 import express, { Express } from 'express';
 import session from 'express-session';
 import request from 'supertest';
-import { UserModel } from '../models/User.js';
-import { PermissionModel } from '../models/Permission.js';
+
+import { AuthRepository } from '../../db/repositories/auth.js';
+import { PermissionTestHelper } from '../test-helpers/permissionTestHelper.js';
+import { UserTestHelper } from '../test-helpers/userTestHelper.js';
 import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
+import { migration as sourceIdPermsMigration } from '../migrations/022_add_source_id_to_permissions.js';
 import authRoutes from './authRoutes.js';
 
 // Mock the DatabaseService to prevent auto-initialization
@@ -24,8 +29,8 @@ import DatabaseService from '../../services/database.js';
 describe('Authentication Routes', () => {
   let app: Express;
   let db: Database.Database;
-  let userModel: UserModel;
-  let permissionModel: PermissionModel;
+  let userModel: UserTestHelper;
+  let permissionModel: PermissionTestHelper;
   let testUser: any;
   let adminUser: any;
   let agent: any;
@@ -48,19 +53,23 @@ describe('Authentication Routes', () => {
     db.pragma('foreign_keys = ON');
     // Run baseline migration (creates all tables)
     baselineMigration.up(db);
+    // Add sourceId column to permissions (migration 022)
+    sourceIdPermsMigration.up(db);
 
-    userModel = new UserModel(db);
-    permissionModel = new PermissionModel(db);
+    const drizzleDb = drizzle(db, { schema });
+    const authRepo = new AuthRepository(drizzleDb, 'sqlite');
+    userModel = new UserTestHelper(authRepo);
+    permissionModel = new PermissionTestHelper(authRepo);
 
     // Mock database service
-    (DatabaseService as any).userModel = userModel;
-    (DatabaseService as any).permissionModel = permissionModel;
+    // permissionModel wired via getUserPermissionSetAsync below
     (DatabaseService as any).auditLog = () => {};  // still used by localAuth.ts
     (DatabaseService as any).auditLogAsync = () => {};
     (DatabaseService as any).findUserByIdAsync = async (id: number) => userModel.findById(id);
     (DatabaseService as any).findUserByUsernameAsync = async (username: string) => userModel.findByUsername(username);
     (DatabaseService as any).authenticateAsync = async (username: string, password: string) => userModel.authenticate(username, password);
     (DatabaseService as any).getUserPermissionSetAsync = async (userId: number) => permissionModel.getUserPermissionSet(userId);
+    (DatabaseService as any).drizzleDbType = 'sqlite';
     (DatabaseService as any).updatePasswordAsync = async (userId: number, newPassword: string) => userModel.updatePassword(userId, newPassword);
 
     app.use('/api/auth', authRoutes);
@@ -88,8 +97,8 @@ describe('Authentication Routes', () => {
       isAdmin: true
     });
 
-    permissionModel.grantDefaultPermissions(testUser.id, false);
-    permissionModel.grantDefaultPermissions(adminUser.id, true);
+    await permissionModel.grantDefaultPermissions(testUser.id, false);
+    await permissionModel.grantDefaultPermissions(adminUser.id, true);
 
     // Create a new agent for each test to maintain session
     agent = request.agent(app);
@@ -164,7 +173,7 @@ describe('Authentication Routes', () => {
     });
 
     it('should reject login for inactive user', async () => {
-      userModel.delete(testUser.id);
+      await userModel.delete(testUser.id);
 
       const response = await agent
         .post('/api/auth/login')
@@ -377,7 +386,7 @@ describe('Authentication Routes', () => {
       expect(statusResponse.body.authenticated).toBe(true);
 
       // Deactivate user
-      userModel.delete(testUser.id);
+      await userModel.delete(testUser.id);
 
       // Session should now be invalid
       statusResponse = await agent
@@ -668,7 +677,7 @@ describe('Authentication Routes', () => {
       resetEnvironmentConfig();
 
       // Ensure anonymous user exists and has permissions
-      let anonymousUser = userModel.findByUsername('anonymous');
+      let anonymousUser = await userModel.findByUsername('anonymous');
       if (!anonymousUser) {
         // Create anonymous user if it doesn't exist
         anonymousUser = await userModel.create({
@@ -679,7 +688,7 @@ describe('Authentication Routes', () => {
         });
       }
       // Grant permissions
-      permissionModel.grantDefaultPermissions(anonymousUser.id, false);
+      await permissionModel.grantDefaultPermissions(anonymousUser.id, false);
 
       const response = await agent
         .get('/api/auth/status')
@@ -815,17 +824,17 @@ describe('Authentication Routes', () => {
       });
 
       // Grant permissions
-      permissionModel.grantDefaultPermissions(nativeUser.id, false);
+      await permissionModel.grantDefaultPermissions(nativeUser.id, false);
 
       // Verify the user exists as a native-login user
-      let user = userModel.findById(nativeUser.id);
+      let user = await userModel.findById(nativeUser.id);
       expect(user).toBeTruthy();
       expect(user!.authProvider).toBe('local');
       expect(user!.passwordHash).toBeTruthy();
 
       // Simulate OIDC migration by directly calling migrateToOIDC
       const oidcSubject = 'oidc-sub-123';
-      const migratedUser = userModel.migrateToOIDC(
+      const migratedUser = await userModel.migrateToOIDC(
         nativeUser.id,
         oidcSubject,
         'migrate@example.com',
@@ -858,13 +867,13 @@ describe('Authentication Routes', () => {
       });
 
       // Grant specific permissions
-      permissionModel.grantDefaultPermissions(nativeUser.id, true);
+      await permissionModel.grantDefaultPermissions(nativeUser.id, true);
 
       // Get permissions before migration
-      const permissionsBefore = permissionModel.getUserPermissions(nativeUser.id);
+      const permissionsBefore = await permissionModel.getUserPermissions(nativeUser.id);
 
       // Migrate to OIDC
-      const migratedUser = userModel.migrateToOIDC(
+      const migratedUser = await userModel.migrateToOIDC(
         nativeUser.id,
         'oidc-sub-456',
         'permissions@example.com',
@@ -872,7 +881,7 @@ describe('Authentication Routes', () => {
       );
 
       // Get permissions after migration
-      const permissionsAfter = permissionModel.getUserPermissions(migratedUser!.id);
+      const permissionsAfter = await permissionModel.getUserPermissions(migratedUser!.id);
 
       // Verify permissions are preserved
       expect(permissionsAfter).toEqual(permissionsBefore);
@@ -892,7 +901,7 @@ describe('Authentication Routes', () => {
       });
 
       // Verify findByEmail works (case-insensitive)
-      const foundUser = userModel.findByEmail('EMAIL-match@example.com');
+      const foundUser = await userModel.findByEmail('EMAIL-match@example.com');
       expect(foundUser).toBeTruthy();
       expect(foundUser!.id).toBe(nativeUser.id);
       expect(foundUser!.username).toBe('oldusername');
@@ -909,14 +918,14 @@ describe('Authentication Routes', () => {
       });
 
       // Try to migrate again
-      expect(() => {
-        userModel.migrateToOIDC(
+      await expect(async () => {
+        await userModel.migrateToOIDC(
           oidcUser.id,
           'oidc-sub-new',
           'oidc@example.com',
           'OIDC User'
         );
-      }).toThrow('User is already using OIDC authentication');
+      }).rejects.toThrow('User is already using OIDC authentication');
     });
 
     it('should update last login timestamp during migration', async () => {
@@ -932,7 +941,7 @@ describe('Authentication Routes', () => {
       const beforeTimestamp = Date.now();
 
       // Migrate to OIDC
-      const migratedUser = userModel.migrateToOIDC(
+      const migratedUser = await userModel.migrateToOIDC(
         nativeUser.id,
         'oidc-sub-timestamp',
         'timestamp@example.com',
@@ -956,7 +965,7 @@ describe('Authentication Routes', () => {
       });
 
       // Migrate without providing email/displayName
-      const migratedUser = userModel.migrateToOIDC(
+      const migratedUser = await userModel.migrateToOIDC(
         nativeUser.id,
         'oidc-sub-preserve'
       );
@@ -978,7 +987,7 @@ describe('Authentication Routes', () => {
       });
 
       // Migrate with new email/displayName
-      const migratedUser = userModel.migrateToOIDC(
+      const migratedUser = await userModel.migrateToOIDC(
         nativeUser.id,
         'oidc-sub-update',
         'new@example.com',

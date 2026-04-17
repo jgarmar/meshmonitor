@@ -6,12 +6,17 @@
 
 import { describe, it, expect, beforeEach, beforeAll, vi } from 'vitest';
 import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from '../../db/schema/index.js';
 import express, { Express } from 'express';
 import session from 'express-session';
 import request from 'supertest';
-import { UserModel } from '../models/User.js';
-import { PermissionModel } from '../models/Permission.js';
+
+import { AuthRepository } from '../../db/repositories/auth.js';
+import { PermissionTestHelper } from '../test-helpers/permissionTestHelper.js';
+import { UserTestHelper } from '../test-helpers/userTestHelper.js';
 import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
+import { migration as sourceIdPermsMigration } from '../migrations/022_add_source_id_to_permissions.js';
 import auditRoutes from './auditRoutes.js';
 import authRoutes from './authRoutes.js';
 
@@ -25,8 +30,8 @@ import DatabaseService from '../../services/database.js';
 describe('Audit Log Routes', () => {
   let app: Express;
   let db: Database.Database;
-  let userModel: UserModel;
-  let permissionModel: PermissionModel;
+  let userModel: UserTestHelper;
+  let permissionModel: PermissionTestHelper;
   let adminUserId: number;
   let regularUserId: number;
 
@@ -72,13 +77,16 @@ describe('Audit Log Routes', () => {
 
     // Run baseline migration (creates all tables)
     baselineMigration.up(db);
+    // Add sourceId column to permissions (migration 022)
+    sourceIdPermsMigration.up(db);
 
-    userModel = new UserModel(db);
-    permissionModel = new PermissionModel(db);
+    const drizzleDb = drizzle(db, { schema });
+    const authRepo = new AuthRepository(drizzleDb, 'sqlite');
+    userModel = new UserTestHelper(authRepo);
+    permissionModel = new PermissionTestHelper(authRepo);
 
     // Mock database service methods
-    (DatabaseService as any).userModel = userModel;
-    (DatabaseService as any).permissionModel = permissionModel;
+    // permissionModel wired via checkPermissionAsync / getUserPermissionSetAsync below
 
     // Mock audit log methods
     (DatabaseService as any).auditLogAsync = (
@@ -96,7 +104,7 @@ describe('Audit Log Routes', () => {
       `).run(userId, action, resource, details, ipAddress, valueBefore || null, valueAfter || null, Date.now());
     };
 
-    (DatabaseService as any).getAuditLogs = (options: any = {}) => {
+    (DatabaseService as any).getAuditLogsAsync = async (options: any = {}) => {
       const {
         limit = 100,
         offset = 0,
@@ -160,16 +168,7 @@ describe('Audit Log Routes', () => {
       return { logs, total: count };
     };
 
-    // Add async version for new unified API
-    (DatabaseService as any).getAuditLogsAsync = async (options: any = {}) => {
-      return (DatabaseService as any).getAuditLogs(options);
-    };
-
     (DatabaseService as any).getAuditStatsAsync = async (days: number = 30) => {
-      return (DatabaseService as any).getAuditStats(days);
-    };
-
-    (DatabaseService as any).getAuditStats = (days: number = 30) => {
       const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
 
       return {
@@ -208,16 +207,12 @@ describe('Audit Log Routes', () => {
       };
     };
 
-    (DatabaseService as any).cleanupAuditLogs = (days: number) => {
+    (DatabaseService as any).cleanupAuditLogsAsync = async (days: number) => {
       const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
       const result = db.prepare(`
         DELETE FROM audit_log WHERE timestamp < ?
       `).run(cutoff);
       return result.changes;
-    };
-
-    (DatabaseService as any).cleanupAuditLogsAsync = async (days: number) => {
-      return (DatabaseService as any).cleanupAuditLogs(days);
     };
 
     // Add async method mocks for authMiddleware compatibility
@@ -229,7 +224,7 @@ describe('Audit Log Routes', () => {
       return userModel.findByUsername(username);
     };
     (DatabaseService as any).checkPermissionAsync = async (userId: number, resource: string, action: string) => {
-      return permissionModel.check(userId, resource, action);
+      return permissionModel.check(userId, resource as any, action as any);
     };
     (DatabaseService as any).getUserPermissionSetAsync = async (userId: number) => {
       return permissionModel.getUserPermissionSet(userId);
@@ -271,7 +266,7 @@ describe('Audit Log Routes', () => {
       isAdmin: true
     });
     adminUserId = admin.id;
-    permissionModel.grantDefaultPermissions(admin.id, true);
+    await permissionModel.grantDefaultPermissions(admin.id, true);
 
     // Create regular user
     const user = await userModel.create({
@@ -282,7 +277,7 @@ describe('Audit Log Routes', () => {
       isAdmin: false
     });
     regularUserId = user.id;
-    permissionModel.grantDefaultPermissions(user.id, false);
+    await permissionModel.grantDefaultPermissions(user.id, false);
 
     // Create some test audit log entries
     DatabaseService.auditLogAsync(adminUserId, 'login_success', 'auth', 'Admin logged in', '192.168.1.1');
@@ -514,7 +509,7 @@ describe('Audit Log Routes', () => {
   describe('Permission Enforcement', () => {
     it('should allow users with audit read permission', async () => {
       // Grant audit read permission to regular user
-      permissionModel.grant({ userId: regularUserId, resource: 'audit', canRead: true, canWrite: false, grantedBy: adminUserId });
+      await permissionModel.grant({ userId: regularUserId, resource: 'audit', canRead: true, canWrite: false, grantedBy: adminUserId });
 
       const res = await asUser().get('/api/audit');
       expect(res.status).toBe(200);
@@ -535,7 +530,7 @@ describe('Audit Log Routes', () => {
 
     it('should block non-admins from cleanup even with audit write permission', async () => {
       // Grant audit write permission to regular user
-      permissionModel.grant({ userId: regularUserId, resource: 'audit', canRead: true, canWrite: true, grantedBy: adminUserId });
+      await permissionModel.grant({ userId: regularUserId, resource: 'audit', canRead: true, canWrite: true, grantedBy: adminUserId });
 
       const res = await asUser().post('/api/audit/cleanup').send({ days: 90 });
       expect(res.status).toBe(403);

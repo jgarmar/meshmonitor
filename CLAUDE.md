@@ -1,6 +1,6 @@
 - Always use context7 when I need code generation, setup or configuration steps, or library/API documentation. This means you should automatically use the Context7 MCP tools to resolve library id and get library docs without me having to explicitly ask.
 - Default admin account is username 'admin' and password 'changeme' . Sometime the password is 'changeme1'
-- use serena MCP for code search and analysis without me explicitly having to ask.
+- use serena MCP for code search and analysis without me explicitly having to ask. Prefer Serena's symbolic tools (`find_symbol`, `get_symbols_overview`, `find_referencing_symbols`, `search_for_pattern`) over grep/Grep for navigating code — they understand symbol relationships and are more precise.
 - use superpowers for planning and workflow management without me having to ask
 - IMPORTANT: Review docs/ARCHITECTURE_LESSONS.md before implementing node communication, state management, backup/restore, asynchronous operations, or database changes. These patterns prevent common mistakes.
 - Only the backend talks to the Node. the Frontend never talks directly to the node.
@@ -100,6 +100,13 @@ When adding a new user-configurable setting:
 - This project has three database backends: SQLite, PostgreSQL, and MySQL.
 - Schema definitions live in `src/db/schema/` — one file per domain, with separate table definitions per backend (SQLite/PostgreSQL/MySQL).
 - When modifying schema, ensure column names and types are consistent across all three backend definitions.
+
+### Raw SQL Ban
+
+- `src/services/database.ts` is raw-SQL-free. All domain queries live in `src/db/repositories/*`.
+- ESLint rule (`no-restricted-syntax`) forbids `this.db.prepare`, `this.db.exec`, `postgresPool.query`, `mysqlPool.query` outside `src/server/migrations/**` and test files.
+- Intentional exceptions (bootstrap, diagnostic, system metadata) must carry an `// eslint-disable-next-line no-restricted-syntax -- <reason>` comment.
+- When adding a query: add an async method to the appropriate repo, expose via DatabaseService facade with `Async` suffix.
 
 ### Migration Registry System
 

@@ -10,7 +10,6 @@ import { createLocalUser, resetUserPassword, setUserPassword } from '../auth/loc
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
 import { PermissionSet } from '../../types/permission.js';
-
 const router = Router();
 
 // All routes require admin
@@ -398,6 +397,13 @@ router.put('/:id/permissions', async (req: Request, res: Response) => {
           error: 'Invalid permissions: write permission requires read permission for channels'
         });
       }
+    }
+
+    // All permissions are per-source — sourceId is required
+    if (!sourceId) {
+      return res.status(400).json({
+        error: 'sourceId is required — all permissions are per-source'
+      });
     }
 
     // Delete only permissions in the given scope, then recreate

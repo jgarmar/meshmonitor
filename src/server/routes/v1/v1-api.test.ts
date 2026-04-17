@@ -69,23 +69,6 @@ vi.mock('../../../services/database.js', () => {
   return {
     default: {
       db: null,
-      apiTokenModel: {
-        validate: vi.fn(async (token: string) => {
-          if (token === VALID_TEST_TOKEN) {
-            return TEST_USER_ID;
-          }
-          return null;
-        }),
-        updateLastUsed: vi.fn()
-      },
-      userModel: {
-        findById: vi.fn((id: number) => {
-          if (id === TEST_USER_ID) {
-            return { id: TEST_USER_ID, username: 'test-api-user', isActive: true, isAdmin: false };
-          }
-          return null;
-        })
-      },
       permissionModel: {
         check: vi.fn((userId: number, resource: string, action: string) => {
           // Grant all permissions for test user

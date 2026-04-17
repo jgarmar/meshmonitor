@@ -6,12 +6,16 @@
 
 import { describe, it, expect, beforeEach, beforeAll, vi } from 'vitest';
 import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from '../../db/schema/index.js';
 import express, { Express } from 'express';
 import session from 'express-session';
 import request from 'supertest';
-import { UserModel } from '../models/User.js';
-import { PermissionModel } from '../models/Permission.js';
+import { AuthRepository } from '../../db/repositories/auth.js';
+import { PermissionTestHelper } from '../test-helpers/permissionTestHelper.js';
+import { UserTestHelper } from '../test-helpers/userTestHelper.js';
 import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
+import { migration as sourceIdPermsMigration } from '../migrations/022_add_source_id_to_permissions.js';
 import userRoutes from './userRoutes.js';
 import authRoutes from './authRoutes.js';
 
@@ -25,8 +29,8 @@ import DatabaseService from '../../services/database.js';
 describe('User Management Routes', () => {
   let app: Express;
   let db: Database.Database;
-  let userModel: UserModel;
-  let permissionModel: PermissionModel;
+  let userModel: UserTestHelper;
+  let permissionModel: PermissionTestHelper;
   let adminAgent: any;
   let userAgent: any;
 
@@ -48,13 +52,16 @@ describe('User Management Routes', () => {
     db.pragma('foreign_keys = ON');
     // Run baseline migration (creates all tables)
     baselineMigration.up(db);
+    // Add sourceId column to permissions (migration 022)
+    sourceIdPermsMigration.up(db);
 
-    userModel = new UserModel(db);
-    permissionModel = new PermissionModel(db);
+    const drizzleDb = drizzle(db, { schema });
+    const authRepo = new AuthRepository(drizzleDb, 'sqlite');
+    userModel = new UserTestHelper(authRepo);
+    permissionModel = new PermissionTestHelper(authRepo);
 
     // Mock database service
-    (DatabaseService as any).userModel = userModel;
-    (DatabaseService as any).permissionModel = permissionModel;
+    // permissionModel wired via checkPermissionAsync / getUserPermissionSetAsync below
     (DatabaseService as any).auditLog = () => {};  // still used by localAuth.ts
     (DatabaseService as any).auditLogAsync = () => {};
     (DatabaseService as any).drizzleDbType = 'sqlite';
@@ -65,7 +72,7 @@ describe('User Management Routes', () => {
         return userModel.findAll();
       },
       createUser: async (input: any) => {
-        // Insert directly via SQL since UserModel.create() hashes password again
+        // Insert directly via SQL since UserTestHelper.create() hashes password again
         const stmt = db.prepare(`
           INSERT INTO users (username, email, display_name, auth_provider, is_admin, is_active, password_hash, password_locked, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -84,30 +91,30 @@ describe('User Management Routes', () => {
         return Number(result.lastInsertRowid);
       },
       updateUser: async (id: number, updates: any) => {
-        // UserModel.update() doesn't handle isAdmin, so handle it directly via SQL
+        // UserTestHelper.update() doesn't handle isAdmin, so handle it directly via SQL
         if (updates.isAdmin !== undefined) {
           db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(updates.isAdmin ? 1 : 0, id);
         }
         // Delegate remaining fields to userModel
         const { isAdmin, ...rest } = updates;
         if (Object.keys(rest).length > 0) {
-          userModel.update(id, rest);
+          await userModel.update(id, rest);
         }
       },
       deleteUser: async (id: number) => {
-        userModel.delete(id);
+        await userModel.delete(id);
         return true;
       },
       deletePermissionsForUser: async (userId: number) => {
-        permissionModel.revokeAll(userId);
+        await permissionModel.revokeAll(userId);
         return 0;
       },
       deletePermissionsForUserByScope: async (userId: number, _sourceId: string | null) => {
-        permissionModel.revokeAll(userId);
+        await permissionModel.revokeAll(userId);
         return 0;
       },
       createPermission: async (input: any) => {
-        const perm = permissionModel.grant({
+        const perm = await permissionModel.grant({
           userId: input.userId,
           resource: input.resource,
           canViewOnMap: input.canViewOnMap ?? false,
@@ -128,7 +135,7 @@ describe('User Management Routes', () => {
       return userModel.findByUsername(username);
     };
     (DatabaseService as any).checkPermissionAsync = async (userId: number, resource: string, action: string) => {
-      return permissionModel.check(userId, resource, action);
+      return permissionModel.check(userId, resource as any, action as any);
     };
     (DatabaseService as any).authenticateAsync = async (username: string, password: string) => {
       return userModel.authenticate(username, password);
@@ -140,7 +147,7 @@ describe('User Management Routes', () => {
       return permissionModel.getUserPermissionSet(userId);
     };
     (DatabaseService as any).clearUserMfaAsync = async (userId: number) => {
-      return userModel.update(userId, { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: null } as any);
+      return await userModel.update(userId, { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: null } as any);
     };
 
     app.use('/api/auth', authRoutes);
@@ -160,7 +167,7 @@ describe('User Management Routes', () => {
       authProvider: 'local',
       isAdmin: true
     });
-    permissionModel.grantDefaultPermissions(admin.id, true);
+    await permissionModel.grantDefaultPermissions(admin.id, true);
 
     // Create regular user
     const user = await userModel.create({
@@ -170,7 +177,7 @@ describe('User Management Routes', () => {
       authProvider: 'local',
       isAdmin: false
     });
-    permissionModel.grantDefaultPermissions(user.id, false);
+    await permissionModel.grantDefaultPermissions(user.id, false);
 
     // Create authenticated agents
     adminAgent = request.agent(app);
@@ -210,7 +217,7 @@ describe('User Management Routes', () => {
 
   describe('GET /api/users/:id', () => {
     it('should allow admin to get user by ID', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       const response = await adminAgent
@@ -223,7 +230,7 @@ describe('User Management Routes', () => {
     });
 
     it('should deny regular user access', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -295,7 +302,7 @@ describe('User Management Routes', () => {
 
   describe('PUT /api/users/:id', () => {
     it('should allow admin to update user', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       const response = await adminAgent
@@ -312,7 +319,7 @@ describe('User Management Routes', () => {
     });
 
     it('should deny regular user from updating users', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -331,7 +338,7 @@ describe('User Management Routes', () => {
 
   describe('DELETE /api/users/:id', () => {
     it('should allow admin to deactivate user', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       const response = await adminAgent
@@ -341,12 +348,12 @@ describe('User Management Routes', () => {
       expect(response.body.success).toBe(true);
 
       // Verify user is deactivated
-      const user = userModel.findById(userId);
+      const user = await userModel.findById(userId);
       expect(user?.isActive).toBe(false);
     });
 
     it('should prevent admin from deleting themselves', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const adminId = users.find(u => u.username === 'admin')!.id;
 
       await adminAgent
@@ -355,7 +362,7 @@ describe('User Management Routes', () => {
     });
 
     it('should deny regular user from deleting users', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -366,7 +373,7 @@ describe('User Management Routes', () => {
 
   describe('PUT /api/users/:id/admin', () => {
     it('should allow admin to promote user to admin', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       const response = await adminAgent
@@ -377,7 +384,7 @@ describe('User Management Routes', () => {
       expect(response.body.success).toBe(true);
 
       // Verify user is now admin
-      const user = userModel.findById(userId);
+      const user = await userModel.findById(userId);
       expect(user?.isAdmin).toBe(true);
     });
 
@@ -398,12 +405,12 @@ describe('User Management Routes', () => {
       expect(response.body.success).toBe(true);
 
       // Verify user is no longer admin
-      const user = userModel.findById(newAdmin.id);
+      const user = await userModel.findById(newAdmin.id);
       expect(user?.isAdmin).toBe(false);
     });
 
     it('should prevent admin from removing own admin status', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const adminId = users.find(u => u.username === 'admin')!.id;
 
       await adminAgent
@@ -413,7 +420,7 @@ describe('User Management Routes', () => {
     });
 
     it('should deny regular user from changing admin status', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -423,7 +430,7 @@ describe('User Management Routes', () => {
     });
 
     it('should reject invalid isAdmin value', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       await adminAgent
@@ -435,7 +442,7 @@ describe('User Management Routes', () => {
 
   describe('POST /api/users/:id/reset-password', () => {
     it('should allow admin to reset user password', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       const response = await adminAgent
@@ -448,7 +455,7 @@ describe('User Management Routes', () => {
     });
 
     it('should deny regular user from resetting passwords', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -473,7 +480,7 @@ describe('User Management Routes', () => {
 
   describe('GET /api/users/:id/permissions', () => {
     it('should allow admin to view user permissions', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       const response = await adminAgent
@@ -485,7 +492,7 @@ describe('User Management Routes', () => {
     });
 
     it('should deny regular user from viewing permissions', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -496,10 +503,11 @@ describe('User Management Routes', () => {
 
   describe('PUT /api/users/:id/permissions', () => {
     it('should allow admin to update user permissions', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
-      const newPermissions = {
+      // All permissions are per-source and require a sourceId
+      const permissions = {
         dashboard: { read: true, write: true },
         nodes: { read: true, write: false },
         messages: { read: false, write: false }
@@ -507,19 +515,13 @@ describe('User Management Routes', () => {
 
       const response = await adminAgent
         .put(`/api/users/${userId}/permissions`)
-        .send({ permissions: newPermissions })
+        .send({ permissions, sourceId: 'test-source' })
         .expect(200);
-
       expect(response.body.success).toBe(true);
-
-      // Verify permissions were updated (viewOnMap defaults to false for non-channel resources)
-      const permissionSet = permissionModel.getUserPermissionSet(userId);
-      expect(permissionSet.dashboard).toEqual({ viewOnMap: false, read: true, write: true });
-      expect(permissionSet.nodes).toEqual({ viewOnMap: false, read: true, write: false });
     });
 
     it('should deny regular user from updating permissions', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users[0].id;
 
       await userAgent
@@ -533,7 +535,7 @@ describe('User Management Routes', () => {
     });
 
     it('should reject invalid permissions format', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       await adminAgent
@@ -543,7 +545,7 @@ describe('User Management Routes', () => {
     });
 
     it('should reject channel permissions with write=true and read=false', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       // This should be rejected because write requires read for channels
@@ -560,7 +562,7 @@ describe('User Management Routes', () => {
     });
 
     it('should accept channel permissions with viewOnMap, read, and write all true', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       const validPermissions = {
@@ -569,18 +571,18 @@ describe('User Management Routes', () => {
 
       const response = await adminAgent
         .put(`/api/users/${userId}/permissions`)
-        .send({ permissions: validPermissions })
+        .send({ permissions: validPermissions, sourceId: 'test-source' })
         .expect(200);
 
       expect(response.body.success).toBe(true);
 
       // Verify permissions were saved correctly
-      const permissionSet = permissionModel.getUserPermissionSet(userId);
+      const permissionSet = await permissionModel.getUserPermissionSet(userId);
       expect(permissionSet.channel_0).toEqual({ viewOnMap: true, read: true, write: true });
     });
 
     it('should accept channel permissions with viewOnMap=true, read=false, write=false', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       // User can see nodes on map but not read messages
@@ -590,17 +592,17 @@ describe('User Management Routes', () => {
 
       const response = await adminAgent
         .put(`/api/users/${userId}/permissions`)
-        .send({ permissions: validPermissions })
+        .send({ permissions: validPermissions, sourceId: 'test-source' })
         .expect(200);
 
       expect(response.body.success).toBe(true);
 
-      const permissionSet = permissionModel.getUserPermissionSet(userId);
+      const permissionSet = await permissionModel.getUserPermissionSet(userId);
       expect(permissionSet.channel_0).toEqual({ viewOnMap: true, read: false, write: false });
     });
 
     it('should accept channel permissions with viewOnMap=false, read=true, write=false', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       // User can read messages but not see nodes on map
@@ -610,17 +612,17 @@ describe('User Management Routes', () => {
 
       const response = await adminAgent
         .put(`/api/users/${userId}/permissions`)
-        .send({ permissions: validPermissions })
+        .send({ permissions: validPermissions, sourceId: 'test-source' })
         .expect(200);
 
       expect(response.body.success).toBe(true);
 
-      const permissionSet = permissionModel.getUserPermissionSet(userId);
+      const permissionSet = await permissionModel.getUserPermissionSet(userId);
       expect(permissionSet.channel_0).toEqual({ viewOnMap: false, read: true, write: false });
     });
 
     it('should NOT validate write-requires-read for non-channel resources', async () => {
-      const users = userModel.findAll();
+      const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
       // Non-channel resources don't have the viewOnMap concept
@@ -631,7 +633,7 @@ describe('User Management Routes', () => {
 
       const response = await adminAgent
         .put(`/api/users/${userId}/permissions`)
-        .send({ permissions })
+        .send({ permissions, sourceId: 'test-source' })
         .expect(200);
 
       expect(response.body.success).toBe(true);

@@ -587,6 +587,7 @@ function App() {
     autoDeleteByDistanceThresholdKm, setAutoDeleteByDistanceThresholdKm,
     autoDeleteByDistanceLat, setAutoDeleteByDistanceLat,
     autoDeleteByDistanceLon, setAutoDeleteByDistanceLon,
+    autoDeleteByDistanceAction, setAutoDeleteByDistanceAction,
   } = useAutomation();
 
   // Check tab permissions and redirect if unauthorized
@@ -600,9 +601,26 @@ function App() {
 
     const isAdmin = authStatus?.user?.isAdmin || false;
     const isAuthenticated = authStatus?.authenticated || false;
+    const meshcoreEnabled = authStatus?.meshcoreEnabled || false;
+
+    // Mirrors Sidebar.tsx hasAnyChannelPermission — channels tab is reachable
+    // if the user can read at least one channel (channel_0..channel_7).
+    const hasAnyChannelPermission = () => {
+      for (let i = 0; i < 8; i++) {
+        if (hasPermission(`channel_${i}` as ResourceType, 'read')) {
+          return true;
+        }
+      }
+      return false;
+    };
 
     // Define permission requirements for each protected tab
     const tabPermissions: Record<string, () => boolean> = {
+      dashboard: () => hasPermission('dashboard', 'read'),
+      info: () => hasPermission('info', 'read'),
+      messages: () => hasPermission('messages', 'read'),
+      channels: hasAnyChannelPermission,
+      meshcore: () => meshcoreEnabled && hasPermission('meshcore', 'read'),
       settings: () => hasPermission('settings', 'read'),
       automation: () => hasPermission('automation', 'read'),
       configuration: () => hasPermission('configuration', 'read'),
@@ -611,7 +629,7 @@ function App() {
       admin: () => isAdmin,
       audit: () => hasPermission('audit', 'read'),
       security: () => hasPermission('security', 'read'),
-      packetmonitor: () => hasPermission('packetmonitor', 'read'),
+      packetmonitor: () => packetLogEnabled && hasPermission('packetmonitor', 'read'),
     };
 
     // Check if current tab requires permission
@@ -621,7 +639,7 @@ function App() {
       logger.info(`[Auth] Redirecting from '${activeTab}' tab - insufficient permissions`);
       setActiveTab('nodes');
     }
-  }, [activeTab, authStatus, authLoading, hasPermission, setActiveTab]);
+  }, [activeTab, authStatus, authLoading, hasPermission, setActiveTab, packetLogEnabled]);
 
   // Helper function to safely parse node IDs to node numbers
   const parseNodeId = useCallback((nodeId: string): number => {
@@ -1162,6 +1180,9 @@ function App() {
           if (settings.autoDeleteByDistanceLon !== undefined) {
             setAutoDeleteByDistanceLon(settings.autoDeleteByDistanceLon ? parseFloat(settings.autoDeleteByDistanceLon) : null);
           }
+          if (settings.autoDeleteByDistanceAction !== undefined) {
+            setAutoDeleteByDistanceAction(settings.autoDeleteByDistanceAction === 'ignore' ? 'ignore' : 'delete');
+          }
 
           if (settings.timerTriggers) {
             try {
@@ -1561,7 +1582,7 @@ function App() {
     setChannelLoadingMore(prev => ({ ...prev, [selectedChannel]: true }));
 
     try {
-      const result = await api.getChannelMessages(selectedChannel, 100, offset);
+      const result = await api.getChannelMessages(selectedChannel, 100, offset, sourceId);
 
       if (result.messages.length > 0) {
         // Process timestamps for new messages
@@ -1632,7 +1653,7 @@ function App() {
     setDmLoadingMore(prev => ({ ...prev, [dmKey]: true }));
 
     try {
-      const result = await api.getDirectMessages(currentNodeId, selectedDMNode, 100, offset);
+      const result = await api.getDirectMessages(currentNodeId, selectedDMNode, 100, offset, sourceId);
 
       if (result.messages.length > 0) {
         // Process timestamps for new messages
@@ -2930,12 +2951,14 @@ function App() {
       return;
     }
 
-    // Extract replyId from replyingTo message if present
+    // Extract replyId from replyingTo message if present.
+    // Message ID format is `${sourceId}_${nodeNum}_${packetId}` — the packetId
+    // is always the last segment, so use slice(-1) to be robust to format changes.
     let replyId: number | undefined = undefined;
     if (replyingTo) {
       const idParts = replyingTo.id.split('_');
-      if (idParts.length > 1) {
-        replyId = parseInt(idParts[1], 10);
+      if (idParts.length >= 2) {
+        replyId = parseInt(idParts[idParts.length - 1], 10);
       }
     }
 
@@ -3021,13 +3044,15 @@ function App() {
       return;
     }
 
-    // Extract replyId from original message
+    // Extract replyId from original message.
+    // Message ID format is `${sourceId}_${nodeNum}_${packetId}` — the packetId
+    // is always the last segment, so use slice(-1) to be robust to format changes.
     const idParts = originalMessage.id.split('_');
     if (idParts.length < 2) {
       setError('Cannot send reaction: invalid message format');
       return;
     }
-    const replyId = parseInt(idParts[1], 10);
+    const replyId = parseInt(idParts[idParts.length - 1], 10);
 
     // Validate replyId is a valid number
     if (isNaN(replyId) || replyId < 0) {
@@ -3137,6 +3162,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3178,6 +3204,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3218,6 +3245,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3255,6 +3283,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3292,6 +3321,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3328,6 +3358,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3380,6 +3411,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ sourceId }),
       });
 
       if (response.ok) {
@@ -3450,12 +3482,14 @@ function App() {
     // Use channel ID directly - no mapping needed
     const messageChannel = channel;
 
-    // Extract replyId from replyingTo message if present
+    // Extract replyId from replyingTo message if present.
+    // Message ID format is `${sourceId}_${nodeNum}_${packetId}` — the packetId
+    // is always the last segment, so use slice(-1) to be robust to format changes.
     let replyId: number | undefined = undefined;
     if (replyingTo) {
       const idParts = replyingTo.id.split('_');
-      if (idParts.length > 1) {
-        replyId = parseInt(idParts[1], 10);
+      if (idParts.length >= 2) {
+        replyId = parseInt(idParts[idParts.length - 1], 10);
       }
     }
 
@@ -4827,6 +4861,7 @@ function App() {
         {activeTab === 'settings' && (
           <ErrorBoundary fallbackTitle="Settings failed to load">
           <SettingsTab
+            mode="source"
             maxNodeAgeHours={maxNodeAgeHours}
             inactiveNodeThresholdHours={inactiveNodeThresholdHours}
             inactiveNodeCheckIntervalMinutes={inactiveNodeCheckIntervalMinutes}
@@ -5075,6 +5110,8 @@ function App() {
                   onThresholdChange={setAutoDeleteByDistanceThresholdKm}
                   onHomeLatChange={setAutoDeleteByDistanceLat}
                   onHomeLonChange={setAutoDeleteByDistanceLon}
+                  action={autoDeleteByDistanceAction}
+                  onActionChange={setAutoDeleteByDistanceAction}
                 />
               </div>
               <div id="ignored-nodes">

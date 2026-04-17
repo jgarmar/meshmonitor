@@ -25,7 +25,8 @@ import { isNodeComplete } from '../utils/nodeHelpers.js';
 import { migrateAutomationChannels } from './utils/automationChannelMigration.js';
 import { detectChannelMoves } from './utils/channelMoveDetection.js';
 import { applyHomoglyphOptimization } from '../utils/homoglyph.js';
-import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS } from './constants/meshtastic.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName } from './constants/meshtastic.js';
+import { normalizeChannelRole } from './constants/channelRole.js';
 import { isAutoFavoriteEligible } from './constants/autoFavorite.js';
 import { createRequire } from 'module';
 import { validateCron, scheduleCron, type CronJob } from './utils/cronScheduler.js';
@@ -44,6 +45,7 @@ export interface ProcessingContext {
   virtualNodeRequestId?: number; // Packet ID from Virtual Node client for ACK matching
   decryptedBy?: 'node' | 'server' | null; // How the packet was decrypted
   decryptedChannelId?: number; // Channel Database entry ID for server-decrypted messages
+  viaStoreForward?: boolean; // Message was received via Store & Forward replay
 }
 
 // CHANNEL_DB_OFFSET is imported from './constants/meshtastic.js'
@@ -112,6 +114,7 @@ export interface DeviceInfo {
   altitudeOverride?: number;
   positionOverrideIsPrivate?: boolean;
   positionIsOverride?: boolean;
+  isStoreForwardServer?: boolean;
 }
 
 export interface MeshMessage {
@@ -225,6 +228,7 @@ type TextMessage = {
   ackFromNode?: number; // Node that sent the ACK
   createdAt: number;
   decryptedBy?: 'node' | 'server' | null; // Decryption source - 'server' means read-only
+  viaStoreForward?: boolean; // Message received via Store & Forward replay
 };
 
 /**
@@ -369,7 +373,9 @@ class MeshtasticManager implements ISourceManager {
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
 
   private autoAckCooldowns: Map<number, number> = new Map(); // nodeNum -> lastResponseTimestamp
+  private autoAckProcessedPackets: Set<number> = new Set(); // packetIds already auto-acked (dedup guard)
   private autoResponderCooldowns: Map<string, number> = new Map(); // "triggerIndex:nodeNum" -> lastResponseTimestamp
+  private autoResponderProcessedPackets: Set<number> = new Set(); // packetIds already auto-responded (dedup guard)
 
   // Auto-ping session tracking
   private autoPingSessions: Map<number, AutoPingSession> = new Map(); // keyed by requester nodeNum
@@ -1045,6 +1051,7 @@ class MeshtasticManager implements ISourceManager {
       metadata: JSON.stringify({ ...metadata, direction: 'tx' }),
       direction: 'tx',
       transport_mechanism: TransportMechanism.INTERNAL,  // Outgoing packets are sent via direct connection
+      sourceId: this.sourceId,
     });
   }
 
@@ -1104,6 +1111,10 @@ class MeshtasticManager implements ISourceManager {
     // Stop time-offset telemetry collection
     this.stopTimeOffsetScheduler();
     this.timeOffsetSamples = [];
+
+    // Clear per-packet dedup sets (no longer relevant after disconnect)
+    this.autoAckProcessedPackets.clear();
+    this.autoResponderProcessedPackets.clear();
 
     logger.debug('Disconnected from Meshtastic node');
   }
@@ -3755,24 +3766,30 @@ class MeshtasticManager implements ISourceManager {
           // Extract position precision from module settings if available
           const positionPrecision = channel.settings.moduleSettings?.positionPrecision;
 
-          // Defensive channel role validation:
+          // Defensive channel role validation.
+          // Rules:
           // 1. Channel 0 must be PRIMARY (role=1), never DISABLED (role=0)
           // 2. Channels 1-7 must be SECONDARY (role=2) or DISABLED (role=0), never PRIMARY (role=1)
-          // A mesh network MUST have exactly ONE PRIMARY channel, and Channel 0 is conventionally PRIMARY
-          let channelRole = channel.role !== undefined ? channel.role : undefined;
+          // 3. Proto3 default-value elision (#2666): firmware strips role=DISABLED on the
+          //    wire, so an empty secondary slot arrives with role=undefined. Treat "no
+          //    role + no name + no PSK" as DISABLED so `?? existingChannel.role` in
+          //    upsertChannel doesn't preserve the stale SECONDARY role forever.
+          const channelRole = normalizeChannelRole(channel);
+
           if (channel.index === 0 && channel.role === 0) {
             logger.warn(`⚠️  Channel 0 received with role=DISABLED (0), overriding to PRIMARY (1)`);
-            channelRole = 1;  // PRIMARY
           }
 
           if (channel.index > 0 && channel.role === 1) {
             logger.warn(`⚠️  Channel ${channel.index} received with role=PRIMARY (1), overriding to SECONDARY (2)`);
             logger.warn(`⚠️  Only Channel 0 can be PRIMARY - all other channels must be SECONDARY or DISABLED`);
-            channelRole = 2;  // SECONDARY
           }
 
-          logger.info(`📡 Saving channel ${channel.index} (${displayName}) - role: ${channelRole}, positionPrecision: ${positionPrecision}`);
-          logger.info(`📡 Database will store name as: "${channelName}" (length: ${channelName.length})`);
+          if (channelRole === 0 && channel.role === undefined && channel.index > 0) {
+            logger.info(`📡 Channel ${channel.index} arrived empty — normalizing role to DISABLED(0) (#2666)`);
+          }
+
+          logger.debug(`📡 Saving channel ${channel.index} (${displayName}) - role: ${channelRole}`);
 
           await databaseService.channels.upsertChannel({
             id: channel.index,
@@ -3931,6 +3948,24 @@ class MeshtasticManager implements ISourceManager {
             } else if (portnum === PortNum.NEIGHBORINFO_APP) {
               // NEIGHBORINFO
               payloadPreview = '[NeighborInfo]';
+            } else if (portnum === PortNum.STORE_FORWARD_APP) {
+              // STORE & FORWARD - show request/response type and relevant details
+              const sf = processedPayload as any;
+              const rrVal = sf.rr ?? sf.requestResponse ?? 0;
+              const rrName = getStoreForwardRequestResponseName(rrVal);
+              if (rrVal === StoreForwardRequestResponse.ROUTER_TEXT_DIRECT || rrVal === StoreForwardRequestResponse.ROUTER_TEXT_BROADCAST) {
+                const textBytes = sf.text;
+                const preview = textBytes ? new TextDecoder('utf-8').decode(textBytes instanceof Uint8Array ? textBytes : new Uint8Array(textBytes)).substring(0, 60) : '';
+                payloadPreview = `[S&F ${rrName}: "${preview}"]`;
+              } else if (rrVal === StoreForwardRequestResponse.ROUTER_HEARTBEAT) {
+                payloadPreview = `[S&F Heartbeat: period=${sf.heartbeat?.period ?? 0}s]`;
+              } else if (rrVal === StoreForwardRequestResponse.ROUTER_STATS) {
+                payloadPreview = `[S&F Stats: saved=${sf.stats?.messagesSaved ?? 0}/${sf.stats?.messagesMax ?? 0}]`;
+              } else if (rrVal === StoreForwardRequestResponse.ROUTER_HISTORY) {
+                payloadPreview = `[S&F History: ${sf.history?.historyMessages ?? 0} msgs]`;
+              } else {
+                payloadPreview = `[S&F ${rrName}]`;
+              }
             } else {
               payloadPreview = `[${portnumName}]`;
             }
@@ -3990,6 +4025,7 @@ class MeshtasticManager implements ISourceManager {
           decrypted_channel_id: decryptedChannelId ?? undefined,
           // Note: ?? (nullish coalescing) correctly preserves 0 (INTERNAL), only defaults on null/undefined
           transport_mechanism: meshPacket.transportMechanism ?? TransportMechanism.LORA,
+          sourceId: this.sourceId,
         });
         } // end else (not internal packet)
       }
@@ -4122,6 +4158,13 @@ class MeshtasticManager implements ISourceManager {
           case PortNum.TRACEROUTE_APP:
             await this.processTracerouteMessage(meshPacket, processedPayload as any);
             break;
+          case PortNum.STORE_FORWARD_APP:
+            await this.processStoreForwardMessage(meshPacket, processedPayload as any, {
+              ...context,
+              decryptedBy,
+              decryptedChannelId: decryptedChannelId ?? undefined,
+            });
+            break;
           default:
             logger.debug(`🤷 Unhandled portnum: ${normalizedPortNum} (${meshtasticProtobufService.getPortNumName(portnum)})`);
         }
@@ -4129,12 +4172,19 @@ class MeshtasticManager implements ISourceManager {
       // Preserve the 'from' and 'to' node order for virtual node traceroute requests.
       // This ensures subsequent responses correctly correlate with this request
       // to update route and signal characteristics in the database.
-      // Skip if from our own node — sendTraceroute() already recorded the request.
       else if (normalizedPortNum === PortNum.TRACEROUTE_APP) {
         const fromNum = meshPacket.from ? Number(meshPacket.from) : 0;
         const toNum = meshPacket.to ? Number(meshPacket.to) : 0;
         const localNodeNum = this.localNodeInfo?.nodeNum;
-        if (fromNum !== localNodeNum) {
+        
+        // Skip only when this is MeshMonitor's own auto-traceroute —
+        // sendTraceroute() already called recordTracerouteRequestAsync() internally.
+        // VN-client packets also have fromNum === localNodeNum but were never
+        // pre-recorded; they arrive as incoming packets with a virtualNodeRequestId.
+        const isFromLocalNode = fromNum === localNodeNum;
+        const isVirtualNodePacket = !!context?.virtualNodeRequestId;
+
+        if (!isFromLocalNode || isVirtualNodePacket) {
           await databaseService.recordTracerouteRequestAsync(fromNum, toNum, this.sourceId ?? undefined);
         }
       }
@@ -4355,6 +4405,7 @@ class MeshtasticManager implements ISourceManager {
           deliveryState: context?.virtualNodeRequestId ? 'pending' : undefined, // Track delivery for Virtual Node messages
           createdAt: Date.now(),
           decryptedBy: context?.decryptedBy ?? null, // Track decryption source - 'server' means read-only
+          viaStoreForward: context?.viaStoreForward === true ? true : undefined, // Message received via Store & Forward replay
         };
         const wasInserted = await databaseService.messages.insertMessage(message, this.sourceId);
 
@@ -4426,8 +4477,94 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
-   * Legacy text message processing (for backward compatibility)
+   * Process a Store & Forward message (PortNum 65).
+   * Handles replayed text, heartbeats, stats, history headers, and control messages.
    */
+  private async processStoreForwardMessage(meshPacket: any, decoded: any, context?: ProcessingContext): Promise<void> {
+    try {
+      const rr = decoded.rr ?? decoded.requestResponse ?? 0;
+      const rrName = getStoreForwardRequestResponseName(rr);
+      const fromNum = Number(meshPacket.from);
+      const fromNodeId = `!${fromNum.toString(16).padStart(8, '0')}`;
+
+      switch (rr) {
+        case StoreForwardRequestResponse.ROUTER_TEXT_DIRECT:
+        case StoreForwardRequestResponse.ROUTER_TEXT_BROADCAST: {
+          // S&F server is replaying a stored text message.
+          // MeshPacket.from = original sender (firmware preserves it).
+          // decoded.text contains the original message bytes.
+          const textBytes = decoded.text;
+          if (!textBytes || textBytes.length === 0) {
+            logger.debug(`📦 S&F ${rrName} from ${fromNodeId} — empty text, skipping`);
+            break;
+          }
+
+          const messageText = new TextDecoder('utf-8').decode(
+            textBytes instanceof Uint8Array ? textBytes : new Uint8Array(textBytes)
+          );
+          logger.info(`📦 S&F ${rrName} from ${fromNodeId}: "${messageText.substring(0, 50)}"`);
+
+          // Dedup: check if we already have this message from the original transmission.
+          // The firmware preserves the original packet ID in meshPacket.id.
+          const packetId = meshPacket.id;
+          if (packetId) {
+            const existingId = `${this.sourceId}_${fromNum}_${packetId}`;
+            const existing = await databaseService.messages.getMessage(existingId);
+            if (existing) {
+              logger.debug(`📦 S&F replay is duplicate of existing message ${existingId}, skipping insertion`);
+              break;
+            }
+          }
+
+          // Feed through the standard text message pipeline.
+          // The message will be stored with the original sender attribution.
+          await this.processTextMessageProtobuf(meshPacket, messageText, {
+            ...context,
+            viaStoreForward: true,
+          });
+          break;
+        }
+
+        case StoreForwardRequestResponse.ROUTER_HEARTBEAT: {
+          const period = decoded.heartbeat?.period ?? 0;
+          const secondary = decoded.heartbeat?.secondary ?? 0;
+          logger.info(`📦 S&F heartbeat from ${fromNodeId}: period=${period}s, secondary=${secondary}`);
+
+          // Mark this node as a Store & Forward server
+          await databaseService.nodes.upsertNode({
+            nodeNum: fromNum,
+            nodeId: fromNodeId,
+            isStoreForwardServer: true,
+            lastHeard: Date.now() / 1000,
+            updatedAt: Date.now(),
+          }, this.sourceId);
+          break;
+        }
+
+        case StoreForwardRequestResponse.ROUTER_STATS: {
+          const stats = decoded.stats;
+          if (stats) {
+            logger.info(`📦 S&F stats from ${fromNodeId}: total=${stats.messagesTotal ?? 0}, saved=${stats.messagesSaved ?? 0}, max=${stats.messagesMax ?? 0}, uptime=${stats.upTime ?? 0}s`);
+          }
+          break;
+        }
+
+        case StoreForwardRequestResponse.ROUTER_HISTORY: {
+          const history = decoded.history;
+          if (history) {
+            logger.info(`📦 S&F history from ${fromNodeId}: ${history.historyMessages ?? 0} messages, window=${history.window ?? 0}min`);
+          }
+          break;
+        }
+
+        default:
+          logger.debug(`📦 S&F ${rrName} (rr=${rr}) from ${fromNodeId}`);
+          break;
+      }
+    } catch (error) {
+      logger.error('❌ Error processing Store & Forward message:', error);
+    }
+  }
 
   /**
    * Validate position coordinates
@@ -6297,6 +6434,16 @@ class MeshtasticManager implements ISourceManager {
       }
       // If device didn't provide lastHeard, don't update it at all - preserve existing value
 
+      // Channel is authoritatively managed by processMeshPacket from live RX packets.
+      // Device NodeDB sync can carry stale values (firmware's NodeDB::updateUser only
+      // refreshes `channel` on NODEINFO_APP packets, and proto3 uint32 default 0 is
+      // indistinguishable from "unset" on wire) so we only SEED channel for nodes that
+      // don't already have one — never overwrite an existing value from device sync.
+      // See: https://github.com/Yeraze/meshmonitor/issues — peer channel stuck at 0.
+      const shouldSeedChannel =
+        nodeInfo.channel !== undefined &&
+        (!existingNode || existingNode.channel == null);
+
       const nodeData: any = {
         nodeNum: Number(nodeInfo.num),
         nodeId: nodeId,
@@ -6305,12 +6452,16 @@ class MeshtasticManager implements ISourceManager {
         // Note: NodeInfo protobuf doesn't include RSSI, only MeshPacket does
         // RSSI will be updated from mesh packet if available
         hopsAway: nodeInfo.hopsAway !== undefined ? nodeInfo.hopsAway : undefined,
-        channel: nodeInfo.channel !== undefined ? nodeInfo.channel : undefined
+        ...(shouldSeedChannel && { channel: nodeInfo.channel }),
       };
 
       // Debug logging for channel extraction
       if (nodeInfo.channel !== undefined) {
-        logger.debug(`📡 NodeInfo for ${nodeId}: extracted channel=${nodeInfo.channel}`);
+        if (shouldSeedChannel) {
+          logger.debug(`📡 NodeInfo for ${nodeId}: seeding channel=${nodeInfo.channel} (new or unset)`);
+        } else {
+          logger.debug(`📡 NodeInfo for ${nodeId}: ignoring device-sync channel=${nodeInfo.channel} (existing=${existingNode?.channel}, managed by live packets)`);
+        }
       } else {
         logger.debug(`📡 NodeInfo for ${nodeId}: no channel field present`);
       }
@@ -6814,9 +6965,23 @@ class MeshtasticManager implements ISourceManager {
         text = applyHomoglyphOptimization(text);
       }
 
-      // Use the new protobuf service to create a proper text message
-      // Note: PKI encryption is handled automatically by the firmware if it has the recipient's public key
-      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji);
+      // For DMs, check if the target node has a public key — if so, request PKI encryption.
+      // The firmware handles the actual crypto, but for serial/TCP connections it only
+      // PKI-encrypts when the packet explicitly has pkiEncrypted=true.
+      let pkiEncrypted = false;
+      if (destination) {
+        try {
+          const targetNode = await databaseService.nodes.getNode(destination, this.sourceId);
+          if (targetNode?.publicKey) {
+            pkiEncrypted = true;
+            logger.debug(`🔐 DM to !${destination.toString(16).padStart(8, '0')} — requesting PKI encryption (node has public key)`);
+          }
+        } catch {
+          // If lookup fails, send without PKI — firmware will use channel encryption
+        }
+      }
+
+      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted);
 
       await this.transport.send(textMessageData);
 
@@ -7453,6 +7618,23 @@ class MeshtasticManager implements ISourceManager {
 
   private async checkAutoAcknowledge(message: any, messageText: string, channelIndex: number, isDirectMessage: boolean, fromNum: number, packetId?: number, rxSnr?: number, rxRssi?: number): Promise<void> {
     try {
+      // Per-packet dedup guard: prevent duplicate auto-ack responses for the same
+      // mesh packet. This can happen when the transport delivers the same packet
+      // twice (e.g. LoRa + MQTT proxy, serial retransmission) and the non-awaited
+      // processIncomingData handler processes them concurrently (#2642).
+      if (packetId != null) {
+        if (this.autoAckProcessedPackets.has(packetId)) {
+          logger.debug(`⏭️ Skipping auto-acknowledge for packet ${packetId}: already processed`);
+          return;
+        }
+        this.autoAckProcessedPackets.add(packetId);
+        // Prevent unbounded memory growth — trim to last 500 entries
+        if (this.autoAckProcessedPackets.size > 1000) {
+          const entries = Array.from(this.autoAckProcessedPackets);
+          this.autoAckProcessedPackets = new Set(entries.slice(-500));
+        }
+      }
+
       // All auto-ack settings are per-source: each MeshtasticManager instance
       // has its own sourceId and the UI writes to `source:{sourceId}:autoAck*`
       // keys. Reading from the global namespace here would resolve to stale or
@@ -8108,6 +8290,19 @@ class MeshtasticManager implements ISourceManager {
 
   private async checkAutoResponder(message: TextMessage, isDirectMessage: boolean, packetId?: number): Promise<void> {
     try {
+      // Per-packet dedup guard: same rationale as checkAutoAcknowledge (#2642)
+      if (packetId != null) {
+        if (this.autoResponderProcessedPackets.has(packetId)) {
+          logger.debug(`⏭️ Skipping auto-responder for packet ${packetId}: already processed`);
+          return;
+        }
+        this.autoResponderProcessedPackets.add(packetId);
+        if (this.autoResponderProcessedPackets.size > 1000) {
+          const entries = Array.from(this.autoResponderProcessedPackets);
+          this.autoResponderProcessedPackets = new Set(entries.slice(-500));
+        }
+      }
+
       // All auto-responder settings are written per-source by AutoResponderSection
       // via /api/settings?sourceId=, so they live under `source:{sourceId}:*`.
       // Reading them globally here would return empty/missing values and the
@@ -11839,6 +12034,11 @@ class MeshtasticManager implements ISourceManager {
       // Add viaMqtt if it exists
       if (node.viaMqtt !== null && node.viaMqtt !== undefined) {
         deviceInfo.viaMqtt = Boolean(node.viaMqtt);
+      }
+
+      // Add isStoreForwardServer if it exists
+      if (node.isStoreForwardServer !== null && node.isStoreForwardServer !== undefined) {
+        deviceInfo.isStoreForwardServer = Boolean(node.isStoreForwardServer);
       }
 
       // Add isFavorite if it exists

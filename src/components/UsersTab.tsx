@@ -46,11 +46,13 @@ interface ChannelDatabasePermission {
 }
 
 const PERMISSION_KEYS = [
-  'dashboard', 'nodes', 'channel_0', 'channel_1', 'channel_2', 'channel_3', 
-  'channel_4', 'channel_5', 'channel_6', 'channel_7', 'messages', 'settings', 
-  'configuration', 'info', 'automation', 'connection', 'traceroute', 'audit', 
+  'dashboard', 'nodes', 'channel_0', 'channel_1', 'channel_2', 'channel_3',
+  'channel_4', 'channel_5', 'channel_6', 'channel_7', 'messages', 'settings',
+  'configuration', 'info', 'automation', 'connection', 'traceroute', 'audit',
   'security', 'nodes_private', 'packetmonitor'
 ] as const;
+
+// All permissions are per-source — no global resources except Admin toggle
 
 const UsersTab: React.FC = () => {
   const { t } = useTranslation();
@@ -85,9 +87,10 @@ const UsersTab: React.FC = () => {
   const [channelDatabaseEntries, setChannelDatabaseEntries] = useState<ChannelDatabaseEntry[]>([]);
   const [channelDbPermissions, setChannelDbPermissions] = useState<ChannelDatabasePermission[]>([]);
 
-  // Source scope for permissions (null = global, string = sourceId)
+  // Source scope for permissions — all permissions are per-source
   const [sources, setSources] = useState<Source[]>([]);
   const [permissionScope, setPermissionScope] = useState<string | null>(null);
+  const [channelNames, setChannelNames] = useState<Map<number, string>>(new Map());
 
   useEffect(() => {
     fetchUsers();
@@ -97,8 +100,14 @@ const UsersTab: React.FC = () => {
 
   const fetchSources = async () => {
     try {
-      const response = await api.get<{ sources: Source[] }>('/api/sources');
-      setSources(response.sources || []);
+      const response = await api.get<Source[]>('/api/sources');
+      const list = Array.isArray(response) ? response : [];
+      setSources(list);
+      // Auto-select first source if none selected yet
+      if (list.length > 0 && permissionScope === null) {
+        setPermissionScope(list[0].id);
+        await fetchChannelNames(list[0].id);
+      }
     } catch (err) {
       logger.debug('Failed to fetch sources:', err);
     }
@@ -175,8 +184,23 @@ const UsersTab: React.FC = () => {
     await fetchChannelDbPermissions(user.id);
   };
 
+  const fetchChannelNames = async (sourceId: string | null) => {
+    if (!sourceId) { setChannelNames(new Map()); return; }
+    try {
+      const channels = await api.get<{ id: number; name: string }[]>(`/api/channels/all?sourceId=${encodeURIComponent(sourceId)}`);
+      const map = new Map<number, string>();
+      if (Array.isArray(channels)) {
+        channels.forEach(ch => { if (ch.name) map.set(ch.id, ch.name); });
+      }
+      setChannelNames(map);
+    } catch {
+      setChannelNames(new Map());
+    }
+  };
+
   const handlePermissionScopeChange = async (scopeId: string | null) => {
     setPermissionScope(scopeId);
+    await fetchChannelNames(scopeId);
     if (selectedUser) {
       await loadPermissionsForUser(selectedUser, scopeId);
     }
@@ -189,19 +213,18 @@ const UsersTab: React.FC = () => {
       // Filter out empty/undefined permissions and ensure valid structure
       const validPermissions: PermissionSet = {};
       PERMISSION_KEYS.forEach(resource => {
-        if (permissions[resource]) {
-          if (resource.startsWith('channel_')) {
-            validPermissions[resource] = {
-              viewOnMap: permissions[resource]?.viewOnMap || false,
-              read: permissions[resource]?.read || false,
-              write: permissions[resource]?.write || false
-            };
-          } else {
-            validPermissions[resource] = {
-              read: permissions[resource]?.read || false,
-              write: permissions[resource]?.write || false
-            };
-          }
+        if (!permissions[resource]) return;
+        if (resource.startsWith('channel_')) {
+          validPermissions[resource] = {
+            viewOnMap: permissions[resource]?.viewOnMap || false,
+            read: permissions[resource]?.read || false,
+            write: permissions[resource]?.write || false
+          };
+        } else {
+          validPermissions[resource] = {
+            read: permissions[resource]?.read || false,
+            write: permissions[resource]?.write || false
+          };
         }
       });
 
@@ -516,8 +539,8 @@ const UsersTab: React.FC = () => {
   }
 
   const labelMap: Record<string, string> = {
-    dashboard: t('nav.dashboard'),
-    nodes: t('nav.nodes'),
+    dashboard: 'Source Status',
+    nodes: 'Node Map & List',
     messages: t('nav.messages'),
     settings: t('nav.settings'),
     configuration: t('nav.configuration'),
@@ -528,6 +551,22 @@ const UsersTab: React.FC = () => {
     nodes_private: t('nodes_private'),
     connection: t('users.can_control_connection'),
     traceroute: t('users.can_initiate_traceroutes'),
+  };
+
+  const tooltipMap: Record<string, string> = {
+    dashboard: 'Controls visibility of source cards on the main dashboard. Does NOT include node or message access — grant those separately.',
+    nodes: 'Read: view node list, neighbor info, and map markers. Write: edit node names/notes.',
+    nodes_private: 'Read: view detailed position history for individual nodes.',
+    messages: 'Read: view messages and channel list. Write: send messages.',
+    settings: 'Read: view global settings. Write: change settings, map styles, GeoJSON layers.',
+    configuration: 'Read: view device configuration. Write: change device radio/module settings.',
+    info: 'Read: view device info and statistics.',
+    automation: 'Read: view automation rules. Write: create/edit automation rules.',
+    connection: 'Connect/disconnect the Meshtastic device for this source.',
+    traceroute: 'Initiate traceroute requests to mesh nodes.',
+    audit: 'Read: view the audit log. Write: purge audit log entries.',
+    security: 'Read: view security scan results. Write: run scans, manage flagged/dead nodes.',
+    packetmonitor: 'Read: view raw Meshtastic packets in the packet monitor.',
   };
 
   return (
@@ -676,11 +715,13 @@ const UsersTab: React.FC = () => {
                   onChange={e => handlePermissionScopeChange(e.target.value || null)}
                   className="permission-scope-select"
                 >
-                  <option value="">{t('users.scope_global')}</option>
                   {sources.map(s => (
                     <option key={s.id} value={s.id}>{s.name}</option>
                   ))}
                 </select>
+                <p className="text-xs text-gray-500 mt-1">
+                  {t('users.source_permissions_hint', 'All permissions are granted per-source.')}
+                </p>
               </div>
             )}
 
@@ -691,14 +732,20 @@ const UsersTab: React.FC = () => {
                 
                 if (resource.startsWith('channel_')) {
                   const channelNum = resource.split('_')[1];
-                  label = channelNum === '0' ? t('users.channel_primary') : t('users.channel_n', { n: channelNum });
+                  const chName = channelNames.get(Number(channelNum));
+                  const baseLabel = channelNum === '0' ? t('users.channel_primary') : t('users.channel_n', { n: channelNum });
+                  label = chName ? `${baseLabel} (${chName})` : baseLabel;
                 } else {
                   label = labelMap[resource] || label;
                 }
 
+                const tooltip = resource.startsWith('channel_')
+                  ? 'View on Map: show nodes heard on this channel. Read: view messages. Write: send messages.'
+                  : tooltipMap[resource] || '';
+
                 return (
                   <div key={resource} className="permission-item">
-                    <div className="permission-label">{label}</div>
+                    <div className="permission-label" title={tooltip}>{label}</div>
                     <div className="permission-actions">
                       {resource === 'packetmonitor' ? (
                         // Packet Monitor is read-only, no write permission

@@ -15,6 +15,8 @@ import DashboardPage from './pages/DashboardPage.tsx';
 import AnalysisPage from './pages/AnalysisPage.tsx';
 import UnifiedMessagesPage from './pages/UnifiedMessagesPage.tsx';
 import UnifiedTelemetryPage from './pages/UnifiedTelemetryPage.tsx';
+import GlobalSettingsPage from './pages/GlobalSettingsPage.tsx';
+import UsersPage from './pages/UsersPage.tsx';
 import './index.css';
 import { AuthProvider } from './contexts/AuthContext';
 import { CsrfProvider } from './contexts/CsrfContext';
@@ -88,6 +90,18 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             <Route
               path="analysis"
               element={sharedProviders(<AnalysisPage />)}
+            />
+
+            {/* Global settings */}
+            <Route
+              path="settings"
+              element={sharedProviders(<GlobalSettingsPage />)}
+            />
+
+            {/* User management */}
+            <Route
+              path="users"
+              element={sharedProviders(<UsersPage />)}
             />
 
             {/* Dashboard / landing page */}

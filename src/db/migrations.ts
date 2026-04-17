@@ -1,7 +1,7 @@
 /**
  * Migration Registry Barrel File
  *
- * Registers all 22 migrations in sequential order for use by the migration runner.
+ * Registers all 38 migrations in sequential order for use by the migration runner.
  * Migration 001 is the v3.7 baseline (selfIdempotent — handles its own detection).
  * Migrations 002-011 were originally 078-087 and retain their original settingsKeys
  * for upgrade compatibility.
@@ -42,6 +42,14 @@ import { migration as addSourceIdToKeyRepairLogMigration, runMigration027Postgre
 import { migration as addSourceIdToNotificationsMigration, runMigration028Postgres, runMigration028Mysql } from '../server/migrations/028_add_source_id_to_notifications.js';
 import { migration as nodesCompositePkMigration, runMigration029Postgres, runMigration029Mysql } from '../server/migrations/029_nodes_composite_pk.js';
 import { migration as addSourceIdToRouteSegmentsMigration, runMigration030Postgres, runMigration030Mysql } from '../server/migrations/030_add_source_id_to_route_segments.js';
+import { migration as dropLegacyNodesUniqueMigration, runMigration031Postgres, runMigration031Mysql } from '../server/migrations/031_drop_legacy_nodes_unique.js';
+import { migration as telemetryPacketDedupeMigration, runMigration032Postgres, runMigration032Mysql } from '../server/migrations/032_telemetry_packet_dedupe.js';
+import { migration as perSourcePermissionsMigration, runMigration033Postgres, runMigration033Mysql } from '../server/migrations/033_per_source_permissions.js';
+import { migration as addViaStoreForwardMigration, runMigration034Postgres, runMigration034Mysql } from '../server/migrations/034_add_via_store_forward.js';
+import { migration as addIsStoreForwardServerMigration, runMigration035Postgres, runMigration035Mysql } from '../server/migrations/035_add_is_store_forward_server.js';
+import { migration as telemetryPerformanceIndexesMigration, runMigration036Postgres, runMigration036Mysql } from '../server/migrations/036_telemetry_performance_indexes.js';
+import { migration as userMapPrefsIdMigration, runMigration037Postgres, runMigration037Mysql } from '../server/migrations/037_add_id_to_user_map_preferences.js';
+import { migration as cleanupOrphanNotificationPrefsMigration, runMigration038Postgres, runMigration038Mysql } from '../server/migrations/038_cleanup_orphan_notification_prefs.js';
 
 // ============================================================================
 // Registry
@@ -434,4 +442,134 @@ registry.register({
   sqlite: (db) => addSourceIdToRouteSegmentsMigration.up(db),
   postgres: (client) => runMigration030Postgres(client),
   mysql: (pool) => runMigration030Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 031: Drop legacy standalone UNIQUE on nodes.nodeId.
+// Migration 029's Postgres path used an ILIKE pattern against
+// pg_get_constraintdef that failed to match the quoted column name, so the
+// old constraint survived on upgraded databases and blocked cross-source node
+// upserts. This migration drops it explicitly using pg_attribute.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 31,
+  name: 'drop_legacy_nodes_unique',
+  settingsKey: 'migration_031_drop_legacy_nodes_unique',
+  sqlite: (db) => dropLegacyNodesUniqueMigration.up(db),
+  postgres: (client) => runMigration031Postgres(client),
+  mysql: (pool) => runMigration031Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 032: Telemetry packet dedupe via soft unique constraint.
+// Adds a partial unique index on (sourceId, nodeNum, packetId, telemetryType)
+// so duplicate packets (e.g. re-broadcast through multiple mesh routers) are
+// silently dropped at insert time instead of producing duplicate rows.
+// See https://github.com/Yeraze/meshmonitor/issues/2629
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 32,
+  name: 'telemetry_packet_dedupe',
+  settingsKey: 'migration_032_telemetry_packet_dedupe',
+  sqlite: (db) => telemetryPacketDedupeMigration.up(db),
+  postgres: (client) => runMigration032Postgres(client),
+  mysql: (pool) => runMigration032Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 033: Per-source permissions expansion + unique index.
+// Expands existing global grants for sourcey resources into one row per source,
+// drops the old unique constraint on (user_id, resource), creates a new unique
+// index on (user_id, resource, sourceId), and migrates orphaned channel_database
+// rows to the default source.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 33,
+  name: 'per_source_permissions',
+  settingsKey: 'migration_033_per_source_permissions',
+  sqlite: (db) => perSourcePermissionsMigration.up(db),
+  postgres: (client) => runMigration033Postgres(client),
+  mysql: (pool) => runMigration033Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 034: Add viaStoreForward column to messages table.
+// Boolean flag to indicate messages received via Store & Forward replay,
+// following the same pattern as the existing viaMqtt column.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 34,
+  name: 'add_via_store_forward',
+  settingsKey: 'migration_034_add_via_store_forward',
+  sqlite: (db) => addViaStoreForwardMigration.up(db),
+  postgres: (client) => runMigration034Postgres(client),
+  mysql: (pool) => runMigration034Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 035: Add isStoreForwardServer column to nodes table.
+// Boolean flag to track nodes detected as Store & Forward servers via
+// ROUTER_HEARTBEAT packets on PortNum 65.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 35,
+  name: 'add_is_store_forward_server',
+  settingsKey: 'migration_035_add_is_store_forward_server',
+  sqlite: (db) => addIsStoreForwardServerMigration.up(db),
+  postgres: (client) => runMigration035Postgres(client),
+  mysql: (pool) => runMigration035Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 036: Add compound indexes to telemetry table.
+// PG/MySQL only had single-column indexes on nodeNum and timestamp. With 450k+
+// rows, queries degrade to full table scans. Adds (nodeId, telemetryType,
+// timestamp DESC) and (nodeNum, timestamp DESC) compound indexes.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 36,
+  name: 'telemetry_performance_indexes',
+  settingsKey: 'migration_036_telemetry_performance_indexes',
+  sqlite: (db) => telemetryPerformanceIndexesMigration.up(db),
+  postgres: (client) => runMigration036Postgres(client),
+  mysql: (pool) => runMigration036Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 037: Backfill missing user_map_preferences columns on PG/MySQL.
+// Pre-baseline (v3.7) deployments lacked `id`, `createdAt`, and `updatedAt`.
+// Drizzle's getMapPreferences (PR #2681) selects all schema columns, so PG
+// fails with `column "id" does not exist` on those legacy tables.
+// SQLite is unaffected (bootstrap creates the table with the right schema).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 37,
+  name: 'add_id_to_user_map_preferences',
+  settingsKey: 'migration_037_add_id_to_user_map_preferences',
+  sqlite: (db) => userMapPrefsIdMigration.up(db),
+  postgres: (client) => runMigration037Postgres(client),
+  mysql: (pool) => runMigration037Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 038: Delete orphan source-scoped notification rows.
+// Source deletes don't cascade to user_notification_preferences /
+// push_subscriptions, leaving dangling rows that cause duplicate-notification
+// fan-out (one extra notification per orphan row per broadcast).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 38,
+  name: 'cleanup_orphan_notification_prefs',
+  settingsKey: 'migration_038_cleanup_orphan_notification_prefs',
+  sqlite: (db) => cleanupOrphanNotificationPrefsMigration.up(db),
+  postgres: (client) => runMigration038Postgres(client),
+  mysql: (pool) => runMigration038Mysql(pool),
 });
